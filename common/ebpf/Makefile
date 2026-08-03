@@ -1,11 +1,19 @@
 BPF_CLANG ?= clang
 # Auto-detect the system include root; Termux uses a non-standard prefix.
 BPF_SYSTEM_INCLUDE ?= $(shell for d in /usr/include /data/data/com.termux/files/usr/include; do [ -f "$$d/linux/bpf.h" ] && echo "$$d" && break; done)
-BPF_ANDROID_INCLUDE ?= $(shell for d in /usr/include/aarch64-linux-android /data/data/com.termux/files/usr/include/aarch64-linux-android; do [ -d "$$d" ] && echo "$$d" && break; done)
+# asm/types.h lives in a multiarch dir on Debian/Ubuntu (e.g. x86_64-linux-gnu)
+# and in the Android arch dir on Termux.
+BPF_MULTIARCH_INCLUDE ?= $(shell for d in \
+	$(BPF_SYSTEM_INCLUDE)/x86_64-linux-gnu \
+	$(BPF_SYSTEM_INCLUDE)/aarch64-linux-gnu \
+	$(BPF_SYSTEM_INCLUDE)/arm-linux-gnueabihf \
+	$(BPF_SYSTEM_INCLUDE)/i386-linux-gnu \
+	$(BPF_SYSTEM_INCLUDE)/aarch64-linux-android \
+	$(BPF_SYSTEM_INCLUDE)/x86_64-linux-android; do [ -f "$$d/asm/types.h" ] && echo "$$d" && break; done)
 BPF_CFLAGS ?= -target bpfel -O2 -g0
 BPF_INCLUDE_FLAGS := -Inative -I$(BPF_SYSTEM_INCLUDE)
-ifneq (,$(wildcard $(BPF_ANDROID_INCLUDE)))
-BPF_INCLUDE_FLAGS += -I$(BPF_ANDROID_INCLUDE)
+ifneq (,$(wildcard $(BPF_MULTIARCH_INCLUDE)))
+BPF_INCLUDE_FLAGS += -I$(BPF_MULTIARCH_INCLUDE)
 endif
 
 SOURCE := native/shared_network.bpf.c
