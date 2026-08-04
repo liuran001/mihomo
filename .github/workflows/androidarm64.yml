@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
   push:
     branches:
-      - Alpha
+      - ebpf-inbound
     paths-ignore:
       - "docs/**"
       - "README.md"
@@ -49,7 +49,7 @@ jobs:
         chmod -R +w ${SING_TUN_DIR}
         cd ${SING_TUN_DIR}
         
-        wget -O sing-tun.patch https://raw.githubusercontent.com/TanakaLun/mihomo/cb49c90be1dde6e219a4a08dff59239b5836559f/.github/patch/sing-tun.patch
+        wget -O sing-tun.patch "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/.github/patch/sing-tun.patch"
         
         if grep -q "if len(r.tunOptions.Inet6Address) > 0 && runtime.GOOS == \"android\"" redirect_linux.go 2>/dev/null; then
           echo "Patch already applied (IPv6 Android code found), skipping..."
