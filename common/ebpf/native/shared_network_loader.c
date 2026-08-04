@@ -83,6 +83,10 @@ static int shared_network_object_map_fd(
     if (strcmp(name, "shared_listener") == 0) return runtime->listener_map_fd;
     if (strcmp(name, "shared_host_ipv4") == 0) return runtime->host_ipv4_map_fd;
     if (strcmp(name, "shared_host_ipv6") == 0) return runtime->host_ipv6_map_fd;
+    if (strcmp(name, "shared_include_source_ipv4") == 0) return runtime->include_source_ipv4_map_fd;
+    if (strcmp(name, "shared_include_source_ipv6") == 0) return runtime->include_source_ipv6_map_fd;
+    if (strcmp(name, "shared_exclude_source_ipv4") == 0) return runtime->exclude_source_ipv4_map_fd;
+    if (strcmp(name, "shared_exclude_source_ipv6") == 0) return runtime->exclude_source_ipv6_map_fd;
     if (strcmp(name, "shared_bypass_ipv4") == 0) return bypass_ipv4_map_fd;
     if (strcmp(name, "shared_bypass_ipv6") == 0) return bypass_ipv6_map_fd;
     if (strcmp(name, "shared_scratch") == 0) return runtime->scratch_map_fd;

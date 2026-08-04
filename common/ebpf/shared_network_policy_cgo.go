@@ -9,6 +9,53 @@ import (
 	E "github.com/metacubex/sing/common/exceptions"
 )
 
+const maxSharedSourceCIDRPolicyEntries = 4096
+
+func (b *SharedNetworkBackend) initializeSourceCIDRPolicy(include, exclude []netip.Prefix) error {
+	includeIPv4, includeIPv6, err := compileBypassCIDRPolicy(include)
+	if err != nil {
+		return E.Cause(err, "compile shared-network include source CIDR policy")
+	}
+	excludeIPv4, excludeIPv6, err := compileBypassCIDRPolicy(exclude)
+	if err != nil {
+		return E.Cause(err, "compile shared-network exclude source CIDR policy")
+	}
+	if len(includeIPv4) > maxSharedSourceCIDRPolicyEntries ||
+		len(includeIPv6) > maxSharedSourceCIDRPolicyEntries ||
+		len(excludeIPv4) > maxSharedSourceCIDRPolicyEntries ||
+		len(excludeIPv6) > maxSharedSourceCIDRPolicyEntries {
+		return E.New("shared-network source CIDR policy exceeds eBPF map capacity")
+	}
+	if b == nil || b.runtime == nil {
+		return errBackendClosed
+	}
+	if _, err = replaceDualStackCIDRPolicy(
+		int(b.runtime.include_source_ipv4_map_fd),
+		int(b.runtime.include_source_ipv6_map_fd),
+		dualStackCIDRPrefixes{},
+		dualStackCIDRPrefixes{includeIPv4, includeIPv6},
+		"shared-network ",
+		"include source CIDR",
+	); err != nil {
+		return err
+	}
+	if _, err = replaceDualStackCIDRPolicy(
+		int(b.runtime.exclude_source_ipv4_map_fd),
+		int(b.runtime.exclude_source_ipv6_map_fd),
+		dualStackCIDRPrefixes{},
+		dualStackCIDRPrefixes{excludeIPv4, excludeIPv6},
+		"shared-network ",
+		"exclude source CIDR",
+	); err != nil {
+		return err
+	}
+	b.includeSourceIPv4 = includeIPv4
+	b.includeSourceIPv6 = includeIPv6
+	b.excludeSourceIPv4 = excludeIPv4
+	b.excludeSourceIPv6 = excludeIPv6
+	return b.updatePolicyFlagsLocked()
+}
+
 func (b *SharedNetworkBackend) UpdateBypassCIDR(prefixes []netip.Prefix) (bool, error) {
 	ipv4, ipv6, err := compileBypassCIDRPolicy(prefixes)
 	if err != nil {
@@ -158,5 +205,11 @@ func computeSharedNetworkPolicyFlags(hostIPv4, hostIPv6, bypassIPv4, bypassIPv6 
 func (b *SharedNetworkBackend) updatePolicyFlagsLocked() error {
 	b.control.Flags &^= sharedNetworkPolicyFlags
 	b.control.Flags |= computeSharedNetworkPolicyFlags(b.hostIPv4, b.hostIPv6, b.bypassIPv4CIDR, b.bypassIPv6CIDR)
+	if len(b.includeSourceIPv4) != 0 || len(b.includeSourceIPv6) != 0 {
+		b.control.Flags |= sharedNetworkFlagIncludeSource
+	}
+	if len(b.excludeSourceIPv4) != 0 || len(b.excludeSourceIPv6) != 0 {
+		b.control.Flags |= sharedNetworkFlagExcludeSource
+	}
 	return b.updateControl()
 }

@@ -15,6 +15,7 @@ type EBPFOption struct {
 	Network            []string             `inbound:"network,omitempty"`
 	UDPTimeout         int64                `inbound:"udp-timeout,omitempty"`
 	DNSMode            string               `inbound:"dns-mode,omitempty"`
+	CgroupIPv6Mode     string               `inbound:"cgroup-ipv6-mode,omitempty"`
 	CgroupPath         string               `inbound:"cgroup-path,omitempty"`
 	RedirectAddress    []netip.Prefix       `inbound:"redirect-address,omitempty"`
 	BypassRuleSet      []string             `inbound:"bypass-rule-set,omitempty"`
@@ -52,6 +53,7 @@ func NewEBPF(options *EBPFOption) (*EBPF, error) {
 			Network:            options.Network,
 			UDPTimeout:         options.UDPTimeout,
 			DNSMode:            options.DNSMode,
+			CgroupIPv6Mode:     options.CgroupIPv6Mode,
 			CgroupPath:         options.CgroupPath,
 			RedirectAddress:    options.RedirectAddress,
 			BypassRuleSet:      options.BypassRuleSet,

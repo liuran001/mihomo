@@ -102,6 +102,7 @@ struct sb_ebpf_cgroup_runtime {
     int exclude_uid_map_fd;
     int bypass_ipv4_cidr_map_fd;
     int bypass_ipv6_cidr_map_fd;
+    int ipv6_available_map_fd;
     int connect4_prog_fd;
     int connect6_prog_fd;
     int connect6_v4mapped_prog_fd;
@@ -125,6 +126,10 @@ struct sb_ebpf_shared_network_runtime {
     int listener_map_fd;
     int host_ipv4_map_fd;
     int host_ipv6_map_fd;
+    int include_source_ipv4_map_fd;
+    int include_source_ipv6_map_fd;
+    int exclude_source_ipv4_map_fd;
+    int exclude_source_ipv6_map_fd;
     int fallback_bypass_ipv4_map_fd;
     int fallback_bypass_ipv6_map_fd;
     int scratch_map_fd;
@@ -138,6 +143,7 @@ int sb_ebpf_cgroup_prepare(
     bool enable_udp,
     bool enable_bypass_ipv4_cidr,
     bool enable_bypass_ipv6_cidr,
+    bool auto_ipv6,
     uint32_t include_uid_entries,
     uint32_t exclude_uid_entries,
     uint32_t tcp_redirect_map_capacity,

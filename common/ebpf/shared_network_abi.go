@@ -9,14 +9,16 @@ import (
 )
 
 type SharedNetworkConfig struct {
-	ListenerPort uint16
-	EnableTCP    bool
-	EnableUDP    bool
-	HijackDNS    bool
-	RedirectIPv4 netip.Prefix
-	RedirectIPv6 netip.Prefix
-	MapCapacity  uint32
-	UDPTimeout   time.Duration
+	ListenerPort      uint16
+	EnableTCP         bool
+	EnableUDP         bool
+	HijackDNS         bool
+	RedirectIPv4      netip.Prefix
+	RedirectIPv6      netip.Prefix
+	IncludeSourceCIDR []netip.Prefix
+	ExcludeSourceCIDR []netip.Prefix
+	MapCapacity       uint32
+	UDPTimeout        time.Duration
 }
 
 type sharedNetworkControl struct {
@@ -103,12 +105,16 @@ const (
 	sharedNetworkFlagHostIPv6
 	sharedNetworkFlagBypassIPv4
 	sharedNetworkFlagBypassIPv6
+	sharedNetworkFlagIncludeSource
+	sharedNetworkFlagExcludeSource
 )
 
 const sharedNetworkPolicyFlags = sharedNetworkFlagHostIPv4 |
 	sharedNetworkFlagHostIPv6 |
 	sharedNetworkFlagBypassIPv4 |
-	sharedNetworkFlagBypassIPv6
+	sharedNetworkFlagBypassIPv6 |
+	sharedNetworkFlagIncludeSource |
+	sharedNetworkFlagExcludeSource
 
 func makeSharedNetworkListenerKey(
 	protocol uint8,
