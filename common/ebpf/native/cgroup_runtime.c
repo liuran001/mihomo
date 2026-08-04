@@ -68,6 +68,16 @@ static int create_bypass_cidr_map(bool enabled, uint32_t key_size) {
         BPF_F_NO_PREALLOC);
 }
 
+static int create_ipv6_available_map(bool enabled) {
+    if (!enabled) return -1;
+    return sb_ebpf_create_map(
+        (enum bpf_map_type)SB_EBPF_ARRAY_MAP_TYPE,
+        sizeof(uint32_t),
+        sizeof(uint32_t),
+        1U,
+        0U);
+}
+
 static int open_cgroup_path(const char *path) {
     const char *actual = path != NULL && path[0] != '\0' ? path : SB_EBPF_DEFAULT_CGROUP_PATH;
     return open(actual, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
@@ -79,6 +89,7 @@ int sb_ebpf_cgroup_prepare(
 	bool enable_udp,
 	bool enable_bypass_ipv4_cidr,
 	bool enable_bypass_ipv6_cidr,
+	bool auto_ipv6,
 	uint32_t include_uid_entries,
 	uint32_t exclude_uid_entries,
 	uint32_t tcp_redirect_map_capacity,
@@ -129,6 +140,7 @@ int sb_ebpf_cgroup_prepare(
         enable_bypass_ipv4_cidr, sizeof(struct sb_ebpf_ipv4_cidr_lpm_key));
     runtime->bypass_ipv6_cidr_map_fd = create_bypass_cidr_map(
         enable_bypass_ipv6_cidr, sizeof(struct sb_ebpf_ipv6_cidr_lpm_key));
+    runtime->ipv6_available_map_fd = create_ipv6_available_map(auto_ipv6);
     if ((enable_tcp && runtime->tcp_redirect_map_fd < 0) ||
         (enable_udp && runtime->udp_redirect_map_fd < 0) ||
         (enable_udp && (runtime->udp_token_map_fd < 0 || runtime->udp_peer_map_fd < 0)) ||
@@ -136,7 +148,8 @@ int sb_ebpf_cgroup_prepare(
         (include_uid_entries > 0U && runtime->include_uid_map_fd < 0) ||
         (exclude_uid_entries > 0U && runtime->exclude_uid_map_fd < 0) ||
         (enable_bypass_ipv4_cidr && runtime->bypass_ipv4_cidr_map_fd < 0) ||
-        (enable_bypass_ipv6_cidr && runtime->bypass_ipv6_cidr_map_fd < 0)) {
+        (enable_bypass_ipv6_cidr && runtime->bypass_ipv6_cidr_map_fd < 0) ||
+        (auto_ipv6 && runtime->ipv6_available_map_fd < 0)) {
         goto prepare_fail;
     }
 
@@ -290,6 +303,7 @@ int sb_ebpf_cgroup_close(struct sb_ebpf_cgroup_runtime *runtime) {
     close_runtime_fd(&runtime->exclude_uid_map_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->include_uid_map_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->bypass_ipv6_cidr_map_fd, &result, &saved_errno);
+    close_runtime_fd(&runtime->ipv6_available_map_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->bypass_ipv4_cidr_map_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->bypass_socket_cookie_map_fd, &result, &saved_errno);
     close_runtime_fd(&runtime->udp_peer_map_fd, &result, &saved_errno);

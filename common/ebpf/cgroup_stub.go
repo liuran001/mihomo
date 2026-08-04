@@ -57,6 +57,10 @@ func (b *CgroupBackend) UsesSocketRelease() bool {
 	return false
 }
 
+func (b *CgroupBackend) UpdateIPv6Available(bool) (bool, error) {
+	return false, E.New("eBPF inbound is not supported by this build: cgo is disabled")
+}
+
 func (b *CgroupBackend) SelfBypassMode() string {
 	return ""
 }

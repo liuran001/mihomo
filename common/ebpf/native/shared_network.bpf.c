@@ -135,6 +135,10 @@ EXTERNAL_MAP(shared_reply, struct sb_shared_reply_key, struct sb_shared_reply_va
 EXTERNAL_MAP(shared_listener, struct sb_shared_listener_key, struct sb_shared_original_value, SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES);
 EXTERNAL_MAP(shared_host_ipv4, struct sb_lpm4_key, __u8, 256U);
 EXTERNAL_MAP(shared_host_ipv6, struct sb_lpm6_key, __u8, 256U);
+EXTERNAL_MAP(shared_include_source_ipv4, struct sb_lpm4_key, __u8, SB_SHARED_SOURCE_CIDR_MAP_ENTRIES);
+EXTERNAL_MAP(shared_include_source_ipv6, struct sb_lpm6_key, __u8, SB_SHARED_SOURCE_CIDR_MAP_ENTRIES);
+EXTERNAL_MAP(shared_exclude_source_ipv4, struct sb_lpm4_key, __u8, SB_SHARED_SOURCE_CIDR_MAP_ENTRIES);
+EXTERNAL_MAP(shared_exclude_source_ipv6, struct sb_lpm6_key, __u8, SB_SHARED_SOURCE_CIDR_MAP_ENTRIES);
 EXTERNAL_MAP(shared_bypass_ipv4, struct sb_lpm4_key, __u8, 65536U);
 EXTERNAL_MAP(shared_bypass_ipv6, struct sb_lpm6_key, __u8, 65536U);
 struct bpf_map_def SEC("maps") shared_scratch = {
@@ -194,6 +198,28 @@ INLINE bool dhcp_packet(__u8 protocol, __u16 source_port, __u16 destination_port
         source_port == 546U || source_port == 547U ||
         destination_port == 67U || destination_port == 68U ||
         destination_port == 546U || destination_port == 547U;
+}
+
+INLINE bool ipv4_source_selected(const __u8 source[4], const struct sb_shared_control *control) {
+    __u32 flags = control->flags;
+    if ((flags & (SB_SHARED_FLAG_INCLUDE_SOURCE | SB_SHARED_FLAG_EXCLUDE_SOURCE)) == 0U) return true;
+    struct sb_lpm4_key key = {.prefixlen = 32U};
+    __builtin_memcpy(key.addr, source, 4U);
+    if ((flags & SB_SHARED_FLAG_EXCLUDE_SOURCE) != 0U &&
+        map_lookup(&shared_exclude_source_ipv4, &key) != 0) return false;
+    return (flags & SB_SHARED_FLAG_INCLUDE_SOURCE) == 0U ||
+        map_lookup(&shared_include_source_ipv4, &key) != 0;
+}
+
+INLINE bool ipv6_source_selected(const __u8 source[16], const struct sb_shared_control *control) {
+    __u32 flags = control->flags;
+    if ((flags & (SB_SHARED_FLAG_INCLUDE_SOURCE | SB_SHARED_FLAG_EXCLUDE_SOURCE)) == 0U) return true;
+    struct sb_lpm6_key key = {.prefixlen = 128U};
+    __builtin_memcpy(key.addr, source, 16U);
+    if ((flags & SB_SHARED_FLAG_EXCLUDE_SOURCE) != 0U &&
+        map_lookup(&shared_exclude_source_ipv6, &key) != 0) return false;
+    return (flags & SB_SHARED_FLAG_INCLUDE_SOURCE) == 0U ||
+        map_lookup(&shared_include_source_ipv6, &key) != 0;
 }
 
 INLINE bool ipv4_builtin_bypass(const __u8 address[4]) {
@@ -538,6 +564,7 @@ NOINLINE int ingress_ipv4(
     struct ipv4_header *ip = data + l3_offset;
     if ((void *)(ip + 1) > data_end || ip->version != 4U || ip->ihl < 5U) return TC_ACT_PIPE;
     if (!selected_protocol(ip->protocol, control)) return TC_ACT_PIPE;
+    if (!ipv4_source_selected((const __u8 *)&ip->source, control)) return TC_ACT_PIPE;
     if ((swap16(ip->fragment_offset) & IP_FRAGMENT_MASK) != 0U) return TC_ACT_SHOT;
     __u32 header_length = (__u32)ip->ihl * 4U;
     struct transport_ports *ports = (void *)ip + header_length;
@@ -716,6 +743,7 @@ NOINLINE int ingress_ipv6(
     __u8 protocol = 0U;
     int transport = ipv6_transport_offset(data, data_end, l3_offset, &protocol);
     if (transport < 0 || !selected_protocol(protocol, control)) return TC_ACT_PIPE;
+    if (!ipv6_source_selected(ip->source, control)) return TC_ACT_PIPE;
     struct transport_ports *ports = data + transport;
     if ((void *)(ports + 1) > data_end) return TC_ACT_PIPE;
     __u16 source_port = swap16(ports->source);

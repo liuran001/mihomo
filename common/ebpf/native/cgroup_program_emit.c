@@ -70,6 +70,26 @@ static void emit_inbound_network_filter(
     }
 }
 
+static void emit_ipv6_availability_bypass(
+    struct bpf_builder *builder,
+    int ipv6_available_map_fd,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count) {
+    if (ipv6_available_map_fd < 0) return;
+
+    emit(builder, BPF_ST_MEM(BPF_W, BPF_REG_10, STACK_IFINDEX_KEY, 0));
+    emit_ld_map_fd(builder, BPF_REG_1, ipv6_available_map_fd);
+    emit(builder, BPF_MOV64_REG(BPF_REG_2, BPF_REG_10));
+    emit(builder, BPF_ALU64_IMM_OP(BPF_ADD, BPF_REG_2, STACK_IFINDEX_KEY));
+    emit(builder, BPF_CALL_FUNC(BPF_FUNC_map_lookup_elem));
+    size_t missing = emit_jump(
+        builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_0, 0, 0));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_2, BPF_REG_0, 0));
+    bypass_jumps[(*bypass_jump_count)++] =
+        emit_jump(builder, BPF_JMP_IMM_OP(BPF_JEQ, BPF_REG_2, 0, 0));
+    patch_jump(builder, missing, builder->count);
+}
+
 static void emit_dns_port_jumps(
     struct bpf_builder *builder,
     uint8_t protocol,

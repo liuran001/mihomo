@@ -8,6 +8,7 @@
 #include <linux/types.h>
 
 #define SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES 65536U
+#define SB_SHARED_SOURCE_CIDR_MAP_ENTRIES 4096U
 #define SB_SHARED_TOKEN_ATTEMPTS 8U
 #define SB_SHARED_NETWORK_SCRATCH_SIZE 256U
 
@@ -20,6 +21,8 @@
 #define SB_SHARED_FLAG_HOST_IPV6 (1U << 6)
 #define SB_SHARED_FLAG_BYPASS_IPV4 (1U << 7)
 #define SB_SHARED_FLAG_BYPASS_IPV6 (1U << 8)
+#define SB_SHARED_FLAG_INCLUDE_SOURCE (1U << 9)
+#define SB_SHARED_FLAG_EXCLUDE_SOURCE (1U << 10)
 
 struct sb_shared_control {
     __u32 enabled;

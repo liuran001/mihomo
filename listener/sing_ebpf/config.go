@@ -18,6 +18,9 @@ const (
 	androidTetheringDNSUID = 1052
 	dnsModeHijack          = "hijack"
 	dnsModeOff             = "off"
+	cgroupIPv6ModeAlways   = "always"
+	cgroupIPv6ModeAuto     = "auto"
+	cgroupIPv6ModeOff      = "off"
 )
 
 var defaultRedirectIPv4Prefix = netip.MustParsePrefix("127.128.0.0/9")
@@ -31,6 +34,24 @@ func normalizeDNSMode(mode string) (string, error) {
 	default:
 		return "", E.New("unknown eBPF dns_mode: ", mode)
 	}
+}
+
+func normalizeCgroupIPv6Mode(mode string) (string, error) {
+	switch mode {
+	case "", cgroupIPv6ModeAlways:
+		return cgroupIPv6ModeAlways, nil
+	case cgroupIPv6ModeAuto, cgroupIPv6ModeOff:
+		return mode, nil
+	default:
+		return "", E.New("unknown eBPF cgroup_ipv6_mode: ", mode)
+	}
+}
+
+func validateCgroupAddressFamilies(ipv6Mode string, ipv4Prefix netip.Prefix, ipv6Prefix netip.Prefix) error {
+	if !ipv4Prefix.IsValid() && (!ipv6Prefix.IsValid() || ipv6Mode == cgroupIPv6ModeOff) {
+		return E.New("eBPF local cgroup interception has no enabled address family")
+	}
+	return nil
 }
 
 func normalizeCgroupMapCapacity(options LC.EBPFMapCapacity) (ECommon.CgroupMapCapacity, error) {
@@ -153,6 +174,26 @@ func validateAndroidUIDOptions(goos string, options LC.EBPF) error {
 
 func hasAndroidUIDOptions(options LC.EBPF) bool {
 	return len(options.IncludeAndroidUser) > 0 || len(options.IncludePackage) > 0 || len(options.ExcludePackage) > 0
+}
+
+func normalizeSourceCIDRs(prefixes []netip.Prefix) ([]netip.Prefix, error) {
+	normalized := make([]netip.Prefix, 0, len(prefixes))
+	seen := make(map[netip.Prefix]struct{}, len(prefixes))
+	for _, prefix := range prefixes {
+		if !prefix.IsValid() {
+			return nil, E.New("invalid shared-network source CIDR")
+		}
+		prefix = prefix.Masked()
+		if prefix.Addr().Is4In6() && prefix.Bits() >= 96 {
+			prefix = netip.PrefixFrom(prefix.Addr().Unmap(), prefix.Bits()-96).Masked()
+		}
+		if _, loaded := seen[prefix]; loaded {
+			continue
+		}
+		seen[prefix] = struct{}{}
+		normalized = append(normalized, prefix)
+	}
+	return normalized, nil
 }
 
 func platformExcludedUIDRanges(goos string) []ECommon.UIDRange {

@@ -124,6 +124,7 @@ static int build_ipv6_sock_addr_prog(
     int bypass_socket_cookie_map_fd,
     int bypass_ipv4_cidr_map_fd,
     int bypass_ipv6_cidr_map_fd,
+    int ipv6_available_map_fd,
     uint8_t protocol,
     bool protocol_from_context,
     uint16_t listen_port,
@@ -198,6 +199,8 @@ static int build_ipv6_sock_addr_prog(
         emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 12));
         emit(&b, BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port)));
     }
+    emit_ipv6_availability_bypass(
+        &b, ipv6_available_map_fd, bypass_jumps, &bypass_jump_count);
     // Connected UDP send() may not hit UDP_SENDMSG on Android kernels. Rewrite at CONNECT so all
     // packets reach the inbound listener; UDP6_SENDMSG remains a fallback for sendmsg() callers.
     if (attach_type == BPF_CGROUP_INET6_CONNECT && protocol_from_context) {

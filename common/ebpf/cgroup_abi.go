@@ -38,13 +38,16 @@ type UIDRange struct {
 }
 
 type CgroupConfig struct {
-	Path         string
-	EnableTCP    bool
-	EnableUDP    bool
-	RedirectIPv4 netip.Prefix
-	RedirectIPv6 netip.Prefix
-	MapCapacity  CgroupMapCapacity
-	Policy       CgroupPolicy
+	Path          string
+	EnableTCP     bool
+	EnableUDP     bool
+	EnableIPv6    bool
+	AutoIPv6      bool
+	IPv6Available bool
+	RedirectIPv4  netip.Prefix
+	RedirectIPv6  netip.Prefix
+	MapCapacity   CgroupMapCapacity
+	Policy        CgroupPolicy
 }
 
 func DefaultCgroupMapCapacity() CgroupMapCapacity {

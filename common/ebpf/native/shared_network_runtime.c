@@ -94,6 +94,11 @@ int sb_ebpf_shared_network_prepare(
     stage = "create host maps";
     runtime->host_ipv4_map_fd = shared_network_create_lpm4(256U);
     runtime->host_ipv6_map_fd = shared_network_create_lpm6(256U);
+    stage = "create source CIDR maps";
+    runtime->include_source_ipv4_map_fd = shared_network_create_lpm4(SB_SHARED_SOURCE_CIDR_MAP_ENTRIES);
+    runtime->include_source_ipv6_map_fd = shared_network_create_lpm6(SB_SHARED_SOURCE_CIDR_MAP_ENTRIES);
+    runtime->exclude_source_ipv4_map_fd = shared_network_create_lpm4(SB_SHARED_SOURCE_CIDR_MAP_ENTRIES);
+    runtime->exclude_source_ipv6_map_fd = shared_network_create_lpm6(SB_SHARED_SOURCE_CIDR_MAP_ENTRIES);
     stage = "create scratch map";
     runtime->scratch_map_fd = sb_ebpf_create_map(
         BPF_MAP_TYPE_PERCPU_ARRAY,
@@ -108,6 +113,10 @@ int sb_ebpf_shared_network_prepare(
         runtime->listener_map_fd < 0 ||
         runtime->host_ipv4_map_fd < 0 ||
         runtime->host_ipv6_map_fd < 0 ||
+        runtime->include_source_ipv4_map_fd < 0 ||
+        runtime->include_source_ipv6_map_fd < 0 ||
+        runtime->exclude_source_ipv4_map_fd < 0 ||
+        runtime->exclude_source_ipv6_map_fd < 0 ||
         runtime->scratch_map_fd < 0) {
         goto fail;
     }
@@ -157,6 +166,10 @@ int sb_ebpf_shared_network_close(struct sb_ebpf_shared_network_runtime *runtime)
     CLOSE_SHARED_FD(runtime->scratch_map_fd);
     CLOSE_SHARED_FD(runtime->fallback_bypass_ipv6_map_fd);
     CLOSE_SHARED_FD(runtime->fallback_bypass_ipv4_map_fd);
+    CLOSE_SHARED_FD(runtime->exclude_source_ipv6_map_fd);
+    CLOSE_SHARED_FD(runtime->exclude_source_ipv4_map_fd);
+    CLOSE_SHARED_FD(runtime->include_source_ipv6_map_fd);
+    CLOSE_SHARED_FD(runtime->include_source_ipv4_map_fd);
     CLOSE_SHARED_FD(runtime->host_ipv6_map_fd);
     CLOSE_SHARED_FD(runtime->host_ipv4_map_fd);
     CLOSE_SHARED_FD(runtime->listener_map_fd);

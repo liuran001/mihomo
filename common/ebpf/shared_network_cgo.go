@@ -51,15 +51,19 @@ import (
 var sharedNetworkObject []byte
 
 type SharedNetworkBackend struct {
-	access          sync.RWMutex
-	runtime         *C.struct_sb_ebpf_shared_network_runtime
-	control         sharedNetworkControl
-	hostIPv4        []netip.Prefix
-	hostIPv6        []netip.Prefix
-	bypassIPv4MapFD int
-	bypassIPv6MapFD int
-	bypassIPv4CIDR  []netip.Prefix
-	bypassIPv6CIDR  []netip.Prefix
+	access            sync.RWMutex
+	runtime           *C.struct_sb_ebpf_shared_network_runtime
+	control           sharedNetworkControl
+	hostIPv4          []netip.Prefix
+	hostIPv6          []netip.Prefix
+	bypassIPv4MapFD   int
+	bypassIPv6MapFD   int
+	bypassIPv4CIDR    []netip.Prefix
+	bypassIPv6CIDR    []netip.Prefix
+	includeSourceIPv4 []netip.Prefix
+	includeSourceIPv6 []netip.Prefix
+	excludeSourceIPv4 []netip.Prefix
+	excludeSourceIPv6 []netip.Prefix
 }
 
 func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConfig) (*SharedNetworkBackend, error) {
@@ -171,6 +175,10 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		backend.control.TokenIPv6Prefix = redirectIPv6.Addr().As16()
 		backend.control.TokenIPv6PrefixBits = uint8(redirectIPv6.Bits())
 	}
+	if err = backend.initializeSourceCIDRPolicy(config.IncludeSourceCIDR, config.ExcludeSourceCIDR); err != nil {
+		_ = backend.Close()
+		return nil, err
+	}
 	if err := backend.updateControl(); err != nil {
 		_ = backend.Close()
 		return nil, E.Cause(err, "initialize shared-network control")
@@ -271,6 +279,10 @@ func (b *SharedNetworkBackend) Close() error {
 		b.bypassIPv6MapFD = -1
 		b.bypassIPv4CIDR = nil
 		b.bypassIPv6CIDR = nil
+		b.includeSourceIPv4 = nil
+		b.includeSourceIPv6 = nil
+		b.excludeSourceIPv4 = nil
+		b.excludeSourceIPv6 = nil
 	}
 	if result != 0 {
 		return E.Cause(syscall.Errno(savedErrno), "close shared-network runtime")

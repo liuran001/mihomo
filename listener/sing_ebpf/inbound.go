@@ -39,16 +39,18 @@ type Inbound struct {
 	additions []inbound.Addition
 	options   LC.EBPF
 
-	cgroupPath         string
-	enableTCP          bool
-	enableUDP          bool
-	dnsMode            string
-	redirectIPv4Prefix netip.Prefix
-	redirectIPv6Prefix netip.Prefix
-	cgroupMapCapacity  ECommon.CgroupMapCapacity
-	cgroupPolicy       ECommon.CgroupPolicy
-	androidUIDOptions  *androidUIDOptions
-	udpTimeout         time.Duration
+	cgroupPath          string
+	enableTCP           bool
+	enableUDP           bool
+	dnsMode             string
+	cgroupIPv6Mode      string
+	cgroupIPv6Available bool
+	redirectIPv4Prefix  netip.Prefix
+	redirectIPv6Prefix  netip.Prefix
+	cgroupMapCapacity   ECommon.CgroupMapCapacity
+	cgroupPolicy        ECommon.CgroupPolicy
+	androidUIDOptions   *androidUIDOptions
+	udpTimeout          time.Duration
 
 	listeners internalListenerSet
 
@@ -97,6 +99,13 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 	if err != nil {
 		return nil, err
 	}
+	cgroupIPv6Mode, err := normalizeCgroupIPv6Mode(options.CgroupIPv6Mode)
+	if err != nil {
+		return nil, err
+	}
+	if err = validateCgroupAddressFamilies(cgroupIPv6Mode, redirectIPv4Prefix, redirectIPv6Prefix); err != nil {
+		return nil, err
+	}
 	cgroupMapCapacity, err := normalizeCgroupMapCapacity(options.MapCapacity)
 	if err != nil {
 		return nil, err
@@ -120,18 +129,20 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 	}
 
 	inboundListener := &Inbound{
-		ctx:                ctx,
-		tunnel:             tunnel,
-		additions:          additions,
-		options:            options,
-		cgroupPath:         cgroupPath,
-		enableTCP:          enableTCP,
-		enableUDP:          enableUDP,
-		dnsMode:            dnsMode,
-		redirectIPv4Prefix: redirectIPv4Prefix,
-		redirectIPv6Prefix: redirectIPv6Prefix,
-		cgroupMapCapacity:  cgroupMapCapacity,
-		udpTimeout:         udpTimeout,
+		ctx:                 ctx,
+		tunnel:              tunnel,
+		additions:           additions,
+		options:             options,
+		cgroupPath:          cgroupPath,
+		enableTCP:           enableTCP,
+		enableUDP:           enableUDP,
+		dnsMode:             dnsMode,
+		cgroupIPv6Mode:      cgroupIPv6Mode,
+		cgroupIPv6Available: true,
+		redirectIPv4Prefix:  redirectIPv4Prefix,
+		redirectIPv6Prefix:  redirectIPv6Prefix,
+		cgroupMapCapacity:   cgroupMapCapacity,
+		udpTimeout:          udpTimeout,
 		cgroupPolicy: ECommon.CgroupPolicy{
 			HijackDNS:  dnsMode == dnsModeHijack,
 			IncludeUID: includeUIDRanges,
@@ -156,6 +167,16 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		if len(options.SharedNetwork.IncludeInterface) == 0 {
 			return nil, E.New("shared_network.include_interface must not be empty")
 		}
+		includeSource, sourceErr := normalizeSourceCIDRs(options.SharedNetwork.IncludeSourceCIDR)
+		if sourceErr != nil {
+			return nil, E.Cause(sourceErr, "normalize include_source_cidr")
+		}
+		excludeSource, sourceErr := normalizeSourceCIDRs(options.SharedNetwork.ExcludeSourceCIDR)
+		if sourceErr != nil {
+			return nil, E.Cause(sourceErr, "normalize exclude_source_cidr")
+		}
+		options.SharedNetwork.IncludeSourceCIDR = includeSource
+		options.SharedNetwork.ExcludeSourceCIDR = excludeSource
 		sharedMapCapacity, capacityErr := normalizeMapCapacityValue(
 			"shared_network.map_capacity",
 			options.SharedNetwork.MapCapacity,
@@ -199,16 +220,22 @@ func (i *Inbound) start() error {
 			return err
 		}
 	}
+	if err := i.refreshCgroupIPv6Availability(true); err != nil {
+		return err
+	}
 	policy := i.cgroupPolicy
 	policy.EnableBypassCIDR = true
 	backend, err := ECommon.PrepareCgroup(ECommon.CgroupConfig{
-		Path:         i.cgroupPath,
-		EnableTCP:    i.enableTCP,
-		EnableUDP:    i.enableUDP,
-		RedirectIPv4: i.redirectIPv4Prefix,
-		RedirectIPv6: i.redirectIPv6Prefix,
-		MapCapacity:  i.cgroupMapCapacity,
-		Policy:       policy,
+		Path:          i.cgroupPath,
+		EnableTCP:     i.enableTCP,
+		EnableUDP:     i.enableUDP,
+		EnableIPv6:    i.cgroupIPv6Enabled(),
+		AutoIPv6:      i.cgroupIPv6Mode == cgroupIPv6ModeAuto && i.cgroupIPv6Enabled(),
+		IPv6Available: i.cgroupIPv6Available,
+		RedirectIPv4:  i.redirectIPv4Prefix,
+		RedirectIPv6:  i.redirectIPv6Prefix,
+		MapCapacity:   i.cgroupMapCapacity,
+		Policy:        policy,
 	})
 	if err != nil {
 		return err
@@ -232,7 +259,7 @@ func (i *Inbound) start() error {
 		i.enableTCP,
 		i.enableUDP,
 		i.redirectIPv4Prefix.IsValid(),
-		i.redirectIPv6Prefix.IsValid(),
+		i.cgroupIPv6Enabled(),
 		i.newListener,
 	); err != nil {
 		return err
@@ -252,10 +279,14 @@ func (i *Inbound) start() error {
 	i.startUDPPeriodic()
 
 	bypassIPv4Count, bypassIPv6Count := backend.BypassCIDRCount()
-	log.Infoln("[EBPF] inbound attached: cgroup=%s, listen_port=%d, dns_mode=%s, self_bypass=%s, redirect_address=[%s], bypass_cidr={ipv4:%d, ipv6:%d}, programs=[%s]",
+	if i.cgroupIPv6Mode == cgroupIPv6ModeAuto && i.cgroupIPv6Enabled() {
+		log.Infoln("[EBPF] local cgroup IPv6 interception: available=%v", i.cgroupIPv6Available)
+	}
+	log.Infoln("[EBPF] inbound attached: cgroup=%s, listen_port=%d, dns_mode=%s, cgroup_ipv6_mode=%s, self_bypass=%s, redirect_address=[%s], bypass_cidr={ipv4:%d, ipv6:%d}, programs=[%s]",
 		backend.CgroupPath(),
 		i.listeners.selectedPort(),
 		i.dnsMode,
+		i.cgroupIPv6Mode,
 		backend.SelfBypassMode(),
 		strings.Join(i.redirectAddressStrings(), ", "),
 		bypassIPv4Count,
@@ -337,6 +368,9 @@ func (i *Inbound) unregisterSocketProtect() {
 // InterfaceUpdated notifies the shared-network TC manager that interfaces may
 // have changed, so it can attach/detach downstream interfaces.
 func (i *Inbound) InterfaceUpdated() {
+	if err := i.refreshCgroupIPv6Availability(false); err != nil {
+		log.Warnln("[EBPF] refresh local cgroup IPv6 availability: %s", err.Error())
+	}
 	if i.sharedNetwork != nil {
 		i.sharedNetwork.InterfaceUpdated()
 	}

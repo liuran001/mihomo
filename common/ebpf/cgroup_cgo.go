@@ -14,6 +14,7 @@ static int singbox_ebpf_cgroup_prepare(
 	bool enable_udp,
 	bool enable_bypass_ipv4_cidr,
 	bool enable_bypass_ipv6_cidr,
+	bool auto_ipv6,
 	uint32_t include_uid_entries,
 	uint32_t exclude_uid_entries,
 	uint32_t tcp_redirect_map_capacity,
@@ -27,6 +28,7 @@ static int singbox_ebpf_cgroup_prepare(
 		enable_udp,
 		enable_bypass_ipv4_cidr,
 		enable_bypass_ipv6_cidr,
+		auto_ipv6,
 		include_uid_entries,
 		exclude_uid_entries,
 		tcp_redirect_map_capacity,
@@ -104,11 +106,15 @@ type CgroupBackend struct {
 	socketBypassMapFD   int
 	bypassIPv4CIDRMapFD int
 	bypassIPv6CIDRMapFD int
+	ipv6AvailableMapFD  int
 	bypassIPv4CIDR      []netip.Prefix
 	bypassIPv6CIDR      []netip.Prefix
 	cgroupPath          string
 	redirectIPv4        netip.Prefix
 	redirectIPv6        netip.Prefix
+	enableIPv6          bool
+	autoIPv6            bool
+	ipv6Available       bool
 	enableUDP           bool
 	hijackDNS           bool
 	lookupAndDeleteMode atomic.Int32
@@ -143,6 +149,15 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 	}
 	if !redirectIPv4.IsValid() && !redirectIPv6.IsValid() {
 		return nil, E.New("missing eBPF redirect address")
+	}
+	if config.EnableIPv6 && !redirectIPv6.IsValid() {
+		return nil, E.New("missing IPv6 eBPF redirect address")
+	}
+	if config.AutoIPv6 && !config.EnableIPv6 {
+		return nil, E.New("automatic IPv6 interception requires enabled IPv6 interception")
+	}
+	if !redirectIPv4.IsValid() && !config.EnableIPv6 {
+		return nil, E.New("eBPF cgroup backend has no enabled address family")
 	}
 	includeUIDEntries, err := compileUIDPolicy("include_uid", policy.IncludeUID)
 	if err != nil {
@@ -181,6 +196,7 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		C.bool(config.EnableUDP),
 		C.bool(policy.EnableBypassCIDR && redirectIPv4.IsValid()),
 		C.bool(policy.EnableBypassCIDR && redirectIPv6.IsValid()),
+		C.bool(config.AutoIPv6),
 		C.uint32_t(len(includeUIDEntries)),
 		C.uint32_t(len(excludeUIDEntries)),
 		C.uint32_t(mapCapacity.TCPRedirect),
@@ -205,11 +221,21 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		socketBypassMapFD:   int(runtimeState.bypass_socket_cookie_map_fd),
 		bypassIPv4CIDRMapFD: int(runtimeState.bypass_ipv4_cidr_map_fd),
 		bypassIPv6CIDRMapFD: int(runtimeState.bypass_ipv6_cidr_map_fd),
+		ipv6AvailableMapFD:  int(runtimeState.ipv6_available_map_fd),
 		cgroupPath:          cgroupPath,
 		redirectIPv4:        redirectIPv4,
 		redirectIPv6:        redirectIPv6,
+		enableIPv6:          config.EnableIPv6,
+		autoIPv6:            config.AutoIPv6,
+		ipv6Available:       false,
 		enableUDP:           config.EnableUDP,
 		hijackDNS:           policy.HijackDNS,
+	}
+	if config.AutoIPv6 {
+		if _, err = backend.updateIPv6AvailableLocked(config.IPv6Available); err != nil {
+			_ = backend.Close()
+			return nil, E.Cause(err, "initialize IPv6 availability eBPF map")
+		}
 	}
 	if err = populateUIDPolicyMap(int(runtimeState.include_uid_map_fd), includeUIDEntries); err != nil {
 		_ = backend.Close()
@@ -386,7 +412,7 @@ func (b *CgroupBackend) loadPrograms(listenerPort uint16, selfTGID uint32) error
 		C.bool(b.hijackDNS),
 		redirectIPv4Pointer,
 		redirectIPv4Bits,
-		C.bool(b.redirectIPv6.IsValid()),
+		C.bool(b.enableIPv6),
 		redirectIPv6Pointer,
 		redirectIPv6Bits,
 		&savedErrno,
@@ -409,6 +435,41 @@ func (b *CgroupBackend) SelfBypassMode() string {
 		return "tgid"
 	}
 	return "socket_cookie"
+}
+
+func (b *CgroupBackend) UpdateIPv6Available(available bool) (bool, error) {
+	if b == nil {
+		return false, errBackendClosed
+	}
+	b.access.Lock()
+	defer b.access.Unlock()
+	return b.updateIPv6AvailableLocked(available)
+}
+
+func (b *CgroupBackend) updateIPv6AvailableLocked(available bool) (bool, error) {
+	if b.runtime == nil {
+		return false, errBackendClosed
+	}
+	if !b.autoIPv6 || b.ipv6AvailableMapFD < 0 {
+		return false, nil
+	}
+	if b.ipv6Available == available {
+		return false, nil
+	}
+	key := uint32(0)
+	value := uint32(0)
+	if available {
+		value = 1
+	}
+	if err := updateMap(
+		b.ipv6AvailableMapFD,
+		unsafe.Pointer(&key),
+		unsafe.Pointer(&value),
+	); err != nil {
+		return false, E.Cause(err, "update IPv6 availability eBPF map")
+	}
+	b.ipv6Available = available
+	return true, nil
 }
 
 func (b *CgroupBackend) Attach() error {
@@ -446,6 +507,7 @@ func (b *CgroupBackend) Close() error {
 		b.socketBypassMapFD = -1
 		b.bypassIPv4CIDRMapFD = -1
 		b.bypassIPv6CIDRMapFD = -1
+		b.ipv6AvailableMapFD = -1
 		b.bypassIPv4CIDR = nil
 		b.bypassIPv6CIDR = nil
 	}

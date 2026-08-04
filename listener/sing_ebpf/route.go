@@ -23,7 +23,8 @@ func (i *Inbound) setupLocalRoutes() error {
 	if i.redirectIPv4Prefix.IsValid() {
 		prefixes = append(prefixes, i.redirectIPv4Prefix)
 	}
-	if i.redirectIPv6Prefix.IsValid() {
+	if i.redirectIPv6Prefix.IsValid() &&
+		(i.cgroupIPv6Enabled() || i.sharedNetwork != nil) {
 		prefixes = append(prefixes, i.redirectIPv6Prefix)
 	}
 	routes, err := addLocalRoutes(prefixes)

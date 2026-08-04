@@ -43,14 +43,16 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		return E.Errors(err, s.closeListeners())
 	}
 	backend, err := ECommon.PrepareSharedNetwork(cgroupBackend, ECommon.SharedNetworkConfig{
-		ListenerPort: s.listeners.selectedPort(),
-		EnableTCP:    s.inbound.enableTCP,
-		EnableUDP:    s.inbound.enableUDP,
-		HijackDNS:    s.inbound.dnsMode == dnsModeHijack,
-		RedirectIPv4: s.inbound.redirectIPv4Prefix,
-		RedirectIPv6: s.inbound.redirectIPv6Prefix,
-		MapCapacity:  s.mapCapacity,
-		UDPTimeout:   s.inbound.udpTimeout,
+		ListenerPort:      s.listeners.selectedPort(),
+		EnableTCP:         s.inbound.enableTCP,
+		EnableUDP:         s.inbound.enableUDP,
+		HijackDNS:         s.inbound.dnsMode == dnsModeHijack,
+		RedirectIPv4:      s.inbound.redirectIPv4Prefix,
+		RedirectIPv6:      s.inbound.redirectIPv6Prefix,
+		IncludeSourceCIDR: s.inbound.options.SharedNetwork.IncludeSourceCIDR,
+		ExcludeSourceCIDR: s.inbound.options.SharedNetwork.ExcludeSourceCIDR,
+		MapCapacity:       s.mapCapacity,
+		UDPTimeout:        s.inbound.udpTimeout,
 	})
 	if err != nil {
 		return E.Errors(err, s.closeListeners())
@@ -72,10 +74,12 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		return E.Errors(err, s.Close())
 	}
 	s.startUDPPeriodic()
-	log.Infoln("[EBPF] shared-network TC interception ready: downstream_interfaces=[%s], redirect_listener_port=%d, dns_mode=%s, tc_priority=%d, map_capacity=%d, programs=[tc/ingress, tc/egress]",
+	log.Infoln("[EBPF] shared-network TC interception ready: downstream_interfaces=[%s], redirect_listener_port=%d, dns_mode=%s, source_cidr={include:%d, exclude:%d}, tc_priority=%d, map_capacity=%d, programs=[tc/ingress, tc/egress]",
 		s.tcManager.InterfaceString(),
 		s.listeners.selectedPort(),
 		s.inbound.dnsMode,
+		len(s.inbound.options.SharedNetwork.IncludeSourceCIDR),
+		len(s.inbound.options.SharedNetwork.ExcludeSourceCIDR),
 		sharedNetworkTCPriority,
 		s.mapCapacity,
 	)
