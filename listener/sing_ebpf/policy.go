@@ -106,6 +106,16 @@ func (i *Inbound) refreshBypassCIDRsLocked() (bool, error) {
 		return false, err
 	}
 	i.bypassCIDR = prefixes
+	// Keep the shared-network backend's bypass flags in sync. It reuses the
+	// cgroup backend's bypass maps, so only the control presence flags need to
+	// follow the effective CIDR set (including runtime bypass_rule_set changes).
+	if i.sharedNetwork != nil {
+		if sharedBackend := i.sharedNetwork.sharedBackendInstance(); sharedBackend != nil && !sharedBackend.IsClosed() {
+			if stateErr := sharedBackend.SetBypassCIDRState(prefixes); stateErr != nil {
+				log.Errorln("[EBPF] refresh shared-network bypass CIDR state: %s", stateErr.Error())
+			}
+		}
+	}
 	// Publish the effective bypass CIDR set to the DNS fake-ip middleware so
 	// domains whose real addresses fall inside it keep their real IP and the
 	// kernel eBPF bypass can engage. Only publish when bypass_rule_set is used.
