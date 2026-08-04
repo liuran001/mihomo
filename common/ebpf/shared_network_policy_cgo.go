@@ -98,7 +98,9 @@ func (b *SharedNetworkBackend) UpdateHostAddresses(addresses []netip.Addr) error
 }
 
 // SetBypassCIDRState updates only policy presence flags when the maps are
-// owned by a cgroup backend and shared-network reuses those descriptors.
+// owned by a cgroup backend and shared-network reuses those descriptors. It
+// also records the CIDR list so updatePolicyFlagsLocked can rebuild the flags
+// on later control updates (e.g. UpdateHostAddresses) instead of wiping them.
 func (b *SharedNetworkBackend) SetBypassCIDRState(prefixes []netip.Prefix) error {
 	if b == nil {
 		return errBackendClosed
@@ -112,7 +114,11 @@ func (b *SharedNetworkBackend) SetBypassCIDRState(prefixes []netip.Prefix) error
 	if b.runtime == nil {
 		return errBackendClosed
 	}
+	oldIPv4 := b.bypassIPv4CIDR
+	oldIPv6 := b.bypassIPv6CIDR
 	oldFlags := b.control.Flags
+	b.bypassIPv4CIDR = slices.Clone(ipv4)
+	b.bypassIPv6CIDR = slices.Clone(ipv6)
 	b.control.Flags &^= sharedNetworkFlagBypassIPv4 | sharedNetworkFlagBypassIPv6
 	if len(ipv4) != 0 {
 		b.control.Flags |= sharedNetworkFlagBypassIPv4
@@ -121,24 +127,36 @@ func (b *SharedNetworkBackend) SetBypassCIDRState(prefixes []netip.Prefix) error
 		b.control.Flags |= sharedNetworkFlagBypassIPv6
 	}
 	if err = b.updateControl(); err != nil {
+		b.bypassIPv4CIDR = oldIPv4
+		b.bypassIPv6CIDR = oldIPv6
 		b.control.Flags = oldFlags
 	}
 	return err
 }
 
+// computeSharedNetworkPolicyFlags computes the host/bypass presence flags from
+// the stored policy lists. updatePolicyFlagsLocked relies on SetBypassCIDRState
+// having persisted the bypass list; otherwise the bypass flags would be
+// cleared on every UpdateHostAddresses.
+func computeSharedNetworkPolicyFlags(hostIPv4, hostIPv6, bypassIPv4, bypassIPv6 []netip.Prefix) uint32 {
+	var flags uint32
+	if len(hostIPv4) != 0 {
+		flags |= sharedNetworkFlagHostIPv4
+	}
+	if len(hostIPv6) != 0 {
+		flags |= sharedNetworkFlagHostIPv6
+	}
+	if len(bypassIPv4) != 0 {
+		flags |= sharedNetworkFlagBypassIPv4
+	}
+	if len(bypassIPv6) != 0 {
+		flags |= sharedNetworkFlagBypassIPv6
+	}
+	return flags
+}
+
 func (b *SharedNetworkBackend) updatePolicyFlagsLocked() error {
 	b.control.Flags &^= sharedNetworkPolicyFlags
-	if len(b.hostIPv4) != 0 {
-		b.control.Flags |= sharedNetworkFlagHostIPv4
-	}
-	if len(b.hostIPv6) != 0 {
-		b.control.Flags |= sharedNetworkFlagHostIPv6
-	}
-	if len(b.bypassIPv4CIDR) != 0 {
-		b.control.Flags |= sharedNetworkFlagBypassIPv4
-	}
-	if len(b.bypassIPv6CIDR) != 0 {
-		b.control.Flags |= sharedNetworkFlagBypassIPv6
-	}
+	b.control.Flags |= computeSharedNetworkPolicyFlags(b.hostIPv4, b.hostIPv6, b.bypassIPv4CIDR, b.bypassIPv6CIDR)
 	return b.updateControl()
 }
