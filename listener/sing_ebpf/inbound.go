@@ -47,6 +47,7 @@ type Inbound struct {
 	redirectIPv6Prefix netip.Prefix
 	cgroupMapCapacity  ECommon.CgroupMapCapacity
 	cgroupPolicy       ECommon.CgroupPolicy
+	androidUIDOptions  *androidUIDOptions
 	udpTimeout         time.Duration
 
 	listeners internalListenerSet
@@ -114,6 +115,10 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		udpTimeout = 5 * time.Minute
 	}
 
+	if err := validateAndroidUIDOptions(runtime.GOOS, options); err != nil {
+		return nil, err
+	}
+
 	inboundListener := &Inbound{
 		ctx:                ctx,
 		tunnel:             tunnel,
@@ -132,6 +137,7 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 			IncludeUID: includeUIDRanges,
 			ExcludeUID: excludeUIDRanges,
 		},
+		androidUIDOptions: newAndroidUIDOptions(options),
 	}
 
 	rp, ok := tunnel.(P.Tunnel)
@@ -188,6 +194,11 @@ func parseNetworkOptions(networks []string) (tcp bool, udp bool) {
 }
 
 func (i *Inbound) start() error {
+	if i.androidUIDOptions != nil {
+		if err := i.resolveAndroidUIDPolicy(); err != nil {
+			return err
+		}
+	}
 	policy := i.cgroupPolicy
 	policy.EnableBypassCIDR = true
 	backend, err := ECommon.PrepareCgroup(ECommon.CgroupConfig{

@@ -135,6 +135,26 @@ func parseUIDRanges(uidList []uint32, rangeList []string) ([]ECommon.UIDRange, e
 	return uidRanges, nil
 }
 
+func validateAndroidUIDOptions(goos string, options LC.EBPF) error {
+	if !hasAndroidUIDOptions(options) {
+		return nil
+	}
+	if goos != "android" {
+		return E.New("include_android_user, include_package, and exclude_package are only supported on Android")
+	}
+	const maxAndroidUserID = (uint64(^uint32(0)-1) - (androidUserRange - 1)) / androidUserRange
+	for _, userID := range options.IncludeAndroidUser {
+		if userID < 0 || uint64(userID) > maxAndroidUserID {
+			return E.New("invalid include_android_user: ", userID)
+		}
+	}
+	return nil
+}
+
+func hasAndroidUIDOptions(options LC.EBPF) bool {
+	return len(options.IncludeAndroidUser) > 0 || len(options.IncludePackage) > 0 || len(options.ExcludePackage) > 0
+}
+
 func platformExcludedUIDRanges(goos string) []ECommon.UIDRange {
 	if goos != "android" {
 		return nil
