@@ -237,6 +237,7 @@ func (i *Inbound) start() error {
 		RedirectIPv4:  i.redirectIPv4Prefix,
 		RedirectIPv6:  i.redirectIPv6Prefix,
 		MapCapacity:   i.cgroupMapCapacity,
+		UDPTimeout:    i.udpTimeout,
 		Policy:        policy,
 	})
 	if err != nil {
