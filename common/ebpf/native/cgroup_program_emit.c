@@ -26,6 +26,16 @@ static void patch_jump(struct bpf_builder *builder, size_t jump_index, size_t ta
     builder->insns[jump_index].off = (int16_t)(target_index - jump_index - 1U);
 }
 
+static void patch_jumps(
+    struct bpf_builder *builder,
+    const size_t *jump_indices,
+    size_t jump_count,
+    size_t target_index) {
+    for (size_t index = 0; index < jump_count; ++index) {
+        patch_jump(builder, jump_indices[index], target_index);
+    }
+}
+
 static void emit_ld_map_fd(struct bpf_builder *builder, int dst_reg, int map_fd) {
     emit(builder, (struct bpf_insn){
         .code = BPF_LD | BPF_DW | BPF_IMM,
@@ -46,6 +56,14 @@ static size_t emit_exit(struct bpf_builder *builder, int result) {
     emit(builder, BPF_MOV64_IMM(BPF_REG_0, result));
     emit(builder, BPF_EXIT_INSN());
     return label;
+}
+
+static void emit_ipv6_sock_addr_destination(struct bpf_builder *builder) {
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_7, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6)));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_8, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 4));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_9, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 8));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_4, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 12));
+    emit(builder, BPF_LDX_MEM(BPF_W, BPF_REG_5, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port)));
 }
 
 static void emit_inbound_network_filter(
@@ -336,9 +354,7 @@ static void emit_redirect_candidate(
     success_jumps[(*success_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
 
     size_t collision_label = builder->count;
-    for (size_t index = 0; index < collision_jump_count; ++index) {
-        patch_jump(builder, collision_jumps[index], collision_label);
-    }
+    patch_jumps(builder, collision_jumps, collision_jump_count, collision_label);
     next_jumps[(*next_jump_count)++] = emit_jump(builder, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
 }
 
@@ -396,9 +412,7 @@ static void emit_ipv4_redirect_token(
             success_jumps,
             &success_jump_count);
         size_t next_label = builder->count;
-        for (size_t i = 0; i < next_jump_count; ++i) {
-            patch_jump(builder, next_jumps[i], next_label);
-        }
+        patch_jumps(builder, next_jumps, next_jump_count, next_label);
         if (attempt + 1U < SB_EBPF_REDIRECT_TOKEN_ATTEMPTS) {
             emit(builder, BPF_ALU32_IMM_OP(BPF_ADD, BPF_REG_8, 0x9e3779b9U));
         } else {
@@ -406,9 +420,7 @@ static void emit_ipv4_redirect_token(
         }
     }
     size_t success_label = builder->count;
-    for (size_t i = 0; i < success_jump_count; ++i) {
-        patch_jump(builder, success_jumps[i], success_label);
-    }
+    patch_jumps(builder, success_jumps, success_jump_count, success_label);
 }
 
 static void emit_ipv6_redirect_token(
@@ -478,9 +490,7 @@ static void emit_ipv6_redirect_token(
             success_jumps,
             &success_jump_count);
         size_t next_label = builder->count;
-        for (size_t i = 0; i < next_jump_count; ++i) {
-            patch_jump(builder, next_jumps[i], next_label);
-        }
+        patch_jumps(builder, next_jumps, next_jump_count, next_label);
         if (attempt + 1U < SB_EBPF_REDIRECT_TOKEN_ATTEMPTS) {
             emit(builder, BPF_ALU32_IMM_OP(BPF_ADD, BPF_REG_8, 0x9e3779b9U));
             emit(builder, BPF_ALU32_IMM_OP(BPF_ADD, BPF_REG_9, 0x7f4a7c15U));
@@ -489,9 +499,7 @@ static void emit_ipv6_redirect_token(
         }
     }
     size_t success_label = builder->count;
-    for (size_t i = 0; i < success_jump_count; ++i) {
-        patch_jump(builder, success_jumps[i], success_label);
-    }
+    patch_jumps(builder, success_jumps, success_jump_count, success_label);
 }
 
 static void emit_self_tgid_bypass(
@@ -629,4 +637,37 @@ static void emit_ipv6_cidr_bypass(
         BPF_W, BPF_REG_4, BPF_REG_6, offsetof(struct bpf_sock_addr, user_ip6) + 12));
     emit(builder, BPF_LDX_MEM(
         BPF_W, BPF_REG_5, BPF_REG_6, offsetof(struct bpf_sock_addr, user_port)));
+}
+
+static void emit_sock_addr_prologue(
+    struct bpf_builder *builder,
+    const struct sb_ebpf_cgroup_config *config,
+    uint32_t self_tgid,
+    int bypass_socket_cookie_map_fd,
+    int include_uid_map_fd,
+    int exclude_uid_map_fd,
+    uint8_t protocol,
+    bool protocol_from_context,
+    size_t *bypass_jumps,
+    size_t *bypass_jump_count) {
+    emit(builder, BPF_MOV64_REG(BPF_REG_6, BPF_REG_1));
+    emit_self_tgid_bypass(builder, self_tgid, bypass_jumps, bypass_jump_count);
+    emit_socket_cookie_bypass(
+        builder,
+        bypass_socket_cookie_map_fd,
+        bypass_jumps,
+        bypass_jump_count);
+    emit_inbound_network_filter(
+        builder,
+        config,
+        protocol,
+        protocol_from_context,
+        bypass_jumps,
+        bypass_jump_count);
+    emit_uid_policy_filter(
+        builder,
+        include_uid_map_fd,
+        exclude_uid_map_fd,
+        bypass_jumps,
+        bypass_jump_count);
 }

@@ -34,6 +34,11 @@ static int singbox_ebpf_shared_network_close(
 	if (result != 0) *saved_errno = errno;
 	return result;
 }
+
+static const char *singbox_ebpf_shared_network_error_stage(
+	const struct sb_ebpf_shared_network_runtime *runtime) {
+	return runtime == NULL ? NULL : runtime->error_stage;
+}
 */
 import "C"
 
@@ -52,6 +57,9 @@ var sharedNetworkObject []byte
 
 type SharedNetworkBackend struct {
 	access            sync.RWMutex
+	health            backendHealth
+	flowAccess        sync.Mutex
+	flowReferences    map[SharedNetworkFlowHandle]uint32
 	runtime           *C.struct_sb_ebpf_shared_network_runtime
 	control           sharedNetworkControl
 	hostIPv4          []netip.Prefix
@@ -69,8 +77,8 @@ type SharedNetworkBackend struct {
 func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConfig) (*SharedNetworkBackend, error) {
 	redirectIPv4 := config.RedirectIPv4
 	redirectIPv6 := config.RedirectIPv6
-	if config.MapCapacity == 0 || config.MapCapacity > MaxConfigurableMapCapacity {
-		return nil, E.New("invalid shared-network map capacity: ", config.MapCapacity)
+	if err := validateMapCapacity("shared-network", config.MapCapacity); err != nil {
+		return nil, err
 	}
 	if config.ListenerPort == 0 {
 		return nil, E.New("missing shared-network listener port")
@@ -98,6 +106,12 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		return nil, E.New("missing embedded shared-network eBPF object")
 	}
 	memlockErr := raiseMemlockLimit()
+	if err := checkKernelCapabilities("shared-network", ""); err != nil {
+		if memlockErr != nil {
+			return nil, E.Errors(err, E.Cause(memlockErr, "remove memlock limit"))
+		}
+		return nil, err
+	}
 
 	runtimeState := (*C.struct_sb_ebpf_shared_network_runtime)(C.calloc(
 		1,
@@ -110,10 +124,10 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 	bypassIPv6MapFD := -1
 	if cgroupBackend != nil {
 		cgroupBackend.access.RLock()
-		if cgroupBackend.runtime == nil {
+		if err := cgroupBackend.health.requireUsable(cgroupBackend.runtime != nil); err != nil {
 			cgroupBackend.access.RUnlock()
 			C.free(unsafe.Pointer(runtimeState))
-			return nil, errBackendClosed
+			return nil, err
 		}
 		bypassIPv4MapFD = cgroupBackend.bypassIPv4CIDRMapFD
 		bypassIPv6MapFD = cgroupBackend.bypassIPv6CIDRMapFD
@@ -132,9 +146,11 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		cgroupBackend.access.RUnlock()
 	}
 	if result != 0 {
+		errorStage := C.GoString(C.singbox_ebpf_shared_network_error_stage(runtimeState))
 		C.free(unsafe.Pointer(runtimeState))
-		prepareErr := eBPFOperationError(
+		prepareErr := eBPFBackendOperationError(
 			"prepare shared-network programs",
+			errorStage,
 			syscall.Errno(savedErrno),
 		)
 		if memlockErr != nil && (savedErrno == C.int(syscall.ENOMEM) || savedErrno == C.int(syscall.EPERM)) {
@@ -204,6 +220,9 @@ func (b *SharedNetworkBackend) Enable() error {
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
+	if err := b.requireUsableLocked(); err != nil {
+		return err
+	}
 	previous := b.control.Enabled
 	b.control.Enabled = 1
 	if err := b.updateControl(); err != nil {
@@ -211,6 +230,24 @@ func (b *SharedNetworkBackend) Enable() error {
 		return err
 	}
 	return nil
+}
+
+func (b *SharedNetworkBackend) requireUsableLocked() error {
+	return b.health.requireUsable(b.runtime != nil)
+}
+
+func (b *SharedNetworkBackend) invalidateLocked(operation string, cause error) error {
+	rebuildRequired := b.health.invalidate("shared-network", operation)
+	b.control.Enabled = 0
+	disableErr := b.updateControl()
+	if disableErr != nil {
+		disableErr = E.Cause(disableErr, "disable unusable shared-network backend")
+	}
+	return E.Errors(
+		cause,
+		disableErr,
+		rebuildRequired,
+	)
 }
 
 func (b *SharedNetworkBackend) Disable() error {
@@ -283,6 +320,9 @@ func (b *SharedNetworkBackend) Close() error {
 		b.includeSourceIPv6 = nil
 		b.excludeSourceIPv4 = nil
 		b.excludeSourceIPv6 = nil
+		for reference := range b.flowReferences {
+			delete(b.flowReferences, reference)
+		}
 	}
 	if result != 0 {
 		return E.Cause(syscall.Errno(savedErrno), "close shared-network runtime")

@@ -45,9 +45,7 @@ static int build_udp4_recvmsg_prog(
     emit(&b, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_8, offsetof(struct bpf_sock_addr, user_port)));
 
     size_t allow_label = emit_exit(&b, 1);
-    for (size_t i = 0; i < bypass_jump_count; ++i) {
-        patch_jump(&b, bypass_jumps[i], allow_label);
-    }
+    patch_jumps(&b, bypass_jumps, bypass_jump_count, allow_label);
 
     if (b.overflow) {
         errno = EMSGSIZE;
@@ -112,9 +110,7 @@ static int build_udp6_recvmsg_prog(
     size_t v4mapped_allow = emit_jump(&b, BPF_JMP_IMM_OP(BPF_JA, 0, 0, 0));
 
     size_t ipv6_lookup_label = b.count;
-    for (size_t i = 0; i < bypass_jump_count; ++i) {
-        patch_jump(&b, bypass_jumps[i], ipv6_lookup_label);
-    }
+    patch_jumps(&b, bypass_jumps, bypass_jump_count, ipv6_lookup_label);
     bypass_jump_count = 0;
 
     emit_zero_region(&b, STACK_REDIRECT_KEY, sizeof(struct sb_ebpf_listener_key));
@@ -151,9 +147,7 @@ static int build_udp6_recvmsg_prog(
     emit(&b, BPF_STX_MEM(BPF_W, BPF_REG_6, BPF_REG_7, offsetof(struct bpf_sock_addr, user_port)));
 
     size_t allow_label = emit_exit(&b, 1);
-    for (size_t i = 0; i < bypass_jump_count; ++i) {
-        patch_jump(&b, bypass_jumps[i], allow_label);
-    }
+    patch_jumps(&b, bypass_jumps, bypass_jump_count, allow_label);
     patch_jump(&b, v4mapped_allow, allow_label);
 
     if (b.overflow) {

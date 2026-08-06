@@ -24,6 +24,9 @@
 #define TCP_FLAG_SYN 0x0002U
 #define TCP_FLAG_ACK 0x0010U
 
+#define IPV6_TRANSPORT_BYPASS -1
+#define IPV6_TRANSPORT_DROP -2
+
 #define SB_SHARED_POLICY_BYPASS 0U
 #define SB_SHARED_POLICY_PROXY 1U
 #define SB_SHARED_POLICY_CACHE_BYPASS 2U
@@ -92,6 +95,13 @@ struct ipv6_header {
 struct ipv6_extension_header {
     __u8 next_header;
     __u8 length;
+};
+
+struct ipv6_fragment_header {
+    __u8 next_header;
+    __u8 reserved;
+    __be16 fragment_offset;
+    __be32 identification;
 };
 
 struct transport_ports {
@@ -357,46 +367,71 @@ NOINLINE bool sync_token(
     return true;
 }
 
-NOINLINE bool reserve_token(struct sb_shared_scratch *scratch, const struct sb_shared_control *control) {
-    struct sb_shared_token_value *existing = map_lookup(&shared_original_to_token, &scratch->original);
+#define SB_SHARED_TOKEN_RETRY 0
+#define SB_SHARED_TOKEN_RESERVED 1
+#define SB_SHARED_TOKEN_FAILED -1
+
+// Keep each attempt in its own BPF subprogram: LLVM 21 otherwise carries loop
+// state in caller-clobbered registers across the hash and map subprogram calls.
+NOINLINE int reserve_token_attempt(
+    struct sb_shared_scratch *scratch,
+    const struct sb_shared_control *control,
+    __u32 attempt) {
+    __builtin_memset(&scratch->token, 0, sizeof(scratch->token));
+    __u32 hash = hash_original(&scratch->original, 0x9e3779b9U * (attempt + 1U));
+    if (scratch->original.family == AF_INET_VALUE) {
+        __u32 prefix = ((__u32)control->token_ipv4_prefix[0] << 24U) |
+            ((__u32)control->token_ipv4_prefix[1] << 16U) |
+            ((__u32)control->token_ipv4_prefix[2] << 8U) |
+            (__u32)control->token_ipv4_prefix[3];
+        __u32 host_bits = 32U - (__u32)control->token_ipv4_prefix_bits;
+        __u32 host_mask = 0xffffffffU >> (32U - host_bits);
+        __u32 candidate = (prefix & ~host_mask) | (hash & host_mask);
+        if ((candidate & host_mask) == 0U || (candidate & host_mask) == host_mask) {
+            return SB_SHARED_TOKEN_RETRY;
+        }
+        scratch->token.token_addr[0] = (__u8)(candidate >> 24U);
+        scratch->token.token_addr[1] = (__u8)(candidate >> 16U);
+        scratch->token.token_addr[2] = (__u8)(candidate >> 8U);
+        scratch->token.token_addr[3] = (__u8)candidate;
+    } else {
+        copy_address(scratch->token.token_addr, control->token_ipv6_prefix, 8U);
+        __u32 second = hash_original(&scratch->original, 0x85ebca6bU ^ attempt);
+        scratch->token.token_addr[8] = (__u8)(hash >> 24U);
+        scratch->token.token_addr[9] = (__u8)(hash >> 16U);
+        scratch->token.token_addr[10] = (__u8)(hash >> 8U);
+        scratch->token.token_addr[11] = (__u8)hash;
+        scratch->token.token_addr[12] = (__u8)(second >> 24U);
+        scratch->token.token_addr[13] = (__u8)(second >> 16U);
+        scratch->token.token_addr[14] = (__u8)(second >> 8U);
+        scratch->token.token_addr[15] = (__u8)second;
+    }
+    if (!sync_token(scratch, control, BPF_NOEXIST)) return SB_SHARED_TOKEN_RETRY;
+    if (map_update(
+            &shared_original_to_token,
+            &scratch->original,
+            &scratch->token,
+            BPF_NOEXIST) == 0) {
+        return SB_SHARED_TOKEN_RESERVED;
+    }
+    map_delete(&shared_reply, &scratch->reply_key);
+    map_delete(&shared_listener, &scratch->listener_key);
+    struct sb_shared_token_value *existing = map_lookup(
+        &shared_original_to_token,
+        &scratch->original);
     if (existing != 0) {
         __builtin_memcpy(&scratch->token, existing, sizeof(scratch->token));
-        return true;
+        return SB_SHARED_TOKEN_RESERVED;
     }
+    return SB_SHARED_TOKEN_FAILED;
+}
+
+NOINLINE bool reserve_token(struct sb_shared_scratch *scratch, const struct sb_shared_control *control) {
 #pragma clang loop unroll(full)
     for (__u32 attempt = 0U; attempt < SB_SHARED_TOKEN_ATTEMPTS; ++attempt) {
-        __builtin_memset(&scratch->token, 0, sizeof(scratch->token));
-        __u32 hash = hash_original(&scratch->original, 0x9e3779b9U * (attempt + 1U));
-        if (scratch->original.family == AF_INET_VALUE) {
-            __u32 prefix = ((__u32)control->token_ipv4_prefix[0] << 24U) |
-                ((__u32)control->token_ipv4_prefix[1] << 16U) |
-                ((__u32)control->token_ipv4_prefix[2] << 8U) |
-                (__u32)control->token_ipv4_prefix[3];
-            __u32 host_bits = 32U - (__u32)control->token_ipv4_prefix_bits;
-            __u32 host_mask = 0xffffffffU >> (32U - host_bits);
-            __u32 candidate = (prefix & ~host_mask) | (hash & host_mask);
-            if ((candidate & host_mask) == 0U || (candidate & host_mask) == host_mask) continue;
-            scratch->token.token_addr[0] = (__u8)(candidate >> 24U);
-            scratch->token.token_addr[1] = (__u8)(candidate >> 16U);
-            scratch->token.token_addr[2] = (__u8)(candidate >> 8U);
-            scratch->token.token_addr[3] = (__u8)candidate;
-        } else {
-            copy_address(scratch->token.token_addr, control->token_ipv6_prefix, 8U);
-            __u32 second = hash_original(&scratch->original, 0x85ebca6bU ^ attempt);
-            scratch->token.token_addr[8] = (__u8)(hash >> 24U);
-            scratch->token.token_addr[9] = (__u8)(hash >> 16U);
-            scratch->token.token_addr[10] = (__u8)(hash >> 8U);
-            scratch->token.token_addr[11] = (__u8)hash;
-            scratch->token.token_addr[12] = (__u8)(second >> 24U);
-            scratch->token.token_addr[13] = (__u8)(second >> 16U);
-            scratch->token.token_addr[14] = (__u8)(second >> 8U);
-            scratch->token.token_addr[15] = (__u8)second;
-        }
-        if (!sync_token(scratch, control, BPF_NOEXIST)) continue;
-        if (map_update(&shared_original_to_token, &scratch->original, &scratch->token, BPF_ANY) == 0) return true;
-        map_delete(&shared_reply, &scratch->reply_key);
-        map_delete(&shared_listener, &scratch->listener_key);
-        return false;
+        int result = reserve_token_attempt(scratch, control, attempt);
+        if (result == SB_SHARED_TOKEN_RESERVED) return true;
+        if (result == SB_SHARED_TOKEN_FAILED) return false;
     }
     return false;
 }
@@ -564,7 +599,6 @@ NOINLINE int ingress_ipv4(
     struct ipv4_header *ip = data + l3_offset;
     if ((void *)(ip + 1) > data_end || ip->version != 4U || ip->ihl < 5U) return TC_ACT_PIPE;
     if (!selected_protocol(ip->protocol, control)) return TC_ACT_PIPE;
-    if (!ipv4_source_selected((const __u8 *)&ip->source, control)) return TC_ACT_PIPE;
     if ((swap16(ip->fragment_offset) & IP_FRAGMENT_MASK) != 0U) return TC_ACT_SHOT;
     __u32 header_length = (__u32)ip->ihl * 4U;
     struct transport_ports *ports = (void *)ip + header_length;
@@ -587,6 +621,10 @@ NOINLINE int ingress_ipv4(
         __u32 tcp_sequence = 0U;
         bool initial_syn = initial_tcp_syn(ip->protocol, ports, data_end, &tcp_sequence);
         if (load_cached_bypass(scratch, control, ip->protocol, initial_syn, tcp_sequence)) {
+            return TC_ACT_PIPE;
+        }
+        if (!ipv4_source_selected((const __u8 *)&ip->source, control)) {
+            cache_bypass(scratch, ip->protocol, tcp_sequence);
             return TC_ACT_PIPE;
         }
         __u8 policy = ipv4_policy(
@@ -618,8 +656,6 @@ NOINLINE int ingress_ipv4(
     source_port = swap16(ports->source);
     destination_port = swap16(ports->destination);
 
-    scratch = map_lookup(&shared_scratch, &zero);
-    if (scratch == 0) return TC_ACT_SHOT;
     if (!cached) {
         if (!reserve_token(scratch, control)) return TC_ACT_SHOT;
     }
@@ -707,7 +743,7 @@ NOINLINE int ipv6_transport_offset(
     __u32 l3_offset,
     __u8 *protocol_out) {
     struct ipv6_header *ip = data + l3_offset;
-    if ((void *)(ip + 1) > data_end) return -1;
+    if ((void *)(ip + 1) > data_end) return IPV6_TRANSPORT_DROP;
     __u8 protocol = ip->next_header;
     __u32 offset = l3_offset + sizeof(*ip);
 #pragma clang loop unroll(full)
@@ -716,20 +752,30 @@ NOINLINE int ipv6_transport_offset(
             *protocol_out = protocol;
             return (int)offset;
         }
-        if (protocol == 44U ||
-            (protocol != 0U && protocol != 43U && protocol != 60U && protocol != 51U)) {
-            return -1;
+        if (protocol == 44U) {
+            struct ipv6_fragment_header *fragment = data + offset;
+            if ((void *)(fragment + 1) > data_end) return IPV6_TRANSPORT_DROP;
+            protocol = fragment->next_header;
+            if (protocol == IPPROTO_TCP_VALUE || protocol == IPPROTO_UDP_VALUE ||
+                protocol == 0U || protocol == 43U || protocol == 60U || protocol == 51U ||
+                protocol == 44U) {
+                return IPV6_TRANSPORT_DROP;
+            }
+            return IPV6_TRANSPORT_BYPASS;
+        }
+        if (protocol != 0U && protocol != 43U && protocol != 60U && protocol != 51U) {
+            return IPV6_TRANSPORT_BYPASS;
         }
         struct ipv6_extension_header *extension = data + offset;
-        if ((void *)(extension + 1) > data_end) return -1;
+        if ((void *)(extension + 1) > data_end) return IPV6_TRANSPORT_DROP;
         __u8 current = protocol;
         protocol = extension->next_header;
         offset += current == 51U
             ? ((__u32)extension->length + 2U) * 4U
             : ((__u32)extension->length + 1U) * 8U;
-        if (data + offset > data_end) return -1;
+        if (data + offset > data_end) return IPV6_TRANSPORT_DROP;
     }
-    return -1;
+    return IPV6_TRANSPORT_DROP;
 }
 
 NOINLINE int ingress_ipv6(
@@ -742,8 +788,8 @@ NOINLINE int ingress_ipv6(
     if ((void *)(ip + 1) > data_end || (swap32(ip->version_flow) >> 28U) != 6U) return TC_ACT_PIPE;
     __u8 protocol = 0U;
     int transport = ipv6_transport_offset(data, data_end, l3_offset, &protocol);
+    if (transport == IPV6_TRANSPORT_DROP) return TC_ACT_SHOT;
     if (transport < 0 || !selected_protocol(protocol, control)) return TC_ACT_PIPE;
-    if (!ipv6_source_selected(ip->source, control)) return TC_ACT_PIPE;
     struct transport_ports *ports = data + transport;
     if ((void *)(ports + 1) > data_end) return TC_ACT_PIPE;
     __u16 source_port = swap16(ports->source);
@@ -764,6 +810,10 @@ NOINLINE int ingress_ipv6(
         __u32 tcp_sequence = 0U;
         bool initial_syn = initial_tcp_syn(protocol, ports, data_end, &tcp_sequence);
         if (load_cached_bypass(scratch, control, protocol, initial_syn, tcp_sequence)) {
+            return TC_ACT_PIPE;
+        }
+        if (!ipv6_source_selected(ip->source, control)) {
+            cache_bypass(scratch, protocol, tcp_sequence);
             return TC_ACT_PIPE;
         }
         __u8 policy = ipv6_policy(
@@ -795,8 +845,6 @@ NOINLINE int ingress_ipv6(
     source_port = swap16(ports->source);
     destination_port = swap16(ports->destination);
 
-    scratch = map_lookup(&shared_scratch, &zero);
-    if (scratch == 0) return TC_ACT_SHOT;
     if (!cached) {
         if (!reserve_token(scratch, control)) return TC_ACT_SHOT;
     }

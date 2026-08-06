@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"time"
 
 	"github.com/metacubex/mihomo/log"
 	"github.com/sagernet/netlink"
@@ -16,6 +17,20 @@ import (
 )
 
 var cgroupIPv6ProbeDestination = net.ParseIP("2001:4860:4860::8888")
+
+const cgroupIPv6StableProbes = 2
+
+var (
+	cgroupIPv6ProbeDebounce      = 500 * time.Millisecond
+	probeCgroupIPv6AvailableFunc = probeCgroupIPv6Available
+)
+
+type cgroupIPv6ProbeState struct {
+	timer      *time.Timer
+	generation uint64
+	candidate  bool
+	count      uint8
+}
 
 func (i *Inbound) cgroupIPv6Enabled() bool {
 	return i.redirectIPv6Prefix.IsValid() && i.cgroupIPv6Mode != cgroupIPv6ModeOff
@@ -84,30 +99,98 @@ func (i *Inbound) refreshCgroupIPv6Availability(initial bool) error {
 	if i.cgroupIPv6Mode != cgroupIPv6ModeAuto || !i.redirectIPv6Prefix.IsValid() {
 		return nil
 	}
-	available, err := probeCgroupIPv6Available()
-	if err != nil {
-		if initial {
-			i.cgroupIPv6Available = true
-			log.Warnln("[EBPF] probe local cgroup IPv6 availability; keeping interception enabled: %s", err.Error())
+	if !initial {
+		if i.backendInstance() == nil {
 			return nil
 		}
-		return err
-	}
-	if initial {
-		i.cgroupIPv6Available = available
+		i.cgroupIPv6ProbeLock.Lock()
+		i.scheduleCgroupIPv6ProbeLocked()
+		i.cgroupIPv6ProbeLock.Unlock()
 		return nil
+	}
+	available, err := probeCgroupIPv6AvailableFunc()
+	if err != nil {
+		i.cgroupIPv6ProbeLock.Lock()
+		i.cgroupIPv6Available = true
+		i.resetCgroupIPv6ProbeLocked()
+		i.cgroupIPv6ProbeLock.Unlock()
+		log.Warnln("[EBPF] probe local cgroup IPv6 availability; keeping interception enabled: %s", err.Error())
+		return nil
+	}
+	i.cgroupIPv6ProbeLock.Lock()
+	i.cgroupIPv6Available = available
+	i.resetCgroupIPv6ProbeLocked()
+	i.cgroupIPv6ProbeLock.Unlock()
+	return nil
+}
+
+func (i *Inbound) scheduleCgroupIPv6ProbeLocked() {
+	i.cgroupIPv6Probe.generation++
+	generation := i.cgroupIPv6Probe.generation
+	i.cgroupIPv6Probe.candidate = false
+	i.cgroupIPv6Probe.count = 0
+	if i.cgroupIPv6Probe.timer != nil {
+		i.cgroupIPv6Probe.timer.Stop()
+	}
+	i.cgroupIPv6Probe.timer = time.AfterFunc(cgroupIPv6ProbeDebounce, func() {
+		i.runCgroupIPv6Probe(generation)
+	})
+}
+
+func (i *Inbound) runCgroupIPv6Probe(generation uint64) {
+	i.cgroupIPv6ProbeLock.Lock()
+	defer i.cgroupIPv6ProbeLock.Unlock()
+	if generation != i.cgroupIPv6Probe.generation {
+		return
+	}
+	i.cgroupIPv6Probe.timer = nil
+	available, err := probeCgroupIPv6AvailableFunc()
+	if err != nil {
+		i.cgroupIPv6Probe.candidate = false
+		i.cgroupIPv6Probe.count = 0
+		log.Warnln("[EBPF] probe local cgroup IPv6 availability after network update: %s", err.Error())
+		return
+	}
+	if available == i.cgroupIPv6Available {
+		i.cgroupIPv6Probe.candidate = false
+		i.cgroupIPv6Probe.count = 0
+		return
+	}
+	if i.cgroupIPv6Probe.count == 0 || i.cgroupIPv6Probe.candidate != available {
+		i.cgroupIPv6Probe.candidate = available
+		i.cgroupIPv6Probe.count = 1
+	} else {
+		i.cgroupIPv6Probe.count++
+	}
+	if i.cgroupIPv6Probe.count < cgroupIPv6StableProbes {
+		i.cgroupIPv6Probe.timer = time.AfterFunc(cgroupIPv6ProbeDebounce, func() {
+			i.runCgroupIPv6Probe(generation)
+		})
+		return
 	}
 	backend := i.backendInstance()
 	if backend == nil {
-		return nil
+		return
 	}
 	changed, err := backend.UpdateIPv6Available(available)
 	if err != nil {
-		return err
+		log.Warnln("[EBPF] update local cgroup IPv6 availability after network update: %s", err.Error())
+		return
 	}
 	if changed {
 		i.cgroupIPv6Available = available
 		log.Infoln("[EBPF] updated local cgroup IPv6 interception: available=%v", available)
 	}
-	return nil
+	i.cgroupIPv6Probe.candidate = false
+	i.cgroupIPv6Probe.count = 0
+}
+
+func (i *Inbound) resetCgroupIPv6ProbeLocked() {
+	i.cgroupIPv6Probe.generation++
+	i.cgroupIPv6Probe.candidate = false
+	i.cgroupIPv6Probe.count = 0
+	if i.cgroupIPv6Probe.timer != nil {
+		i.cgroupIPv6Probe.timer.Stop()
+		i.cgroupIPv6Probe.timer = nil
+	}
 }

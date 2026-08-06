@@ -64,6 +64,7 @@ enum {
     STACK_UID_KEY = -240,
     STACK_BYPASS_CIDR_KEY = -272,
     STACK_UDP_FLOW_KEY = -304,
+    STACK_UDP_FLOW_VALUE = -384,
 };
 
 struct bpf_builder {
@@ -71,13 +72,6 @@ struct bpf_builder {
     size_t count;
     bool overflow;
 };
-
-static int close_fd(int *fd) {
-    if (fd == NULL || *fd < 0) return 0;
-    int value = *fd;
-    *fd = -1;
-    return close(value);
-}
 
 static uint32_t ipv4_redirect_host_mask(uint32_t prefix_bits) {
     if (prefix_bits > 32U) return 0U;
@@ -102,10 +96,14 @@ static uint32_t ipv6_redirect_word(const uint8_t prefix[16], size_t offset) {
 
 static void init_runtime(struct sb_ebpf_cgroup_runtime *runtime) {
     memset(runtime, -1, sizeof(*runtime));
+    runtime->error_stage[0] = '\0';
     runtime->socket_release_supported = false;
     runtime->self_bypass_tgid = false;
+    runtime->socket_bypass_map_capacity = 0U;
     runtime->attached_programs = 0U;
 }
+
+static int create_bypass_socket_cookie_map(uint32_t max_entries);
 
 #include "cgroup_program.c"
 #include "cgroup_runtime.c"

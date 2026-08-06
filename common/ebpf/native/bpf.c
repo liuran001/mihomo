@@ -49,6 +49,89 @@ int sb_ebpf_create_map(enum bpf_map_type type, uint32_t key_size, uint32_t value
     return (int)sb_ebpf_bpf_sys(BPF_MAP_CREATE, &attr, sizeof(attr));
 }
 
+bool sb_ebpf_map_capacity_valid(uint32_t capacity) {
+    return capacity > 0U && capacity <= SB_EBPF_MAX_CONFIGURABLE_MAP_ENTRIES;
+}
+
+int sb_ebpf_close_fd(int *fd) {
+    if (fd == NULL || *fd < 0) return 0;
+    int value = *fd;
+    *fd = -1;
+    return close(value);
+}
+
+int sb_ebpf_close_fds(int **fds, size_t fd_count) {
+    int result = 0;
+    int saved_errno = 0;
+    for (size_t index = 0U; index < fd_count; ++index) {
+        if (sb_ebpf_close_fd(fds[index]) != 0 && result == 0) {
+            result = -1;
+            saved_errno = errno;
+        }
+    }
+    if (result != 0) errno = saved_errno;
+    return result;
+}
+
+int sb_ebpf_create_maps(
+    const struct sb_ebpf_map_spec *specs,
+    size_t spec_count,
+    const char **failed_name) {
+    if (specs == NULL && spec_count != 0U) {
+        errno = EINVAL;
+        return -1;
+    }
+    if (failed_name != NULL) *failed_name = NULL;
+    for (size_t index = 0U; index < spec_count; ++index) {
+        if (specs[index].fd == NULL) {
+            errno = EINVAL;
+            if (failed_name != NULL) *failed_name = specs[index].name;
+            return -1;
+        }
+        *specs[index].fd = -1;
+    }
+    for (size_t index = 0U; index < spec_count; ++index) {
+        const struct sb_ebpf_map_spec *spec = &specs[index];
+        if (spec->max_entries == 0U) continue;
+        if (!sb_ebpf_map_capacity_valid(spec->max_entries)) {
+            errno = EINVAL;
+            if (failed_name != NULL) *failed_name = spec->name;
+            goto fail;
+        }
+        *spec->fd = sb_ebpf_create_map(
+            spec->type,
+            spec->key_size,
+            spec->value_size,
+            spec->max_entries,
+            spec->flags);
+        if (*spec->fd < 0) {
+            if (failed_name != NULL) *failed_name = spec->name;
+            goto fail;
+        }
+    }
+    return 0;
+
+fail: {
+        int saved_errno = errno;
+        for (size_t index = spec_count; index > 0U; --index) {
+            if (specs[index - 1U].fd != NULL) {
+                (void)sb_ebpf_close_fd(specs[index - 1U].fd);
+            }
+        }
+        errno = saved_errno;
+        return -1;
+    }
+}
+
+void sb_ebpf_set_error_stage(char *destination, const char *stage) {
+    if (destination == NULL) return;
+    if (stage == NULL) {
+        destination[0] = '\0';
+        return;
+    }
+    snprintf(destination, SB_EBPF_ERROR_STAGE_SIZE, "%s", stage);
+}
+
 static int load_prog_once(
     const struct bpf_insn *insns,
     size_t insn_count,

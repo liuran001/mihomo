@@ -69,18 +69,26 @@ func (b *SharedNetworkBackend) UpdateBypassCIDR(prefixes []netip.Prefix) (bool, 
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
-	if b.runtime == nil || b.bypassIPv4MapFD < 0 || b.bypassIPv6MapFD < 0 {
+	if err = b.requireUsableLocked(); err != nil {
+		return false, err
+	}
+	if b.bypassIPv4MapFD < 0 || b.bypassIPv6MapFD < 0 {
 		return false, errBackendClosed
 	}
+	oldPrefixes := dualStackCIDRPrefixes{b.bypassIPv4CIDR, b.bypassIPv6CIDR}
+	newPrefixes := dualStackCIDRPrefixes{ipv4, ipv6}
 	changed, err := replaceDualStackCIDRPolicy(
 		b.bypassIPv4MapFD,
 		b.bypassIPv6MapFD,
-		dualStackCIDRPrefixes{b.bypassIPv4CIDR, b.bypassIPv6CIDR},
-		dualStackCIDRPrefixes{ipv4, ipv6},
+		oldPrefixes,
+		newPrefixes,
 		"shared-network ",
 		"bypass CIDR",
 	)
 	if err != nil {
+		if policyRollbackFailed(err) {
+			return false, b.invalidateLocked("bypass CIDR policy", err)
+		}
 		return false, err
 	}
 	oldIPv4 := b.bypassIPv4CIDR
@@ -92,6 +100,19 @@ func (b *SharedNetworkBackend) UpdateBypassCIDR(prefixes []netip.Prefix) (bool, 
 		b.bypassIPv4CIDR = oldIPv4
 		b.bypassIPv6CIDR = oldIPv6
 		b.control.Flags = oldFlags
+		rollbackErr := rollbackSharedNetworkPolicyMaps(
+			b.bypassIPv4MapFD,
+			b.bypassIPv6MapFD,
+			newPrefixes,
+			oldPrefixes,
+			"bypass CIDR",
+		)
+		if rollbackErr != nil {
+			return false, b.invalidateLocked(
+				"bypass CIDR policy",
+				E.Errors(err, E.Cause(rollbackErr, "rollback bypass CIDR maps")),
+			)
+		}
 		return false, err
 	}
 	return changed, nil
@@ -116,18 +137,23 @@ func (b *SharedNetworkBackend) UpdateHostAddresses(addresses []netip.Addr) error
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
-	if b.runtime == nil {
-		return errBackendClosed
+	if err := b.requireUsableLocked(); err != nil {
+		return err
 	}
+	oldPrefixes := dualStackCIDRPrefixes{b.hostIPv4, b.hostIPv6}
+	newPrefixes := dualStackCIDRPrefixes{ipv4, ipv6}
 	_, err := replaceDualStackCIDRPolicy(
 		int(b.runtime.host_ipv4_map_fd),
 		int(b.runtime.host_ipv6_map_fd),
-		dualStackCIDRPrefixes{b.hostIPv4, b.hostIPv6},
-		dualStackCIDRPrefixes{ipv4, ipv6},
+		oldPrefixes,
+		newPrefixes,
 		"shared-network ",
 		"host",
 	)
 	if err != nil {
+		if policyRollbackFailed(err) {
+			return b.invalidateLocked("host address policy", err)
+		}
 		return err
 	}
 	oldIPv4 := b.hostIPv4
@@ -139,15 +165,26 @@ func (b *SharedNetworkBackend) UpdateHostAddresses(addresses []netip.Addr) error
 		b.hostIPv4 = oldIPv4
 		b.hostIPv6 = oldIPv6
 		b.control.Flags = oldFlags
+		rollbackErr := rollbackSharedNetworkPolicyMaps(
+			int(b.runtime.host_ipv4_map_fd),
+			int(b.runtime.host_ipv6_map_fd),
+			newPrefixes,
+			oldPrefixes,
+			"host address",
+		)
+		if rollbackErr != nil {
+			return b.invalidateLocked(
+				"host address policy",
+				E.Errors(err, E.Cause(rollbackErr, "rollback host address maps")),
+			)
+		}
 		return err
 	}
 	return nil
 }
 
 // SetBypassCIDRState updates only policy presence flags when the maps are
-// owned by a cgroup backend and shared-network reuses those descriptors. It
-// also records the CIDR list so updatePolicyFlagsLocked can rebuild the flags
-// on later control updates (e.g. UpdateHostAddresses) instead of wiping them.
+// owned by a cgroup backend and shared-network reuses those descriptors.
 func (b *SharedNetworkBackend) SetBypassCIDRState(prefixes []netip.Prefix) error {
 	if b == nil {
 		return errBackendClosed
@@ -158,22 +195,15 @@ func (b *SharedNetworkBackend) SetBypassCIDRState(prefixes []netip.Prefix) error
 	}
 	b.access.Lock()
 	defer b.access.Unlock()
-	if b.runtime == nil {
-		return errBackendClosed
+	if err = b.requireUsableLocked(); err != nil {
+		return err
 	}
 	oldIPv4 := b.bypassIPv4CIDR
 	oldIPv6 := b.bypassIPv6CIDR
 	oldFlags := b.control.Flags
 	b.bypassIPv4CIDR = slices.Clone(ipv4)
 	b.bypassIPv6CIDR = slices.Clone(ipv6)
-	b.control.Flags &^= sharedNetworkFlagBypassIPv4 | sharedNetworkFlagBypassIPv6
-	if len(ipv4) != 0 {
-		b.control.Flags |= sharedNetworkFlagBypassIPv4
-	}
-	if len(ipv6) != 0 {
-		b.control.Flags |= sharedNetworkFlagBypassIPv6
-	}
-	if err = b.updateControl(); err != nil {
+	if err = b.updatePolicyFlagsLocked(); err != nil {
 		b.bypassIPv4CIDR = oldIPv4
 		b.bypassIPv6CIDR = oldIPv6
 		b.control.Flags = oldFlags
@@ -181,30 +211,38 @@ func (b *SharedNetworkBackend) SetBypassCIDRState(prefixes []netip.Prefix) error
 	return err
 }
 
-// computeSharedNetworkPolicyFlags computes the host/bypass presence flags from
-// the stored policy lists. updatePolicyFlagsLocked relies on SetBypassCIDRState
-// having persisted the bypass list; otherwise the bypass flags would be
-// cleared on every UpdateHostAddresses.
-func computeSharedNetworkPolicyFlags(hostIPv4, hostIPv6, bypassIPv4, bypassIPv6 []netip.Prefix) uint32 {
-	var flags uint32
-	if len(hostIPv4) != 0 {
-		flags |= sharedNetworkFlagHostIPv4
-	}
-	if len(hostIPv6) != 0 {
-		flags |= sharedNetworkFlagHostIPv6
-	}
-	if len(bypassIPv4) != 0 {
-		flags |= sharedNetworkFlagBypassIPv4
-	}
-	if len(bypassIPv6) != 0 {
-		flags |= sharedNetworkFlagBypassIPv6
-	}
-	return flags
+func rollbackSharedNetworkPolicyMaps(
+	ipv4MapFD int,
+	ipv6MapFD int,
+	current dualStackCIDRPrefixes,
+	previous dualStackCIDRPrefixes,
+	policyName string,
+) error {
+	_, err := replaceDualStackCIDRPolicy(
+		ipv4MapFD,
+		ipv6MapFD,
+		current,
+		previous,
+		"shared-network ",
+		policyName,
+	)
+	return err
 }
 
 func (b *SharedNetworkBackend) updatePolicyFlagsLocked() error {
 	b.control.Flags &^= sharedNetworkPolicyFlags
-	b.control.Flags |= computeSharedNetworkPolicyFlags(b.hostIPv4, b.hostIPv6, b.bypassIPv4CIDR, b.bypassIPv6CIDR)
+	if len(b.hostIPv4) != 0 {
+		b.control.Flags |= sharedNetworkFlagHostIPv4
+	}
+	if len(b.hostIPv6) != 0 {
+		b.control.Flags |= sharedNetworkFlagHostIPv6
+	}
+	if len(b.bypassIPv4CIDR) != 0 {
+		b.control.Flags |= sharedNetworkFlagBypassIPv4
+	}
+	if len(b.bypassIPv6CIDR) != 0 {
+		b.control.Flags |= sharedNetworkFlagBypassIPv6
+	}
 	if len(b.includeSourceIPv4) != 0 || len(b.includeSourceIPv6) != 0 {
 		b.control.Flags |= sharedNetworkFlagIncludeSource
 	}
