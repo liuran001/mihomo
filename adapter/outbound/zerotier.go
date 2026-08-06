@@ -12,7 +12,6 @@ import (
 	"net/netip"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -20,11 +19,8 @@ import (
 	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
-	"github.com/metacubex/mihomo/constant/features"
 	"github.com/metacubex/mihomo/dns"
 	"github.com/metacubex/mihomo/log"
-	"github.com/metacubex/mipstack"
-	wireguard "github.com/metacubex/sing-wireguard"
 	M "github.com/metacubex/sing/common/metadata"
 	ZT "github.com/metacubex/zerotier-go"
 	ZTIP "github.com/metacubex/zerotier-go/iplink"
@@ -32,15 +28,15 @@ import (
 )
 
 const (
-	zeroTierDefaultStateDir      = "zerotier"
-	zeroTierFrameQueueSize       = 256
+	zeroTierDefaultStateDir = "zerotier"
+	// zeroTierFrameQueueSize absorbs short multi-flow bursts so data frames do
+	// not crowd handshake and window-update traffic out of the single ordered
+	// bridge consumer.
+	zeroTierFrameQueueSize = 2048
+	// zeroTierFrameBatchSize amortizes runtime validation, lock acquisition,
+	// and IP-stack delivery while retaining callback order.
+	zeroTierFrameBatchSize       = 64
 	zeroTierFrameDropLogInterval = 10 * time.Second
-)
-
-const (
-	ipStackAuto   = "auto"
-	ipStackGVisor = "gvisor"
-	ipStackMips   = "mips"
 )
 
 var errZeroTierClosed = errors.New("ZeroTier outbound closed")
@@ -126,56 +122,9 @@ type ZeroTierOption struct {
 	RemoteTraceLevel  uint64                `proxy:"remote-trace-level,omitempty"`
 }
 
-type IPStackOption struct {
-	Mode                 string `proxy:"mode,omitempty"`
-	CongestionController string `proxy:"congestion-controller,omitempty"`
-}
-
 type ZeroTierOrbitOption struct {
 	World string `proxy:"world"`
 	Seed  string `proxy:"seed"`
-}
-
-func (o *IPStackOption) normalize() {
-	o.Mode = strings.ToLower(strings.TrimSpace(o.Mode))
-	if o.Mode == "" {
-		o.Mode = ipStackAuto
-	}
-	o.CongestionController = strings.ToLower(strings.TrimSpace(o.CongestionController))
-}
-
-func (o IPStackOption) validate() error {
-	switch o.Mode {
-	case ipStackAuto, ipStackMips:
-	case ipStackGVisor:
-		if !features.WithGVisor {
-			return errors.New("gVisor IP stack requires the with_gvisor build tag")
-		}
-	default:
-		return fmt.Errorf("invalid IP stack mode %q; expected auto, gvisor, or mips", o.Mode)
-	}
-	switch mipstack.CongestionControl(o.CongestionController) {
-	case "", mipstack.CongestionControlCUBIC, mipstack.CongestionControlReno, mipstack.CongestionControlBBR:
-		return nil
-	default:
-		return fmt.Errorf("invalid IP stack congestion controller %q; expected cubic, reno, or bbr", o.CongestionController)
-	}
-}
-
-// ipStack is the mihomo IP stack's packet and socket surface, adapted from
-// sing-wireguard only for gVisor.
-type ipStack interface {
-	Start() error
-	DialTCP(ctx context.Context, network string, source, destination netip.AddrPort) (net.Conn, error)
-	ListenUDP(ctx context.Context, network string, local netip.AddrPort) (net.PacketConn, error)
-	Read(buffers [][]byte, sizes []int, offset int) (int, error)
-	Write(buffers [][]byte, offset int) (int, error)
-	Close() error
-}
-
-// gVisorIPStack adapts sing-wireguard's stack device socket signatures.
-type gVisorIPStack struct {
-	wireguard.Device
 }
 
 type zeroTierOrbit struct {
@@ -210,47 +159,6 @@ type zeroTierPacketConn struct {
 	net.PacketConn
 	validateDestination func(netip.Addr) error
 }
-
-// newIPStack constructs the selected userspace IP stack.
-func newIPStack(option IPStackOption, localAddresses []netip.Prefix, mtu uint32) (ipStack, error) {
-	mode := option.Mode
-	if mode == ipStackAuto {
-		if features.WithGVisor {
-			mode = ipStackGVisor
-		} else {
-			mode = ipStackMips
-		}
-	}
-	switch mode {
-	case ipStackGVisor:
-		device, err := wireguard.NewStackDevice(localAddresses, mtu)
-		if err != nil {
-			return nil, err
-		}
-		return &gVisorIPStack{Device: device}, nil
-	case ipStackMips:
-		return mipstack.New(mipstack.Config{
-			LocalAddresses:    localAddresses,
-			MTU:               mtu,
-			CongestionControl: mipstack.CongestionControl(option.CongestionController),
-		})
-	default:
-		return nil, errors.New("invalid IP stack mode")
-	}
-}
-
-// DialTCP opens one active TCP connection through gVisor.
-func (s *gVisorIPStack) DialTCP(ctx context.Context, network string, _ netip.AddrPort, destination netip.AddrPort) (net.Conn, error) {
-	return s.DialContext(ctx, network, M.SocksaddrFromNetIP(destination))
-}
-
-// ListenUDP opens one unconnected UDP socket through gVisor.
-func (s *gVisorIPStack) ListenUDP(ctx context.Context, _ string, local netip.AddrPort) (net.PacketConn, error) {
-	return s.ListenPacket(ctx, M.SocksaddrFromNetIP(local))
-}
-
-var _ ipStack = (*mipstack.Stack)(nil)
-var _ ipStack = (*gVisorIPStack)(nil)
 
 func (c *zeroTierPacketConn) WriteTo(packet []byte, destination net.Addr) (int, error) {
 	address := M.SocksaddrFromNet(destination).Unwrap()
@@ -1144,20 +1052,33 @@ func (z *ZeroTier) resolverForNetworkConfig(config ZT.NetworkConfigData) (resolv
 }
 
 func (z *ZeroTier) runStackPackets(runtime *zeroTierRuntime, device ipStack) {
-	buffer := make([]byte, 64*1024)
-	buffers := [][]byte{buffer}
-	sizes := []int{0}
+	mtu, err := device.MTU()
+	if err != nil || mtu < 1 {
+		mtu = 64 * 1024
+	}
+	batchSize := device.BatchSize()
+	if batchSize < 1 {
+		batchSize = 1
+	}
+	storage := make([]byte, mtu*batchSize)
+	buffers := make([][]byte, batchSize)
+	for index := range buffers {
+		start := index * mtu
+		buffers[index] = storage[start : start+mtu : start+mtu]
+	}
+	sizes := make([]int, batchSize)
+	writeErrors := make([]error, 0, batchSize)
 	for z.ctx.Err() == nil {
-		if _, err := device.Read(buffers, sizes, 0); err != nil {
+		count, readErr := device.Read(buffers, sizes, 0)
+		if readErr != nil {
 			if z.ctx.Err() == nil {
-				invalidated := z.invalidateDevice(device, fmt.Errorf("ZeroTier stack read failed: %w", err))
-				if invalidated && !errors.Is(err, net.ErrClosed) && !errors.Is(err, os.ErrClosed) {
-					log.Errorln("[ZeroTier](%s) stack read: %v", z.Name(), err)
+				invalidated := z.invalidateDevice(device, fmt.Errorf("ZeroTier stack read failed: %w", readErr))
+				if invalidated && !errors.Is(readErr, net.ErrClosed) && !errors.Is(readErr, os.ErrClosed) {
+					log.Errorln("[ZeroTier](%s) stack read: %v", z.Name(), readErr)
 				}
 			}
 			return
 		}
-		packet := buffer[:sizes[0]]
 		z.operationMu.RLock()
 		z.stateMu.RLock()
 		current := z.runtime == runtime && z.tunDevice == device
@@ -1166,68 +1087,87 @@ func (z *ZeroTier) runStackPackets(runtime *zeroTierRuntime, device ipStack) {
 			z.operationMu.RUnlock()
 			return
 		}
-		err := runtime.ipLink.WritePacket(packet)
+		writeErrors = writeErrors[:0]
+		for index := 0; index < count; index++ {
+			if writeErr := runtime.ipLink.WritePacket(buffers[index][:sizes[index]]); writeErr != nil {
+				writeErrors = append(writeErrors, writeErr)
+			}
+		}
 		z.operationMu.RUnlock()
-		if err != nil {
-			log.Debugln("[ZeroTier](%s) send IP packet: %v", z.Name(), err)
+		for _, writeErr := range writeErrors {
+			log.Debugln("[ZeroTier](%s) send IP packet: %v", z.Name(), writeErr)
 		}
 	}
 }
 
 func (z *ZeroTier) runInboundFrames() {
+	frames := make([]zeroTierInboundFrame, zeroTierFrameBatchSize)
+	packets := make([][]byte, 0, zeroTierFrameBatchSize)
+	frameErrors := make([]error, 0, zeroTierFrameBatchSize)
 	for {
+		var first zeroTierInboundFrame
 		select {
-		case inbound := <-z.frameCh:
-			z.stateMu.RLock()
-			current := z.runtime == inbound.runtime
-			z.stateMu.RUnlock()
-			if !current || inbound.runtime == nil {
-				continue
-			}
-			z.handleInboundFrame(inbound.runtime, inbound.frame)
+		case first = <-z.frameCh:
 		case <-z.ctx.Done():
 			return
 		}
+		frames[0] = first
+		count := 1
+	drain:
+		for count < len(frames) {
+			select {
+			case frames[count] = <-z.frameCh:
+				count++
+			default:
+				break drain
+			}
+		}
+		device, output, processingErrors := z.processInboundFrames(frames[:count], packets[:0], frameErrors[:0])
+		for _, err := range processingErrors {
+			log.Debugln("[ZeroTier](%s) process inbound frame: %v", z.Name(), err)
+		}
+		if device != nil && len(output) != 0 {
+			if _, writeErr := device.Write(output, 0); writeErr != nil && z.ctx.Err() == nil {
+				invalidated := z.invalidateDevice(device, fmt.Errorf("ZeroTier stack write failed: %w", writeErr))
+				if invalidated && !errors.Is(writeErr, net.ErrClosed) && !errors.Is(writeErr, os.ErrClosed) {
+					log.Debugln("[ZeroTier](%s) stack write: %v", z.Name(), writeErr)
+				}
+			}
+		}
+		for index := 0; index < count; index++ {
+			frames[index] = zeroTierInboundFrame{}
+		}
+		packets, frameErrors = output, processingErrors
 	}
 }
 
-func (z *ZeroTier) handleInboundFrame(runtime *zeroTierRuntime, frame ZT.Frame) {
+// processInboundFrames converts one callback-order batch while preventing a
+// concurrent configuration update from mutating its IP link. Stack delivery
+// follows after the read lock is released.
+func (z *ZeroTier) processInboundFrames(frames []zeroTierInboundFrame, packets [][]byte, frameErrors []error) (ipStack, [][]byte, []error) {
 	z.operationMu.RLock()
 	z.stateMu.RLock()
-	current := z.runtime == runtime
-	z.stateMu.RUnlock()
-	if !current {
-		z.operationMu.RUnlock()
-		return
-	}
-	packet, err := runtime.ipLink.HandleFrame(frame)
-	if len(packet) == 0 {
-		z.operationMu.RUnlock()
-		if err != nil {
-			log.Debugln("[ZeroTier](%s) process inbound frame: %v", z.Name(), err)
-		}
-		return
-	}
-	z.stateMu.RLock()
-	current = z.runtime == runtime
+	runtime := z.runtime
 	device := z.tunDevice
 	z.stateMu.RUnlock()
-	z.operationMu.RUnlock()
-	var writeErr error
-	var invalidated bool
-	if current && device != nil {
-		if _, writeErr = device.Write([][]byte{packet}, 0); writeErr != nil {
-			if z.ctx.Err() == nil {
-				invalidated = z.invalidateDevice(device, fmt.Errorf("ZeroTier stack write failed: %w", writeErr))
-			}
+	if runtime == nil {
+		z.operationMu.RUnlock()
+		return nil, packets, frameErrors
+	}
+	for _, inbound := range frames {
+		if inbound.runtime != runtime {
+			continue
+		}
+		packet, err := runtime.ipLink.HandleFrame(inbound.frame)
+		if err != nil {
+			frameErrors = append(frameErrors, err)
+		}
+		if len(packet) != 0 {
+			packets = append(packets, packet)
 		}
 	}
-	if err != nil {
-		log.Debugln("[ZeroTier](%s) process inbound frame: %v", z.Name(), err)
-	}
-	if invalidated && !errors.Is(writeErr, net.ErrClosed) && !errors.Is(writeErr, os.ErrClosed) {
-		log.Debugln("[ZeroTier](%s) stack write: %v", z.Name(), writeErr)
-	}
+	z.operationMu.RUnlock()
+	return device, packets, frameErrors
 }
 
 func (z *ZeroTier) networkStackFor(destination netip.Addr) (*ZTIP.Link, ipStack, error) {
@@ -1316,11 +1256,8 @@ func (z *ZeroTier) ListenPacketContext(ctx context.Context, metadata *C.Metadata
 	if err != nil {
 		return nil, err
 	}
-	localAddress := netip.IPv4Unspecified()
-	if metadata.DstIP.Is6() {
-		localAddress = netip.IPv6Unspecified()
-	}
-	packetConn, err := device.ListenUDP(ctx, "udp", netip.AddrPortFrom(localAddress, 0))
+	// The ipStack contract guarantees that a generic UDP wildcard supports both address families.
+	packetConn, err := device.ListenUDP(ctx, "udp", netip.AddrPort{})
 	if err != nil {
 		return nil, err
 	}
