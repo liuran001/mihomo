@@ -18,36 +18,75 @@ const (
 	mapLookupAndDeleteUnknown int32 = iota
 	mapLookupAndDeleteSupported
 	mapLookupAndDeleteUnsupported
-)
 
-// enotSupp is ENOTSUPP (errno 524). Linux uses a distinct value from
-// EOPNOTSUPP (95) and neither syscall nor x/sys/unix export ENOTSUPP; some
-// kernels return it for unsupported BPF commands such as
-// BPF_MAP_LOOKUP_AND_DELETE_ELEM.
-const enotSupp = syscall.Errno(524)
+	// ENOTSUPP is an internal Linux errno that is normally translated before
+	// reaching user space. Some Android kernels return it directly when a BPF
+	// map command is unavailable.
+	linuxErrnoNotSupported syscall.Errno = 524
+)
 
 func (b *CgroupBackend) SocketProtectFunc() control.Func {
 	if b == nil {
 		return nil
 	}
 	return func(network string, address string, rawConn syscall.RawConn) error {
+		b.access.RLock()
+		if b.runtime == nil {
+			b.access.RUnlock()
+			return errBackendClosed
+		}
+		if b.runtime.self_bypass_tgid {
+			b.access.RUnlock()
+			return nil
+		}
+		b.access.RUnlock()
 		return control.Raw(rawConn, func(fd uintptr) error {
-			b.access.RLock()
-			defer b.access.RUnlock()
-			if b.runtime == nil {
-				return errBackendClosed
-			}
 			cookie, err := readSocketCookie(fd)
 			if err != nil {
 				return E.Cause(err, "read socket cookie")
 			}
-			value := uint8(1)
-			if err = updateMap(b.socketBypassMapFD, unsafe.Pointer(&cookie), unsafe.Pointer(&value)); err != nil {
-				return E.Cause(err, "register eBPF bypass socket")
+			b.access.RLock()
+			if b.runtime == nil {
+				b.access.RUnlock()
+				return errBackendClosed
 			}
+			if b.runtime.self_bypass_tgid {
+				b.access.RUnlock()
+				return nil
+			}
+			if b.socketBypassMapFD >= 0 {
+				err = registerSocketCookie(b.socketBypassMapFD, cookie)
+				b.access.RUnlock()
+				return err
+			}
+			b.access.RUnlock()
+
+			b.access.Lock()
+			defer b.access.Unlock()
+			if b.runtime == nil {
+				return errBackendClosed
+			}
+			if b.runtime.self_bypass_tgid {
+				return nil
+			}
+			if b.socketBypassMapFD >= 0 {
+				return registerSocketCookie(b.socketBypassMapFD, cookie)
+			}
+			if b.pendingSocketCookies == nil {
+				b.pendingSocketCookies = make(map[uint64]struct{})
+			}
+			b.pendingSocketCookies[cookie] = struct{}{}
 			return nil
 		})
 	}
+}
+
+func registerSocketCookie(mapFD int, cookie uint64) error {
+	value := uint8(1)
+	if err := updateMap(mapFD, unsafe.Pointer(&cookie), unsafe.Pointer(&value)); err != nil {
+		return E.Cause(err, "register eBPF bypass socket")
+	}
+	return nil
 }
 
 func (b *CgroupBackend) LookupOriginal(protocol uint8, listenerDestination netip.AddrPort) (OriginalDestination, error) {
@@ -129,7 +168,7 @@ func mapLookupAndDeleteUnavailable(err error) bool {
 	return errors.Is(err, unix.ENOSYS) ||
 		errors.Is(err, unix.EINVAL) ||
 		errors.Is(err, unix.EOPNOTSUPP) ||
-		errors.Is(err, enotSupp)
+		errors.Is(err, linuxErrnoNotSupported)
 }
 
 func (b *CgroupBackend) DeleteRedirect(protocol uint8, listenerDestination netip.AddrPort) error {

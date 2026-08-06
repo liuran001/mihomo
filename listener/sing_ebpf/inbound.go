@@ -45,6 +45,8 @@ type Inbound struct {
 	dnsMode             string
 	cgroupIPv6Mode      string
 	cgroupIPv6Available bool
+	cgroupIPv6Probe     cgroupIPv6ProbeState
+	cgroupIPv6ProbeLock sync.Mutex
 	redirectIPv4Prefix  netip.Prefix
 	redirectIPv6Prefix  netip.Prefix
 	cgroupMapCapacity   ECommon.CgroupMapCapacity

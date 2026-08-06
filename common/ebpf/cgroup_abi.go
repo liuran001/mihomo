@@ -2,6 +2,7 @@ package ebpf
 
 import (
 	"net/netip"
+	"time"
 
 	E "github.com/metacubex/sing/common/exceptions"
 )
@@ -14,6 +15,8 @@ const (
 	SocketBypassMapCapacity    = 65536
 	SharedNetworkMapCapacity   = 65536
 	MaxConfigurableMapCapacity = 1 << 20
+	udpFlowActionProxy         = 1
+	udpFlowActionBypass        = 2
 
 	addressFamilyIPv4 = 2
 	addressFamilyIPv6 = 10
@@ -23,18 +26,6 @@ type CgroupMapCapacity struct {
 	TCPRedirect  uint32
 	UDPRedirect  uint32
 	SocketBypass uint32
-}
-
-type CgroupPolicy struct {
-	EnableBypassCIDR bool
-	HijackDNS        bool
-	IncludeUID       []UIDRange
-	ExcludeUID       []UIDRange
-}
-
-type UIDRange struct {
-	Start uint32
-	End   uint32
 }
 
 type CgroupConfig struct {
@@ -47,6 +38,7 @@ type CgroupConfig struct {
 	RedirectIPv4  netip.Prefix
 	RedirectIPv6  netip.Prefix
 	MapCapacity   CgroupMapCapacity
+	UDPTimeout    time.Duration
 	Policy        CgroupPolicy
 }
 
@@ -87,6 +79,14 @@ type udpFlowKey struct {
 	Port         uint16
 	Addr         [16]byte
 	Reserved     [4]byte
+}
+
+type udpFlowValue struct {
+	Action          uint8
+	Reserved        [3]byte
+	LastSeenSeconds uint32
+	Listener        listenerLookupKey
+	Reserved2       [4]byte
 }
 
 func makeUDPFlowKey(original originalDestinationValue) udpFlowKey {

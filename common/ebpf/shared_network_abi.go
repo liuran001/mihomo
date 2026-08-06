@@ -35,15 +35,23 @@ type sharedNetworkControl struct {
 }
 
 func sharedNetworkUDPTimeoutSeconds(timeout time.Duration) (uint32, error) {
+	return normalizedUDPTimeoutSeconds("shared-network", timeout)
+}
+
+func cgroupUDPTimeoutSeconds(timeout time.Duration) (uint32, error) {
+	return normalizedUDPTimeoutSeconds("local cgroup", timeout)
+}
+
+func normalizedUDPTimeoutSeconds(scope string, timeout time.Duration) (uint32, error) {
 	if timeout <= 0 {
-		return 0, E.New("invalid shared-network UDP timeout: ", timeout)
+		return 0, E.New("invalid ", scope, " UDP timeout: ", timeout)
 	}
 	seconds := uint64(timeout / time.Second)
 	if timeout%time.Second != 0 {
 		seconds++
 	}
 	if seconds > math.MaxUint32 {
-		return 0, E.New("shared-network UDP timeout is too large: ", timeout)
+		return 0, E.New(scope, " UDP timeout is too large: ", timeout)
 	}
 	return uint32(seconds), nil
 }

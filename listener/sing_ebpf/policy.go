@@ -120,7 +120,14 @@ func (i *Inbound) refreshBypassCIDRsLocked() (bool, error) {
 	// domains whose real addresses fall inside it keep their real IP and the
 	// kernel eBPF bypass can engage. Only publish when bypass_rule_set is used.
 	if len(i.bypassRuleSet) > 0 {
-		resolver.EBFPBypassIPSet.Store(backend.BypassIPSet())
+		var builder netipx.IPSetBuilder
+		for _, prefix := range prefixes {
+			builder.AddPrefix(prefix)
+		}
+		bypassSet, buildErr := builder.IPSet()
+		if buildErr == nil {
+			resolver.EBFPBypassIPSet.Store(bypassSet)
+		}
 	} else {
 		resolver.EBFPBypassIPSet.Store(nil)
 	}

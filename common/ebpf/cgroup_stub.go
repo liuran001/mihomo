@@ -7,8 +7,6 @@ import (
 
 	"github.com/metacubex/sing/common/control"
 	E "github.com/metacubex/sing/common/exceptions"
-
-	"go4.org/netipx"
 )
 
 type CgroupBackend struct{}
@@ -39,10 +37,6 @@ func (b *CgroupBackend) UpdateBypassCIDR([]netip.Prefix) (bool, error) {
 
 func (b *CgroupBackend) BypassCIDRCount() (int, int) {
 	return 0, 0
-}
-
-func (b *CgroupBackend) BypassIPSet() *netipx.IPSet {
-	return nil
 }
 
 func (b *CgroupBackend) CgroupPath() string {

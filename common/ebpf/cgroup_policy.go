@@ -1,5 +1,3 @@
-//go:build with_ebpf && (linux || android)
-
 package ebpf
 
 import (
@@ -15,6 +13,18 @@ const (
 	maxUIDPolicyEntries        = 4096
 	maxBypassCIDRPolicyEntries = 65536
 )
+
+type CgroupPolicy struct {
+	EnableBypassCIDR bool
+	HijackDNS        bool
+	IncludeUID       []UIDRange
+	ExcludeUID       []UIDRange
+}
+
+type UIDRange struct {
+	Start uint32
+	End   uint32
+}
 
 type uidLPMKey struct {
 	PrefixLength uint32

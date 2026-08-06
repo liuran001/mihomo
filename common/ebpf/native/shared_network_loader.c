@@ -199,7 +199,7 @@ static int shared_network_object_load_section(
     const Elf64_Ehdr *header,
     size_t object_size,
     const char *section_name,
-    const char *program_name,
+    const struct sb_ebpf_program_descriptor *program,
     int bypass_ipv4_map_fd,
     int bypass_ipv6_map_fd,
     const struct sb_ebpf_shared_network_runtime *runtime) {
@@ -273,9 +273,9 @@ static int shared_network_object_load_section(
         result = sb_ebpf_load_prog(
             instructions,
             instruction_count,
-            program_name,
-            BPF_PROG_TYPE_SCHED_CLS,
-            (enum bpf_attach_type)0,
+            program->name,
+            program->type,
+            program->attach_type,
             true);
     } else {
         fprintf(
@@ -319,22 +319,29 @@ int sb_ebpf_load_shared_network_programs(
         errno = ENOEXEC;
         return -1;
     }
-    runtime->ingress_prog_fd = shared_network_object_load_section(
-        header,
-        object_size,
-        "classifier/ingress",
-        "sb_share_in",
-        bypass_ipv4_map_fd,
-        bypass_ipv6_map_fd,
-        runtime);
-    if (runtime->ingress_prog_fd < 0) return -1;
-    runtime->egress_prog_fd = shared_network_object_load_section(
-        header,
-        object_size,
-        "classifier/egress",
-        "sb_share_out",
-        bypass_ipv4_map_fd,
-        bypass_ipv6_map_fd,
-        runtime);
-    return runtime->egress_prog_fd < 0 ? -1 : 0;
+    struct shared_network_program_spec {
+        const char *section;
+        struct sb_ebpf_program_descriptor program;
+    } programs[] = {
+        {"classifier/ingress", {"sb_share_in", BPF_PROG_TYPE_SCHED_CLS,
+         (enum bpf_attach_type)0, &runtime->ingress_prog_fd}},
+        {"classifier/egress", {"sb_share_out", BPF_PROG_TYPE_SCHED_CLS,
+         (enum bpf_attach_type)0, &runtime->egress_prog_fd}},
+    };
+    for (size_t index = 0U; index < sizeof(programs) / sizeof(programs[0]); ++index) {
+        struct shared_network_program_spec *spec = &programs[index];
+        *spec->program.fd = shared_network_object_load_section(
+            header,
+            object_size,
+            spec->section,
+            &spec->program,
+            bypass_ipv4_map_fd,
+            bypass_ipv6_map_fd,
+            runtime);
+        if (*spec->program.fd < 0) {
+            sb_ebpf_set_error_stage(runtime->error_stage, spec->program.name);
+            return -1;
+        }
+    }
+    return 0;
 }
