@@ -104,6 +104,11 @@ jobs:
         run: |
           set -euo pipefail
           title="[automation] eBPF branch failed to sync upstream"
+          issues_enabled="$(gh api repos/"$GITHUB_REPOSITORY" --jq '.has_issues' 2>/dev/null || echo false)"
+          if [ "${issues_enabled}" != "true" ]; then
+            echo "ERROR: automatic failure reporting requires Issues to be enabled in ${GITHUB_REPOSITORY}" >&2
+            exit 1
+          fi
           for number in $(gh issue list --repo "$GITHUB_REPOSITORY" --search "\"${title}\" in:title" --state open --json number -q '.[].number' 2>/dev/null || true); do
             gh issue close "${number}" --repo "$GITHUB_REPOSITORY" --reason completed || true
           done
