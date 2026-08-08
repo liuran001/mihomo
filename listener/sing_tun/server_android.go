@@ -46,6 +46,13 @@ func getPackageManager() (tun.PackageManager, error) {
 	return globalPM, pmErr
 }
 
+// GetPackageManager returns the shared Android package manager, initializing
+// it on first use. Used by other inbounds (e.g. the eBPF inbound) to resolve
+// include/exclude package names to UIDs.
+func GetPackageManager() (tun.PackageManager, error) {
+	return getPackageManager()
+}
+
 func (l *Listener) buildAndroidRules(tunOptions *tun.Options) error {
 	packageManager, err := getPackageManager()
 	if err != nil {

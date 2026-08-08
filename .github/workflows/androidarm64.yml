@@ -1,0 +1,168 @@
+name: Build Android ARM64
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - ebpf-inbound
+    paths-ignore:
+      - "docs/**"
+      - "README.md"
+
+concurrency:
+  group: "${{ github.workflow }}-${{ github.ref }}"
+  cancel-in-progress: true
+
+env:
+  REGISTRY: docker.io
+
+jobs:
+  build-android-arm64:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+
+    - name: Set up Go
+      uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+      with:
+        go-download-base-url: 'https://github.com/MetaCubeX/go/releases/download/build'
+        go-version: '1.26'
+
+    - name: Verify Go installation
+      run: go version
+
+    - name: Verify Go env
+      run: go env
+
+    - name: Download dependencies
+      run: |
+        go mod download
+        go mod tidy
+
+    - name: Apply patch to sing-tun (idempotent)
+      run: |
+        SING_TUN_VERSION=$(go list -m github.com/metacubex/sing-tun | awk '{print $2}')
+        SING_TUN_DIR="$(go env GOMODCACHE)/github.com/metacubex/sing-tun@${SING_TUN_VERSION}"
+
+        echo "Sing-tun version: $SING_TUN_VERSION"
+        echo "Sing-tun directory: $SING_TUN_DIR"
+
+        chmod -R +w ${SING_TUN_DIR}
+        cd ${SING_TUN_DIR}
+
+        cp "$GITHUB_WORKSPACE/.github/patch/sing-tun.patch" ./sing-tun.patch
+
+        if grep -q "if len(r.tunOptions.Inet6Address) > 0 && runtime.GOOS == \"android\"" redirect_linux.go 2>/dev/null; then
+          echo "Patch already applied (IPv6 Android code found), skipping..."
+          exit 0
+        fi
+
+        if patch -p1 --reverse --dry-run < sing-tun.patch 2>/dev/null; then
+          echo "Patch already applied (reverse dry-run succeeded), skipping..."
+          exit 0
+        fi
+
+        if patch -p1 --dry-run < sing-tun.patch 2>&1 | grep -q "Reversed (or previously applied) patch detected"; then
+          echo "Patch already applied (dry-run detected reversal), skipping..."
+          exit 0
+        fi
+
+        echo "Applying patch for the first time..."
+        if patch -p1 < sing-tun.patch; then
+          echo "Patch applied successfully to sing-tun"
+        else
+          echo "Failed to apply patch"
+          echo "=== Dry run patch to see issues ==="
+          patch -p1 --dry-run < sing-tun.patch
+          exit 1
+        fi
+
+        echo "=== Verifying patch changes ==="
+        echo "Checking redirect_linux.go for IPv6 Android changes:"
+        grep -A5 "if len(r.tunOptions.Inet6Address) > 0" redirect_linux.go || echo "IPv6 change not found"
+
+        echo "Checking redirect_server.go for dual-stack changes:"
+        grep -B2 "if s.listenAddr.Is4()" redirect_server.go || echo "Dual-stack change not found"
+
+    - name: Modify the Update Link
+      run: sed -i 's|github\.com/MetaCubeX/mihomo|github.com/TanakaLun/mihomo|g' ./component/updater/update_core.go
+
+    - name: Update CA
+      run: |
+        sudo apt-get update && sudo apt-get install -y ca-certificates
+        sudo update-ca-certificates
+        cp -f /etc/ssl/certs/ca-certificates.crt component/ca/ca-certificates.crt
+
+    - name: Set variables
+      run: |
+        BRANCH_NAME="${GITHUB_REF#refs/heads/}"
+        SHORT_HASH=$(git rev-parse --short HEAD)
+        VERSION="TanakaLun-${SHORT_HASH}"
+        VERSION="${VERSION//\//-}"
+        echo "VERSION=${VERSION}" >> $GITHUB_ENV
+        echo "BUILDTIME=$(date)" >> $GITHUB_ENV
+        echo "CGO_ENABLED=1" >> $GITHUB_ENV
+        echo "GOTOOLCHAIN=local" >> $GITHUB_ENV
+        echo "BUILDTAG=" >> $GITHUB_ENV
+
+    - name: Setup NDK
+      uses: nttld/setup-ndk@v1
+      id: setup-ndk
+      with:
+        ndk-version: r29-beta1
+
+    - name: Set NDK environment
+      run: |
+        NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}
+        echo "CC=${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang" >> $GITHUB_ENV
+        echo "CGO_ENABLED=1" >> $GITHUB_ENV
+        echo "GOOS=android" >> $GITHUB_ENV
+        echo "GOARCH=arm64" >> $GITHUB_ENV
+
+    - name: Record build metadata
+      run: |
+        mkdir -p dist build
+        git fetch --depth=1 https://github.com/MetaCubeX/mihomo.git Alpha
+        echo "$(git rev-parse FETCH_HEAD)" > build/UPSTREAM_SHA
+        echo "$(git rev-parse HEAD)" > build/COMMIT_SHA
+        echo "android/arm64" > build/PLATFORM
+        go version > build/GO_VERSION
+        echo "${VERSION}" > build/VERSION
+
+    - name: Build mihomo for Android arm64 (with patched sing-tun)
+      run: |
+        go clean -cache
+
+        make ebpf_generate
+
+        go build -v -tags "with_gvisor with_ebpf" -trimpath \
+          -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' \
+                    -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' \
+                    -w -s -buildid=" \
+          -o mihomo
+
+    - name: Strip binary
+      run: |
+        NDK_PATH=${{ steps.setup-ndk.outputs.ndk-path }}
+        STRIP_PATH="${NDK_PATH}/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip"
+        $STRIP_PATH --strip-all mihomo
+        echo "Binary size after strip: $(du -h mihomo | cut -f1)"
+
+    - name: Compress binary
+      run: |
+        cp mihomo mihomo-android-arm64
+        gzip -c mihomo-android-arm64 > mihomo-android-arm64-${VERSION}.gz
+
+    - name: Checksum and copy metadata
+      run: |
+        sha256sum mihomo-android-arm64-*.gz > mihomo-android-arm64.sha256
+        cp build/* dist/ 2>/dev/null || true
+
+    - name: Upload artifact
+      uses: actions/upload-artifact@v7
+      with:
+        name: android-arm64
+        path: |
+          mihomo-android-arm64-*.gz
+          mihomo-android-arm64.sha256
+          dist/*
+          build/*
