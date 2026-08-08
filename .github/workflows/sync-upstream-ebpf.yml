@@ -48,8 +48,8 @@ jobs:
           git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
           git fetch --prune upstream "${{ steps.vars.outputs.branch }}"
 
-      - name: Rebase candidate
-        id: rebase
+      - name: Merge upstream into candidate
+        id: merge
         shell: bash
         run: |
           set -euo pipefail
@@ -57,10 +57,10 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           candidate="automation/ebpf-${GITHUB_RUN_ID}"
           git switch -c "${candidate}"
-          git rebase "upstream/${{ steps.vars.outputs.branch }}"
+          git merge --no-edit --no-ff "upstream/${{ steps.vars.outputs.branch }}"
 
       - name: Record upstream revision
-        if: steps.rebase.outcome == 'success'
+        if: steps.merge.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -70,7 +70,7 @@ jobs:
           git commit -m "chore: record upstream revision"
 
       - name: Push candidate branch
-        if: steps.rebase.outcome == 'success'
+        if: steps.merge.outcome == 'success'
         shell: bash
         run: |
           set -euo pipefail
@@ -79,7 +79,7 @@ jobs:
           echo "candidate_branch=${candidate}" >> "$GITHUB_OUTPUT"
 
       - name: Create or update pull request
-        if: steps.rebase.outcome == 'success'
+        if: steps.merge.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -97,7 +97,7 @@ jobs:
           fi
 
       - name: Close stale sync failure issues
-        if: steps.rebase.outcome == 'success'
+        if: steps.merge.outcome == 'success'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
@@ -147,15 +147,15 @@ jobs:
           candidate="conflict-repro-${GITHUB_RUN_ID}"
           git switch -c "${candidate}"
           set +e
-          git rebase "upstream/${branch}"
-          rebase_status=$?
+          git merge --no-edit --no-ff "upstream/${branch}"
+          merge_status=$?
           set -e
           upstream_sha="$(git rev-parse "upstream/${branch}")"
           conflict_files="$(git diff --name-only --diff-filter=U 2>/dev/null || true)"
           run_url="${{ steps.vars.outputs.run_url }}"
           last_good_build="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "Build eBPF branch" --status success --limit 1 --json headSha -q '.[0].headSha' 2>/dev/null || echo unknown)"
           title="[automation] eBPF branch failed to sync upstream"
-          body="Upstream repository: ${UPSTREAM_REPO}\\nUpstream branch: ${branch}\\nUpstream SHA: ${upstream_sha}\\nDownstream branch: ${FEATURE_BRANCH}\\nDownstream SHA: ${feature_sha}\\nRebase exit code: ${rebase_status}\\nConflict files:\\n${conflict_files}\\nActions run: ${run_url}\\nLast successful build SHA: ${last_good_build}\\n\\nLocal reproduction:\\n\\n    git fetch upstream ${branch}\\n    git switch -c conflict-repro origin/${FEATURE_BRANCH}\\n    git rebase upstream/${branch}"
+          body="Upstream repository: ${UPSTREAM_REPO}\\nUpstream branch: ${branch}\\nUpstream SHA: ${upstream_sha}\\nDownstream branch: ${FEATURE_BRANCH}\\nDownstream SHA: ${feature_sha}\\nMerge exit code: ${merge_status}\\nConflict files:\\n${conflict_files}\\nActions run: ${run_url}\\nLast successful build SHA: ${last_good_build}\\n\\nLocal reproduction:\\n\\n    git fetch upstream ${branch}\\n    git switch -c conflict-repro origin/${FEATURE_BRANCH}\\n    git merge upstream/${branch}"
           for label in automation ebpf upstream-sync; do
             gh label create "${label}" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
           done
