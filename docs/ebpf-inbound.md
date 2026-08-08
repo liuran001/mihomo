@@ -203,6 +203,17 @@ helpers, and cleans up all state on completion. After stopping mihomo on the
 same host, verify `bpftool prog show`, `bpftool map show`, and
 `bpftool link show` report no leftover objects.
 
+## Repository automation prerequisites
+
+The sync workflow creates PRs and failure Issues. The target repository must
+have:
+
+- Issues enabled, otherwise the failure notification step exits with an
+  actionable error instead of creating an Issue.
+- GitHub Actions permitted to create and approve pull requests.
+- The sync workflow present on the repository default branch so the
+  `schedule` trigger is active.
+
 ## Relationship with TUN, TProxy, and Redir
 
 The eBPF inbound intercepts sockets inside the selected cgroup; it is not a
