@@ -1,0 +1,173 @@
+name: Sync upstream and integrate eBPF
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_branch:
+        description: Upstream branch
+        required: true
+        default: Alpha
+  schedule:
+    - cron: "17 */6 * * *"
+
+concurrency:
+  group: sync-upstream-ebpf
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  pull-requests: write
+  issues: write
+
+env:
+  UPSTREAM_REPO: MetaCubeX/mihomo
+  FEATURE_BRANCH: ebpf-inbound
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ebpf-inbound
+
+      - name: Resolve upstream branch
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="${{ inputs.upstream_branch || 'Alpha' }}"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --prune upstream "${{ steps.vars.outputs.branch }}"
+
+      - name: Merge upstream into candidate
+        id: merge
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          candidate="automation/ebpf-${GITHUB_RUN_ID}"
+          git switch -c "${candidate}"
+          git merge --no-edit --no-ff "upstream/${{ steps.vars.outputs.branch }}"
+
+      - name: Record upstream revision
+        if: steps.merge.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          git rev-parse "upstream/${{ steps.vars.outputs.branch }}" > build/UPSTREAM_SHA
+          git add build/UPSTREAM_SHA
+          git commit -m "chore: record upstream revision"
+
+      - name: Push candidate branch
+        if: steps.merge.outcome == 'success'
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate="automation/ebpf-${GITHUB_RUN_ID}"
+          git push origin "HEAD:refs/heads/${candidate}"
+          echo "candidate_branch=${candidate}" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update pull request
+        if: steps.merge.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          candidate="automation/ebpf-${GITHUB_RUN_ID}"
+          upstream_sha="$(git rev-parse "upstream/${{ steps.vars.outputs.branch }}")"
+          downstream_sha="$(git rev-parse HEAD)"
+          body="Automated upstream integration.\\n\\nUpstream: ${{ steps.vars.outputs.branch }} @ ${upstream_sha}\\nCandidate: ${candidate} @ ${downstream_sha}\\nRun: ${{ steps.vars.outputs.run_url }}\\n\\nMerge only after required checks pass."
+          pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --head "${candidate}" --json number -q '.[0].number' 2>/dev/null || true)"
+          if [ -z "${pr_number}" ]; then
+            gh pr create --repo "$GITHUB_REPOSITORY" --base "$FEATURE_BRANCH" --head "${candidate}" --title "chore: sync upstream into eBPF branch" --body "${body}"
+          else
+            gh pr edit "${pr_number}" --repo "$GITHUB_REPOSITORY" --title "chore: sync upstream into eBPF branch" --body "${body}"
+          fi
+
+      - name: Close stale sync failure issues
+        if: steps.merge.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          title="[automation] eBPF branch failed to sync upstream"
+          issues_enabled="$(gh api repos/"$GITHUB_REPOSITORY" --jq '.has_issues' 2>/dev/null || echo false)"
+          if [ "${issues_enabled}" != "true" ]; then
+            echo "ERROR: automatic failure reporting requires Issues to be enabled in ${GITHUB_REPOSITORY}" >&2
+            exit 1
+          fi
+          for number in $(gh issue list --repo "$GITHUB_REPOSITORY" --search "\"${title}\" in:title" --state open --json number -q '.[].number' 2>/dev/null || true); do
+            gh issue close "${number}" --repo "$GITHUB_REPOSITORY" --reason completed || true
+          done
+
+  notify:
+    needs: sync
+    if: ${{ always() && needs.sync.result == 'failure' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          ref: ebpf-inbound
+
+      - name: Resolve upstream branch
+        id: vars
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="${{ inputs.upstream_branch || 'Alpha' }}"
+          echo "branch=${branch}" >> "$GITHUB_OUTPUT"
+          echo "run_url=${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Fetch upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          git remote add upstream "https://github.com/${UPSTREAM_REPO}.git" 2>/dev/null || git remote set-url upstream "https://github.com/${UPSTREAM_REPO}.git"
+          git fetch --prune upstream "${{ steps.vars.outputs.branch }}"
+
+      - name: Reproduce conflict and create issue
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          branch="${{ steps.vars.outputs.branch }}"
+          feature_sha="$(git rev-parse HEAD)"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          candidate="conflict-repro-${GITHUB_RUN_ID}"
+          git switch -c "${candidate}"
+          set +e
+          git merge --no-edit --no-ff "upstream/${branch}"
+          merge_status=$?
+          set -e
+          upstream_sha="$(git rev-parse "upstream/${branch}")"
+          conflict_files="$(git diff --name-only --diff-filter=U 2>/dev/null || true)"
+          run_url="${{ steps.vars.outputs.run_url }}"
+          last_good_build="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow "Build eBPF branch" --status success --limit 1 --json headSha -q '.[0].headSha' 2>/dev/null || echo unknown)"
+          title="[automation] eBPF branch failed to sync upstream"
+          body="Upstream repository: ${UPSTREAM_REPO}\\nUpstream branch: ${branch}\\nUpstream SHA: ${upstream_sha}\\nDownstream branch: ${FEATURE_BRANCH}\\nDownstream SHA: ${feature_sha}\\nMerge exit code: ${merge_status}\\nConflict files:\\n${conflict_files}\\nActions run: ${run_url}\\nLast successful build SHA: ${last_good_build}\\n\\nLocal reproduction:\\n\\n    git fetch upstream ${branch}\\n    git switch -c conflict-repro origin/${FEATURE_BRANCH}\\n    git merge upstream/${branch}"
+          for label in automation ebpf upstream-sync; do
+            gh label create "${label}" --repo "$GITHUB_REPOSITORY" 2>/dev/null || true
+          done
+          existing="$(gh issue list --repo "$GITHUB_REPOSITORY" --search "\"${title}\" in:title" --state open --json number -q '.[0].number' 2>/dev/null || true)"
+          if [ -n "${existing}" ]; then
+            gh issue edit "${existing}" --repo "$GITHUB_REPOSITORY" --title "${title}" --body "${body}"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "${title}" --body "${body}" --label automation --label ebpf --label upstream-sync
+          fi
+          exit 1
