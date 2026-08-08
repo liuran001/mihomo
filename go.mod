@@ -27,7 +27,7 @@ require (
 	github.com/metacubex/jls-tls v0.0.0-20260723084315-67adc0e2f796
 	github.com/metacubex/kcp-go v0.0.0-20260105040817-550693377604
 	github.com/metacubex/mhurl v0.1.0
-	github.com/metacubex/mipstack v0.0.0-20260805225546-c23383f247aa
+	github.com/metacubex/mipstack v0.0.0-20260808050503-d7b2821f2a69
 	github.com/metacubex/mlkem v0.1.0
 	github.com/metacubex/quic-go v0.61.1-0.20260727080200-2548683b76f4
 	github.com/metacubex/randv2 v0.2.0
@@ -38,12 +38,12 @@ require (
 	github.com/metacubex/sing-quic v0.0.0-20260726014900-38b0e9295f51
 	github.com/metacubex/sing-shadowsocks v0.2.12
 	github.com/metacubex/sing-shadowsocks2 v0.2.7
-	github.com/metacubex/sing-tun v0.4.21
+	github.com/metacubex/sing-tun v0.4.22
 	github.com/metacubex/sing-vmess v0.2.5
 	github.com/metacubex/sing-wireguard v0.0.0-20260804133520-b873d2f3e751
 	github.com/metacubex/smux v0.0.0-20260105030934-d0c8756d3141
 	github.com/metacubex/ssh v0.1.0
-	github.com/metacubex/tailscale v0.0.0-20260727131202-3748fbaa292c
+	github.com/metacubex/tailscale v0.0.0-20260807072706-a4fb5feabcbb
 	github.com/metacubex/tfo-go v0.0.0-20260623020846-376a77860b8c
 	github.com/metacubex/tls v0.1.7
 	github.com/metacubex/utls v1.8.7
@@ -110,7 +110,7 @@ require (
 	github.com/klauspost/reedsolomon v1.12.3 // indirect
 	github.com/mdlayher/socket v0.5.1 // indirect
 	github.com/metacubex/ascon v0.1.0 // indirect
-	github.com/metacubex/gvisor v0.0.0-20260803120439-3db0444786c6 // indirect
+	github.com/metacubex/gvisor v0.0.0-20260807021258-5683e078dbc4 // indirect
 	github.com/metacubex/hkdf v0.1.0 // indirect
 	github.com/metacubex/hpke v0.1.0 // indirect
 	github.com/metacubex/jsonv2 v0.0.0-20260721082349-16b4998c8f89 // indirect
