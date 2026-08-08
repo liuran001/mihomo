@@ -42,30 +42,30 @@ jobs:
       run: |
         SING_TUN_VERSION=$(go list -m github.com/metacubex/sing-tun | awk '{print $2}')
         SING_TUN_DIR="$(go env GOMODCACHE)/github.com/metacubex/sing-tun@${SING_TUN_VERSION}"
-        
+
         echo "Sing-tun version: $SING_TUN_VERSION"
         echo "Sing-tun directory: $SING_TUN_DIR"
-        
+
         chmod -R +w ${SING_TUN_DIR}
         cd ${SING_TUN_DIR}
-        
-        wget -O sing-tun.patch "https://raw.githubusercontent.com/${GITHUB_REPOSITORY}/${GITHUB_REF_NAME}/.github/patch/sing-tun.patch"
-        
+
+        cp "$GITHUB_WORKSPACE/.github/patch/sing-tun.patch" ./sing-tun.patch
+
         if grep -q "if len(r.tunOptions.Inet6Address) > 0 && runtime.GOOS == \"android\"" redirect_linux.go 2>/dev/null; then
           echo "Patch already applied (IPv6 Android code found), skipping..."
           exit 0
         fi
-        
+
         if patch -p1 --reverse --dry-run < sing-tun.patch 2>/dev/null; then
           echo "Patch already applied (reverse dry-run succeeded), skipping..."
           exit 0
         fi
-        
+
         if patch -p1 --dry-run < sing-tun.patch 2>&1 | grep -q "Reversed (or previously applied) patch detected"; then
           echo "Patch already applied (dry-run detected reversal), skipping..."
           exit 0
         fi
-        
+
         echo "Applying patch for the first time..."
         if patch -p1 < sing-tun.patch; then
           echo "Patch applied successfully to sing-tun"
@@ -75,11 +75,11 @@ jobs:
           patch -p1 --dry-run < sing-tun.patch
           exit 1
         fi
-        
+
         echo "=== Verifying patch changes ==="
         echo "Checking redirect_linux.go for IPv6 Android changes:"
         grep -A5 "if len(r.tunOptions.Inet6Address) > 0" redirect_linux.go || echo "IPv6 change not found"
-        
+
         echo "Checking redirect_server.go for dual-stack changes:"
         grep -B2 "if s.listenAddr.Is4()" redirect_server.go || echo "Dual-stack change not found"
 
@@ -118,6 +118,16 @@ jobs:
         echo "GOOS=android" >> $GITHUB_ENV
         echo "GOARCH=arm64" >> $GITHUB_ENV
 
+    - name: Record build metadata
+      run: |
+        mkdir -p dist build
+        git fetch --depth=1 https://github.com/MetaCubeX/mihomo.git Alpha
+        echo "$(git rev-parse FETCH_HEAD)" > build/UPSTREAM_SHA
+        echo "$(git rev-parse HEAD)" > build/COMMIT_SHA
+        echo "android/arm64" > build/PLATFORM
+        go version > build/GO_VERSION
+        echo "${VERSION}" > build/VERSION
+
     - name: Build mihomo for Android arm64 (with patched sing-tun)
       run: |
         go clean -cache
@@ -142,9 +152,17 @@ jobs:
         cp mihomo mihomo-android-arm64
         gzip -c mihomo-android-arm64 > mihomo-android-arm64-${VERSION}.gz
 
+    - name: Checksum and copy metadata
+      run: |
+        sha256sum mihomo-android-arm64-*.gz > mihomo-android-arm64.sha256
+        cp build/* dist/ 2>/dev/null || true
+
     - name: Upload artifact
       uses: actions/upload-artifact@v7
       with:
         name: android-arm64
         path: |
           mihomo-android-arm64-*.gz
+          mihomo-android-arm64.sha256
+          dist/*
+          build/*
