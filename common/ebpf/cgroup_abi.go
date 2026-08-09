@@ -1,6 +1,7 @@
 package ebpf
 
 import (
+	"net"
 	"net/netip"
 	"time"
 
@@ -28,6 +29,20 @@ type CgroupMapCapacity struct {
 	SocketBypass uint32
 }
 
+type SharedNetworkMapCapacities struct {
+	Proxy    uint32
+	Bypass   uint32
+	Fragment uint32
+}
+
+func DefaultSharedNetworkMapCapacities() SharedNetworkMapCapacities {
+	return SharedNetworkMapCapacities{
+		Proxy:    SharedNetworkMapCapacity,
+		Bypass:   SharedNetworkMapCapacity,
+		Fragment: SharedNetworkMapCapacity,
+	}
+}
+
 type CgroupConfig struct {
 	Path          string
 	EnableTCP     bool
@@ -53,6 +68,7 @@ func DefaultCgroupMapCapacity() CgroupMapCapacity {
 type OriginalDestination struct {
 	Destination  netip.AddrPort
 	ConnectedUDP bool
+	SourceMAC    net.HardwareAddr
 }
 
 type listenerLookupKey struct {

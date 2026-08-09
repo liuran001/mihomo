@@ -12,22 +12,23 @@ import (
 
 type EBPFOption struct {
 	BaseOption
-	Network            []string             `inbound:"network,omitempty"`
-	UDPTimeout         int64                `inbound:"udp-timeout,omitempty"`
-	DNSMode            string               `inbound:"dns-mode,omitempty"`
-	CgroupIPv6Mode     string               `inbound:"cgroup-ipv6-mode,omitempty"`
-	CgroupPath         string               `inbound:"cgroup-path,omitempty"`
-	RedirectAddress    []netip.Prefix       `inbound:"redirect-address,omitempty"`
-	BypassRuleSet      []string             `inbound:"bypass-rule-set,omitempty"`
-	IncludeUID         []uint32             `inbound:"include-uid,omitempty"`
-	IncludeUIDRange    []string             `inbound:"include-uid-range,omitempty"`
-	ExcludeUID         []uint32             `inbound:"exclude-uid,omitempty"`
-	ExcludeUIDRange    []string             `inbound:"exclude-uid-range,omitempty"`
-	IncludeAndroidUser []int                `inbound:"include-android-user,omitempty"`
-	IncludePackage     []string             `inbound:"include-package,omitempty"`
-	ExcludePackage     []string             `inbound:"exclude-package,omitempty"`
-	MapCapacity        LC.EBPFMapCapacity   `inbound:"map-capacity,omitempty"`
-	SharedNetwork      LC.EBPFSharedNetwork `inbound:"shared-network,omitempty"`
+	Network              []string             `inbound:"network,omitempty"`
+	UDPTimeout           int64                `inbound:"udp-timeout,omitempty"`
+	DNSMode              string               `inbound:"dns-mode,omitempty"`
+	CgroupIPv6Mode       string               `inbound:"cgroup-ipv6-mode,omitempty"`
+	CgroupPath           string               `inbound:"cgroup-path,omitempty"`
+	RedirectAddress      []netip.Prefix       `inbound:"redirect-address,omitempty"`
+	BypassPrivateAddress *bool                `inbound:"bypass-private-address,omitempty"`
+	BypassRuleSet        []string             `inbound:"bypass-rule-set,omitempty"`
+	IncludeUID           []uint32             `inbound:"include-uid,omitempty"`
+	IncludeUIDRange      []string             `inbound:"include-uid-range,omitempty"`
+	ExcludeUID           []uint32             `inbound:"exclude-uid,omitempty"`
+	ExcludeUIDRange      []string             `inbound:"exclude-uid-range,omitempty"`
+	IncludeAndroidUser   []int                `inbound:"include-android-user,omitempty"`
+	IncludePackage       []string             `inbound:"include-package,omitempty"`
+	ExcludePackage       []string             `inbound:"exclude-package,omitempty"`
+	MapCapacity          LC.EBPFMapCapacity   `inbound:"map-capacity,omitempty"`
+	SharedNetwork        LC.EBPFSharedNetwork `inbound:"shared-network,omitempty"`
 }
 
 func (o EBPFOption) Equal(config C.InboundConfig) bool {
@@ -50,22 +51,23 @@ func NewEBPF(options *EBPFOption) (*EBPF, error) {
 		Base:   base,
 		config: options,
 		ebpf: LC.EBPF{
-			Network:            options.Network,
-			UDPTimeout:         options.UDPTimeout,
-			DNSMode:            options.DNSMode,
-			CgroupIPv6Mode:     options.CgroupIPv6Mode,
-			CgroupPath:         options.CgroupPath,
-			RedirectAddress:    options.RedirectAddress,
-			BypassRuleSet:      options.BypassRuleSet,
-			IncludeUID:         options.IncludeUID,
-			IncludeUIDRange:    options.IncludeUIDRange,
-			ExcludeUID:         options.ExcludeUID,
-			ExcludeUIDRange:    options.ExcludeUIDRange,
-			IncludeAndroidUser: options.IncludeAndroidUser,
-			IncludePackage:     options.IncludePackage,
-			ExcludePackage:     options.ExcludePackage,
-			MapCapacity:        options.MapCapacity,
-			SharedNetwork:      options.SharedNetwork,
+			Network:              options.Network,
+			UDPTimeout:           options.UDPTimeout,
+			DNSMode:              options.DNSMode,
+			CgroupIPv6Mode:       options.CgroupIPv6Mode,
+			CgroupPath:           options.CgroupPath,
+			RedirectAddress:      options.RedirectAddress,
+			BypassPrivateAddress: options.BypassPrivateAddress,
+			BypassRuleSet:        options.BypassRuleSet,
+			IncludeUID:           options.IncludeUID,
+			IncludeUIDRange:      options.IncludeUIDRange,
+			ExcludeUID:           options.ExcludeUID,
+			ExcludeUIDRange:      options.ExcludeUIDRange,
+			IncludeAndroidUser:   options.IncludeAndroidUser,
+			IncludePackage:       options.IncludePackage,
+			ExcludePackage:       options.ExcludePackage,
+			MapCapacity:          options.MapCapacity,
+			SharedNetwork:        options.SharedNetwork,
 		},
 	}, nil
 }

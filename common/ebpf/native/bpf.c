@@ -1,7 +1,7 @@
 // Copyright 2026, Asterisk4Magisk contributors
 // SPDX-License-Identifier: GPL-3.0
 
-#include "ebpf.h"
+#include "runtime.h"
 
 #include <linux/unistd.h>
 #include <errno.h>
@@ -47,6 +47,33 @@ int sb_ebpf_create_map(enum bpf_map_type type, uint32_t key_size, uint32_t value
     attr.max_entries = max_entries;
     attr.map_flags = flags;
     return (int)sb_ebpf_bpf_sys(BPF_MAP_CREATE, &attr, sizeof(attr));
+}
+
+int sb_ebpf_update_map(int map_fd, const void *key, const void *value, uint64_t flags) {
+    if (map_fd < 0 || key == NULL || value == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = (uint32_t)map_fd;
+    attr.key = (uint64_t)(uintptr_t)key;
+    attr.value = (uint64_t)(uintptr_t)value;
+    attr.flags = flags;
+    return (int)sb_ebpf_bpf_sys(BPF_MAP_UPDATE_ELEM, &attr, sizeof(attr));
+}
+
+int sb_ebpf_lookup_map(int map_fd, const void *key, void *value) {
+    if (map_fd < 0 || key == NULL || value == NULL) {
+        errno = EINVAL;
+        return -1;
+    }
+    union bpf_attr attr;
+    memset(&attr, 0, sizeof(attr));
+    attr.map_fd = (uint32_t)map_fd;
+    attr.key = (uint64_t)(uintptr_t)key;
+    attr.value = (uint64_t)(uintptr_t)value;
+    return (int)sb_ebpf_bpf_sys(BPF_MAP_LOOKUP_ELEM, &attr, sizeof(attr));
 }
 
 bool sb_ebpf_map_capacity_valid(uint32_t capacity) {

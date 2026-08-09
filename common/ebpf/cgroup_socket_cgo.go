@@ -18,11 +18,6 @@ const (
 	mapLookupAndDeleteUnknown int32 = iota
 	mapLookupAndDeleteSupported
 	mapLookupAndDeleteUnsupported
-
-	// ENOTSUPP is an internal Linux errno that is normally translated before
-	// reaching user space. Some Android kernels return it directly when a BPF
-	// map command is unavailable.
-	linuxErrnoNotSupported syscall.Errno = 524
 )
 
 func (b *CgroupBackend) SocketProtectFunc() control.Func {

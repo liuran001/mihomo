@@ -5,7 +5,38 @@ package ebpf
 import (
 	"errors"
 	"testing"
+	"unsafe"
 )
+
+var (
+	_ [56 - unsafe.Sizeof(mapBatchAttr{})]byte
+	_ [unsafe.Sizeof(mapBatchAttr{}) - 56]byte
+)
+
+func TestMapBatchAttrABI(t *testing.T) {
+	attribute := mapBatchAttr{}
+	if size := unsafe.Sizeof(attribute); size != 56 {
+		t.Fatalf("unexpected batch map attribute size: %d", size)
+	}
+	for name, offset := range map[string]uintptr{
+		"in_batch":   unsafe.Offsetof(attribute.InBatch),
+		"out_batch":  unsafe.Offsetof(attribute.OutBatch),
+		"keys":       unsafe.Offsetof(attribute.Keys),
+		"values":     unsafe.Offsetof(attribute.Values),
+		"count":      unsafe.Offsetof(attribute.Count),
+		"map_fd":     unsafe.Offsetof(attribute.MapFD),
+		"elem_flags": unsafe.Offsetof(attribute.ElemFlags),
+		"flags":      unsafe.Offsetof(attribute.Flags),
+	} {
+		expected := map[string]uintptr{
+			"in_batch": 0, "out_batch": 8, "keys": 16, "values": 24,
+			"count": 32, "map_fd": 36, "elem_flags": 40, "flags": 48,
+		}[name]
+		if offset != expected {
+			t.Fatalf("unexpected %s offset: %d", name, offset)
+		}
+	}
+}
 
 func TestValidateMapCapacity(t *testing.T) {
 	if err := validateMapCapacity("test", 1); err != nil {

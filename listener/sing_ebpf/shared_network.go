@@ -22,7 +22,8 @@ type sharedNetwork struct {
 	listeners      internalListenerSet
 	udpClientTable udpClientTable
 	udpWarnings    udpWarningLimiters
-	mapCapacity    uint32
+	mapCapacity    ECommon.SharedNetworkMapCapacities
+	tcPriority     uint16
 
 	lifecycleAccess sync.RWMutex
 	backendAccess   sync.RWMutex
@@ -30,11 +31,12 @@ type sharedNetwork struct {
 	periodicDone    chan struct{}
 }
 
-func newSharedNetwork(inbound *Inbound, options []string, mapCapacity uint32) *sharedNetwork {
+func newSharedNetwork(inbound *Inbound, options []string, mapCapacity ECommon.SharedNetworkMapCapacities, tcPriority uint16) *sharedNetwork {
 	return &sharedNetwork{
 		inbound:     inbound,
 		interfaces:  append([]string(nil), options...),
 		mapCapacity: mapCapacity,
+		tcPriority:  tcPriority,
 	}
 }
 
@@ -43,16 +45,19 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		return E.Errors(err, s.closeListeners())
 	}
 	backend, err := ECommon.PrepareSharedNetwork(cgroupBackend, ECommon.SharedNetworkConfig{
-		ListenerPort:      s.listeners.selectedPort(),
-		EnableTCP:         s.inbound.enableTCP,
-		EnableUDP:         s.inbound.enableUDP,
-		HijackDNS:         s.inbound.dnsMode == dnsModeHijack,
-		RedirectIPv4:      s.inbound.redirectIPv4Prefix,
-		RedirectIPv6:      s.inbound.redirectIPv6Prefix,
-		IncludeSourceCIDR: s.inbound.options.SharedNetwork.IncludeSourceCIDR,
-		ExcludeSourceCIDR: s.inbound.options.SharedNetwork.ExcludeSourceCIDR,
-		MapCapacity:       s.mapCapacity,
-		UDPTimeout:        s.inbound.udpTimeout,
+		ListenerPort:         s.listeners.selectedPort(),
+		EnableTCP:            s.inbound.enableTCP,
+		EnableUDP:            s.inbound.enableUDP,
+		HijackDNS:            s.inbound.dnsMode == dnsModeHijack,
+		BypassPrivateAddress: s.inbound.bypassPrivateAddress,
+		RedirectIPv4:         s.inbound.redirectIPv4Prefix,
+		RedirectIPv6:         s.inbound.redirectIPv6Prefix,
+		IncludeSourceCIDR:    s.inbound.options.SharedNetwork.IncludeSourceCIDR,
+		ExcludeSourceCIDR:    s.inbound.options.SharedNetwork.ExcludeSourceCIDR,
+		IncludeSourceMAC:     s.inbound.sharedNetworkIncludeMAC,
+		ExcludeSourceMAC:     s.inbound.sharedNetworkExcludeMAC,
+		MapCapacity:          s.mapCapacity,
+		UDPTimeout:           s.inbound.udpTimeout,
 	})
 	if err != nil {
 		return E.Errors(err, s.closeListeners())
@@ -65,6 +70,7 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		backend:     backend,
 		interfaces:  s.interfaces,
 		enableIPv4:  s.inbound.redirectIPv4Prefix.IsValid(),
+		priority:    s.tcPriority,
 		attachments: make(map[string]*sharedTCAttachment),
 	}
 	if monitor, monitorErr := tun.NewNetworkUpdateMonitor(log.SingLogger); monitorErr == nil {
@@ -80,7 +86,7 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		s.inbound.dnsMode,
 		len(s.inbound.options.SharedNetwork.IncludeSourceCIDR),
 		len(s.inbound.options.SharedNetwork.ExcludeSourceCIDR),
-		sharedNetworkTCPriority,
+		s.tcPriority,
 		s.mapCapacity,
 	)
 	return nil

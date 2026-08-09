@@ -17,7 +17,7 @@ import (
 	"golang.org/x/sys/unix"
 )
 
-func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, enableIPv4 bool) (*sharedTCAttachment, error) {
+func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, enableIPv4 bool, priority uint16) (*sharedTCAttachment, error) {
 	restoreRouteLocalnet := false
 	if enableIPv4 {
 		var err error
@@ -38,6 +38,7 @@ func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, en
 		backend.EgressProgramFD(),
 		"sb_share_out",
 		sharedEgressFilterHandle,
+		priority,
 	)
 	if err != nil {
 		if restoreRouteLocalnet {
@@ -51,6 +52,7 @@ func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, en
 		backend.IngressProgramFD(),
 		"sb_share_in",
 		sharedIngressFilterHandle,
+		priority,
 	)
 	if err != nil {
 		var routeErr error
@@ -108,7 +110,7 @@ func restoreSharedRouteLocalnet(interfaceName string) error {
 	return nil
 }
 
-func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, programName string, handle uint16) (*netlink.BpfFilter, error) {
+func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, programName string, handle uint16, priority uint16) (*netlink.BpfFilter, error) {
 	if programFD < 0 {
 		return nil, E.New("shared-network eBPF program is unavailable")
 	}
@@ -134,7 +136,7 @@ func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, progr
 			LinkIndex: link.Attrs().Index,
 			Parent:    parent,
 			Handle:    filterHandle,
-			Priority:  sharedNetworkTCPriority,
+			Priority:  priority,
 			Protocol:  unix.ETH_P_ALL,
 		},
 		Fd:           programFD,

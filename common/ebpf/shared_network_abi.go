@@ -2,6 +2,7 @@ package ebpf
 
 import (
 	"math"
+	"net"
 	"net/netip"
 	"time"
 
@@ -9,16 +10,26 @@ import (
 )
 
 type SharedNetworkConfig struct {
-	ListenerPort      uint16
-	EnableTCP         bool
-	EnableUDP         bool
-	HijackDNS         bool
-	RedirectIPv4      netip.Prefix
-	RedirectIPv6      netip.Prefix
-	IncludeSourceCIDR []netip.Prefix
-	ExcludeSourceCIDR []netip.Prefix
-	MapCapacity       uint32
-	UDPTimeout        time.Duration
+	ListenerPort         uint16
+	EnableTCP            bool
+	EnableUDP            bool
+	HijackDNS            bool
+	BypassPrivateAddress bool
+	RedirectIPv4         netip.Prefix
+	RedirectIPv6         netip.Prefix
+	IncludeSourceCIDR    []netip.Prefix
+	ExcludeSourceCIDR    []netip.Prefix
+	IncludeSourceMAC     []MACAddress
+	ExcludeSourceMAC     []MACAddress
+	MapCapacity          SharedNetworkMapCapacities
+	UDPTimeout           time.Duration
+}
+
+type MACAddress [6]byte
+
+type sharedNetworkMACKey struct {
+	Address  MACAddress
+	Reserved [2]byte
 }
 
 type sharedNetworkControl struct {
@@ -95,6 +106,8 @@ type sharedNetworkOriginalValue struct {
 	Addr           [16]byte
 	InterfaceIndex uint32
 	Reserved       uint32
+	SourceMAC      [6]byte
+	Reserved2      [2]byte
 }
 
 type SharedNetworkFlowHandle struct {
@@ -115,6 +128,10 @@ const (
 	sharedNetworkFlagBypassIPv6
 	sharedNetworkFlagIncludeSource
 	sharedNetworkFlagExcludeSource
+	sharedNetworkFlagIncludeSourceMAC
+	sharedNetworkFlagExcludeSourceMAC
+	sharedNetworkFlagBypassPrivateAddress
+	sharedNetworkFlagBypassFlowCache
 )
 
 const sharedNetworkPolicyFlags = sharedNetworkFlagHostIPv4 |
@@ -122,7 +139,21 @@ const sharedNetworkPolicyFlags = sharedNetworkFlagHostIPv4 |
 	sharedNetworkFlagBypassIPv4 |
 	sharedNetworkFlagBypassIPv6 |
 	sharedNetworkFlagIncludeSource |
-	sharedNetworkFlagExcludeSource
+	sharedNetworkFlagExcludeSource |
+	sharedNetworkFlagIncludeSourceMAC |
+	sharedNetworkFlagExcludeSourceMAC |
+	sharedNetworkFlagBypassFlowCache
+
+const sharedNetworkBypassFlowPolicyFlags = sharedNetworkFlagBypassIPv4 |
+	sharedNetworkFlagBypassIPv6 |
+	sharedNetworkFlagIncludeSource |
+	sharedNetworkFlagExcludeSource |
+	sharedNetworkFlagIncludeSourceMAC |
+	sharedNetworkFlagExcludeSourceMAC
+
+func sharedNetworkBypassFlowCacheRequired(flags uint32) bool {
+	return flags&sharedNetworkBypassFlowPolicyFlags != 0
+}
 
 func makeSharedNetworkListenerKey(
 	protocol uint8,
@@ -155,6 +186,10 @@ func sharedNetworkOriginalAddress(value sharedNetworkOriginalValue) (netip.Addr,
 	default:
 		return netip.Addr{}, E.New("invalid original destination family: ", value.Family)
 	}
+}
+
+func sharedNetworkOriginalMAC(value sharedNetworkOriginalValue) net.HardwareAddr {
+	return append(net.HardwareAddr(nil), value.SourceMAC[:]...)
 }
 
 func makeSharedNetworkFlowHandle(key sharedNetworkListenerKey, value sharedNetworkOriginalValue) SharedNetworkFlowHandle {

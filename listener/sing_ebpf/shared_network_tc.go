@@ -25,15 +25,16 @@ import (
 const (
 	sharedNetworkFallbackRefresh = 3 * time.Second
 	// Run before Android tethering offload (IPv6 priority 2, IPv4 priority 3).
-	sharedNetworkTCPriority   = 1
-	sharedIngressFilterHandle = 0x5342
-	sharedEgressFilterHandle  = 0x5343
+	defaultSharedNetworkTCPriority = 1
+	sharedIngressFilterHandle      = 0x5342
+	sharedEgressFilterHandle       = 0x5343
 )
 
 type sharedTCManager struct {
 	backend         *ECommon.SharedNetworkBackend
 	interfaces      []string
 	enableIPv4      bool
+	priority        uint16
 	access          sync.Mutex
 	attachments     map[string]*sharedTCAttachment
 	enabled         bool
@@ -54,6 +55,9 @@ type sharedTCAttachment struct {
 }
 
 func (m *sharedTCManager) Start() error {
+	if m.priority == 0 {
+		m.priority = defaultSharedNetworkTCPriority
+	}
 	if err := m.reconcile(); err != nil {
 		return E.Errors(err, m.closeAttachments())
 	}
@@ -148,7 +152,7 @@ func (m *sharedTCManager) reconcile() error {
 		if _, loaded := m.attachments[interfaceName]; loaded {
 			continue
 		}
-		attachment, attachErr := attachSharedTC(link, m.backend, m.enableIPv4)
+		attachment, attachErr := attachSharedTC(link, m.backend, m.enableIPv4, m.priority)
 		if attachErr != nil {
 			return E.Cause(attachErr, "attach eBPF shared-network to ", interfaceName)
 		}

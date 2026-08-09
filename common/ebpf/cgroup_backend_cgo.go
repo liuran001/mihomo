@@ -6,7 +6,7 @@ package ebpf
 #cgo CFLAGS: -I${SRCDIR}/native
 #include <errno.h>
 #include <stdlib.h>
-#include "ebpf.h"
+#include "runtime.h"
 
 static int singbox_ebpf_cgroup_prepare(
 	const char *cgroup_path,
@@ -15,8 +15,9 @@ static int singbox_ebpf_cgroup_prepare(
 	bool enable_bypass_ipv4_cidr,
 	bool enable_bypass_ipv6_cidr,
 	bool auto_ipv6,
-	uint32_t include_uid_entries,
-	uint32_t exclude_uid_entries,
+	uint32_t uid_policy_entries,
+	bool uid_default_bypass,
+	bool exclude_android_dns_tether,
 	uint32_t tcp_redirect_map_capacity,
 	uint32_t udp_redirect_map_capacity,
 	uint32_t socket_bypass_map_capacity,
@@ -29,8 +30,9 @@ static int singbox_ebpf_cgroup_prepare(
 		enable_bypass_ipv4_cidr,
 		enable_bypass_ipv6_cidr,
 		auto_ipv6,
-		include_uid_entries,
-		exclude_uid_entries,
+		uid_policy_entries,
+		uid_default_bypass,
+		exclude_android_dns_tether,
 		tcp_redirect_map_capacity,
 		udp_redirect_map_capacity,
 		socket_bypass_map_capacity,
@@ -41,6 +43,8 @@ static int singbox_ebpf_cgroup_prepare(
 
 static int singbox_ebpf_cgroup_load_programs(
 	struct sb_ebpf_cgroup_runtime *runtime,
+	const uint8_t *object,
+	size_t object_size,
 	uint16_t listen_port,
 	uint32_t self_tgid,
 	bool enable_ipv4,
@@ -54,6 +58,8 @@ static int singbox_ebpf_cgroup_load_programs(
 	int *saved_errno) {
 	int result = sb_ebpf_cgroup_load_programs(
 		runtime,
+		object,
+		object_size,
 		listen_port,
 		self_tgid,
 		enable_ipv4,
@@ -76,6 +82,15 @@ static int singbox_ebpf_cgroup_attach(
 	return result;
 }
 
+static int singbox_ebpf_cgroup_probe_self_tgid(
+	struct sb_ebpf_cgroup_runtime *runtime,
+	uint32_t *self_tgid,
+	int *saved_errno) {
+	int result = sb_ebpf_cgroup_probe_self_tgid(runtime, self_tgid);
+	if (result != 0) *saved_errno = errno;
+	return result;
+}
+
 static int singbox_ebpf_cgroup_close(
 	struct sb_ebpf_cgroup_runtime *runtime,
 	int *saved_errno) {
@@ -88,12 +103,19 @@ static const char *singbox_ebpf_cgroup_error_stage(
 	const struct sb_ebpf_cgroup_runtime *runtime) {
 	return runtime == NULL ? NULL : runtime->error_stage;
 }
+
+static int singbox_ebpf_cgroup_program_fd(
+	const struct sb_ebpf_cgroup_runtime *runtime,
+	enum sb_ebpf_cgroup_program_slot slot) {
+	if (runtime == NULL || slot < 0 || slot >= SB_EBPF_CGROUP_PROGRAM_COUNT) return -1;
+	return runtime->program_fds[slot];
+}
 */
 import "C"
 
 import (
+	_ "embed"
 	"net/netip"
-	"os"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -103,6 +125,9 @@ import (
 
 	"golang.org/x/sys/unix"
 )
+
+//go:embed native/cgroup.bpf.o
+var cgroupObject []byte
 
 type CgroupBackend struct {
 	access               sync.RWMutex
@@ -177,11 +202,7 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 			return nil, err
 		}
 	}
-	includeUIDEntries, err := compileUIDPolicy("include_uid", policy.IncludeUID)
-	if err != nil {
-		return nil, err
-	}
-	excludeUIDEntries, err := compileUIDPolicy("exclude_uid", policy.ExcludeUID)
+	uidPolicyEntries, uidDefaultBypass, err := compileUIDPolicy(policy)
 	if err != nil {
 		return nil, err
 	}
@@ -215,8 +236,9 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		C.bool(policy.EnableBypassCIDR && redirectIPv4.IsValid()),
 		C.bool(policy.EnableBypassCIDR && redirectIPv6.IsValid()),
 		C.bool(config.AutoIPv6),
-		C.uint32_t(len(includeUIDEntries)),
-		C.uint32_t(len(excludeUIDEntries)),
+		C.uint32_t(len(uidPolicyEntries)),
+		C.bool(uidDefaultBypass),
+		C.bool(policy.ExcludeAndroidDNSTether),
 		C.uint32_t(mapCapacity.TCPRedirect),
 		C.uint32_t(mapCapacity.UDPRedirect),
 		C.uint32_t(mapCapacity.SocketBypass),
@@ -257,91 +279,11 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 			return nil, E.Cause(err, "initialize IPv6 availability eBPF map")
 		}
 	}
-	if err = populateUIDPolicyMap(int(runtimeState.include_uid_map_fd), includeUIDEntries); err != nil {
+	if err = populateUIDPolicyMap(int(runtimeState.uid_policy_map_fd), uidPolicyEntries); err != nil {
 		_ = backend.Close()
-		return nil, E.Cause(err, "populate include_uid eBPF map")
-	}
-	if err = populateUIDPolicyMap(int(runtimeState.exclude_uid_map_fd), excludeUIDEntries); err != nil {
-		_ = backend.Close()
-		return nil, E.Cause(err, "populate exclude_uid eBPF map")
+		return nil, E.Cause(err, "populate UID policy eBPF map")
 	}
 	return backend, nil
-}
-
-func raiseMemlockLimit() error {
-	unlimited := unix.Rlimit{
-		Cur: unix.RLIM_INFINITY,
-		Max: unix.RLIM_INFINITY,
-	}
-	unlimitedErr := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &unlimited)
-	if unlimitedErr == nil {
-		return nil
-	}
-
-	var limit unix.Rlimit
-	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &limit); err != nil {
-		return E.Errors(unlimitedErr, E.Cause(err, "read memlock limit"))
-	}
-	if limit.Cur < limit.Max {
-		limit.Cur = limit.Max
-		if err := unix.Setrlimit(unix.RLIMIT_MEMLOCK, &limit); err != nil {
-			return E.Errors(unlimitedErr, E.Cause(err, "raise soft memlock limit"))
-		}
-	}
-	return unlimitedErr
-}
-
-func checkKernelCapabilities(scope string, cgroupPath string) error {
-	if cgroupPath != "" {
-		var fileSystem unix.Statfs_t
-		if err := unix.Statfs(cgroupPath, &fileSystem); err != nil {
-			return E.Cause(err, "check ", scope, " eBPF cgroup2 mount")
-		}
-		if fileSystem.Type != unix.CGROUP2_SUPER_MAGIC {
-			return E.New("eBPF inbound is not supported: ", cgroupPath, " is not a cgroup2 mount")
-		}
-	}
-
-	attribute := mapCreateAttr{
-		MapType:    bpfMapTypeArray,
-		KeySize:    4,
-		ValueSize:  4,
-		MaxEntries: 1,
-	}
-	fd, _, errno := unix.Syscall(
-		unix.SYS_BPF,
-		bpfMapCreate,
-		uintptr(unsafe.Pointer(&attribute)),
-		unsafe.Sizeof(attribute),
-	)
-	if errno != 0 {
-		return eBPFOperationError("probe "+scope+" BPF_MAP_CREATE", errno)
-	}
-	if err := unix.Close(int(fd)); err != nil {
-		return E.Cause(err, "close eBPF capability probe map")
-	}
-	return nil
-}
-
-func eBPFBackendOperationError(operation string, stage string, err error) error {
-	if stage != "" {
-		operation += ": " + stage
-	}
-	return eBPFOperationError(operation, err)
-}
-
-func eBPFOperationError(operation string, err error) error {
-	if errno, isErrno := err.(syscall.Errno); isErrno {
-		switch errno {
-		case unix.EBUSY:
-			return E.Cause(errno, "another eBPF inbound is already active on this cgroup: ", operation)
-		case unix.ENOSYS, unix.EINVAL, unix.EOPNOTSUPP:
-			return E.Cause(errno, "eBPF inbound is not supported by this kernel: ", operation)
-		case unix.EPERM, unix.EACCES:
-			return E.Cause(errno, "eBPF inbound is not permitted on this device: ", operation)
-		}
-	}
-	return E.Cause(err, operation)
 }
 
 func (b *CgroupBackend) CgroupPath() string {
@@ -360,36 +302,22 @@ func (b *CgroupBackend) AttachedPrograms() []string {
 	if b.runtime == nil {
 		return nil
 	}
-	programs := make([]string, 0, 10)
-	if b.runtime.connect4_prog_fd >= 0 {
-		programs = append(programs, "sb_ebpf_conn4 (cgroup/connect4)")
-	}
-	if b.enableUDP && b.runtime.udp4_sendmsg_prog_fd >= 0 {
-		programs = append(programs, "sb_ebpf_udp4 (cgroup/sendmsg4)")
-	}
-	if b.enableUDP && b.runtime.udp4_recvmsg_prog_fd >= 0 {
-		programs = append(programs, "sb_ebpf_urcv4 (cgroup/recvmsg4)")
-	}
-	if b.runtime.connect6_v4mapped_prog_fd >= 0 {
-		programs = append(programs, "sb_ebpf_c6v4m (cgroup/connect6)")
-	}
-	if b.runtime.connect6_prog_fd >= 0 {
-		programs = append(programs, "sb_ebpf_conn6 (cgroup/connect6)")
-	}
-	if b.enableUDP && b.runtime.udp6_v4mapped_sendmsg_prog_fd >= 0 {
-		programs = append(programs, "sb_ebpf_u6v4m (cgroup/sendmsg6)")
-	}
-	if b.enableUDP && b.runtime.udp6_sendmsg_prog_fd >= 0 {
-		programs = append(programs, "sb_ebpf_udp6 (cgroup/sendmsg6)")
-	}
-	if b.enableUDP && b.runtime.udp6_v4mapped_recvmsg_prog_fd >= 0 {
-		programs = append(programs, "sb_ebpf_ur6v4m (cgroup/recvmsg6)")
-	}
-	if b.enableUDP && b.runtime.udp6_recvmsg_prog_fd >= 0 {
-		programs = append(programs, "sb_ebpf_urcv6 (cgroup/recvmsg6)")
-	}
-	if b.enableUDP && b.runtime.socket_release_prog_fd >= 0 {
-		programs = append(programs, "sb_ebpf_rel (cgroup/sock_release)")
+	programs := make([]string, 0, int(C.SB_EBPF_CGROUP_PROGRAM_COUNT))
+	for _, program := range []struct {
+		slot C.enum_sb_ebpf_cgroup_program_slot
+		name string
+	}{
+		{C.SB_EBPF_CGROUP_PROGRAM_CONNECT4, "sb_ebpf_conn4 (cgroup/connect4)"},
+		{C.SB_EBPF_CGROUP_PROGRAM_UDP4_SENDMSG, "sb_ebpf_udp4 (cgroup/sendmsg4)"},
+		{C.SB_EBPF_CGROUP_PROGRAM_UDP4_RECVMSG, "sb_ebpf_urcv4 (cgroup/recvmsg4)"},
+		{C.SB_EBPF_CGROUP_PROGRAM_CONNECT6, "sb_ebpf_conn6 (cgroup/connect6)"},
+		{C.SB_EBPF_CGROUP_PROGRAM_UDP6_SENDMSG, "sb_ebpf_udp6 (cgroup/sendmsg6)"},
+		{C.SB_EBPF_CGROUP_PROGRAM_UDP6_RECVMSG, "sb_ebpf_urcv6 (cgroup/recvmsg6)"},
+		{C.SB_EBPF_CGROUP_PROGRAM_SOCKET_RELEASE, "sb_ebpf_rel (cgroup/sock_release)"},
+	} {
+		if C.singbox_ebpf_cgroup_program_fd(b.runtime, program.slot) >= 0 {
+			programs = append(programs, program.name)
+		}
 	}
 	return programs
 }
@@ -400,11 +328,35 @@ func (b *CgroupBackend) UsesSocketRelease() bool {
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
-	return b.runtime != nil && b.runtime.socket_release_prog_fd >= 0
+	return b.runtime != nil && C.singbox_ebpf_cgroup_program_fd(
+		b.runtime,
+		C.SB_EBPF_CGROUP_PROGRAM_SOCKET_RELEASE,
+	) >= 0
 }
 
 func (b *CgroupBackend) LoadPrograms(listenerPort uint16) error {
-	return b.loadPrograms(listenerPort, uint32(os.Getpid()))
+	selfTGID, err := b.probeSelfTGID()
+	if err != nil {
+		return err
+	}
+	return b.loadPrograms(listenerPort, selfTGID)
+}
+
+func (b *CgroupBackend) probeSelfTGID() (uint32, error) {
+	if b == nil {
+		return 0, errBackendClosed
+	}
+	b.access.Lock()
+	defer b.access.Unlock()
+	if err := b.health.requireUsable(b.runtime != nil); err != nil {
+		return 0, err
+	}
+	var selfTGID C.uint32_t
+	var savedErrno C.int
+	if C.singbox_ebpf_cgroup_probe_self_tgid(b.runtime, &selfTGID, &savedErrno) != 0 {
+		return 0, eBPFOperationError("probe BPF-visible self TGID", syscall.Errno(savedErrno))
+	}
+	return uint32(selfTGID), nil
 }
 
 func (b *CgroupBackend) loadPrograms(listenerPort uint16, selfTGID uint32) error {
@@ -415,6 +367,9 @@ func (b *CgroupBackend) loadPrograms(listenerPort uint16, selfTGID uint32) error
 	defer b.access.Unlock()
 	if err := b.health.requireUsable(b.runtime != nil); err != nil {
 		return err
+	}
+	if len(cgroupObject) == 0 {
+		return E.New("missing embedded cgroup eBPF object")
 	}
 	var redirectIPv4Bytes [4]byte
 	var redirectIPv4Pointer *C.uint8_t
@@ -435,6 +390,8 @@ func (b *CgroupBackend) loadPrograms(listenerPort uint16, selfTGID uint32) error
 	var savedErrno C.int
 	if C.singbox_ebpf_cgroup_load_programs(
 		b.runtime,
+		(*C.uint8_t)(unsafe.Pointer(&cgroupObject[0])),
+		C.size_t(len(cgroupObject)),
 		C.uint16_t(listenerPort),
 		C.uint32_t(selfTGID),
 		C.bool(b.redirectIPv4.IsValid()),

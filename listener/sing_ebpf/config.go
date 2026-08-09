@@ -3,6 +3,7 @@
 package sing_ebpf
 
 import (
+	"net"
 	"net/netip"
 	"path/filepath"
 	"strconv"
@@ -15,12 +16,11 @@ import (
 )
 
 const (
-	androidTetheringDNSUID = 1052
-	dnsModeHijack          = "hijack"
-	dnsModeOff             = "off"
-	cgroupIPv6ModeAlways   = "always"
-	cgroupIPv6ModeAuto     = "auto"
-	cgroupIPv6ModeOff      = "off"
+	dnsModeHijack        = "hijack"
+	dnsModeOff           = "off"
+	cgroupIPv6ModeAlways = "always"
+	cgroupIPv6ModeAuto   = "auto"
+	cgroupIPv6ModeOff    = "off"
 )
 
 var defaultRedirectIPv4Prefix = netip.MustParsePrefix("127.128.0.0/9")
@@ -196,9 +196,49 @@ func normalizeSourceCIDRs(prefixes []netip.Prefix) ([]netip.Prefix, error) {
 	return normalized, nil
 }
 
-func platformExcludedUIDRanges(goos string) []ECommon.UIDRange {
-	if goos != "android" {
-		return nil
+func parseSharedNetworkMACAddresses(name string, addresses []string) ([]ECommon.MACAddress, error) {
+	parsed := make([]ECommon.MACAddress, 0, len(addresses))
+	seen := make(map[ECommon.MACAddress]struct{}, len(addresses))
+	for index, address := range addresses {
+		hardwareAddress, err := net.ParseMAC(address)
+		if err != nil {
+			return nil, E.Cause(err, "parse shared_network.", name, "[", index, "]")
+		}
+		if len(hardwareAddress) != len(ECommon.MACAddress{}) {
+			return nil, E.New("shared_network.", name, "[", index, "] must be a 48-bit MAC address")
+		}
+		var mac ECommon.MACAddress
+		copy(mac[:], hardwareAddress)
+		if _, loaded := seen[mac]; loaded {
+			continue
+		}
+		seen[mac] = struct{}{}
+		parsed = append(parsed, mac)
 	}
-	return []ECommon.UIDRange{{Start: androidTetheringDNSUID, End: androidTetheringDNSUID}}
+	return parsed, nil
+}
+
+func normalizeSharedNetworkMapCapacity(options LC.EBPFSharedNetworkMapCapacity) (ECommon.SharedNetworkMapCapacities, error) {
+	capacity := ECommon.DefaultSharedNetworkMapCapacities()
+	var err error
+	capacity.Proxy, err = normalizeMapCapacityValuePtr("shared_network.map_capacity.proxy", options.Proxy, capacity.Proxy)
+	if err != nil {
+		return ECommon.SharedNetworkMapCapacities{}, err
+	}
+	capacity.Bypass, err = normalizeMapCapacityValuePtr("shared_network.map_capacity.bypass", options.Bypass, capacity.Bypass)
+	if err != nil {
+		return ECommon.SharedNetworkMapCapacities{}, err
+	}
+	capacity.Fragment, err = normalizeMapCapacityValuePtr("shared_network.map_capacity.fragment", options.Fragment, capacity.Fragment)
+	if err != nil {
+		return ECommon.SharedNetworkMapCapacities{}, err
+	}
+	return capacity, nil
+}
+
+func normalizeMapCapacityValuePtr(name string, configured *uint32, defaultValue uint32) (uint32, error) {
+	if configured == nil {
+		return defaultValue, nil
+	}
+	return normalizeMapCapacityValue(name, *configured, defaultValue)
 }

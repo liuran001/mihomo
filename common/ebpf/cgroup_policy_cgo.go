@@ -13,6 +13,12 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var (
+	uidPolicyUpdateBatchSupport  mapBatchSupport
+	bypassCIDRUpdateBatchSupport mapBatchSupport
+	bypassCIDRDeleteBatchSupport mapBatchSupport
+)
+
 func validateCgroupMapCapacity(capacity CgroupMapCapacity) error {
 	for _, entry := range []struct {
 		name  string
@@ -29,30 +35,25 @@ func validateCgroupMapCapacity(capacity CgroupMapCapacity) error {
 	return nil
 }
 
-func compileUIDPolicy(name string, uidRanges []UIDRange) ([]uidLPMKey, error) {
-	for _, uidRange := range uidRanges {
-		if uidRange.Start > uidRange.End {
-			return nil, E.New("invalid ", name, " range: ", uidRange.Start, ":", uidRange.End)
-		}
-	}
-	entries := compileUIDRanges(uidRanges)
-	if len(entries) > maxUIDPolicyEntries {
-		return nil, E.New(name, " compiles to too many eBPF map entries: ", len(entries), " > ", maxUIDPolicyEntries)
-	}
-	return entries, nil
-}
-
 func populateUIDPolicyMap(mapFD int, entries []uidLPMKey) error {
 	if len(entries) == 0 {
 		return nil
 	}
-	value := uint8(1)
-	for entryIndex := range entries {
-		if err := updateMap(mapFD, unsafe.Pointer(&entries[entryIndex]), unsafe.Pointer(&value)); err != nil {
-			return err
-		}
+	values := make([]uint8, len(entries))
+	for index := range values {
+		values[index] = 1
 	}
-	return nil
+	_, err := updateMapBatch(
+		mapFD,
+		unsafe.Pointer(&entries[0]),
+		unsafe.Pointer(&values[0]),
+		uint32(len(entries)),
+		unsafe.Sizeof(entries[0]),
+		unsafe.Sizeof(values[0]),
+		0,
+		&uidPolicyUpdateBatchSupport,
+	)
+	return err
 }
 
 func (b *CgroupBackend) UpdateBypassCIDR(prefixes []netip.Prefix) (bool, error) {
@@ -166,28 +167,118 @@ func replaceBypassCIDRPolicyMap(
 	}
 	value := uint8(1)
 	added := make([]netip.Prefix, 0, len(additions))
-	for _, prefix := range additions {
-		err := updateBypassCIDRMapEntry(mapFD, prefix, &value, bpfNoExist)
-		if errors.Is(err, unix.EEXIST) {
-			continue
-		}
-		if err != nil {
+	processed, err := updateBypassCIDRMapEntries(mapFD, additions, bpfNoExist)
+	if processed > uint32(len(additions)) {
+		return E.New("invalid eBPF batch update count: ", processed)
+	}
+	added = append(added, additions[:processed]...)
+	if err != nil {
+		if !errors.Is(err, unix.EEXIST) {
 			return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapFD, added, nil))
 		}
-		added = append(added, prefix)
+		for _, prefix := range additions[processed:] {
+			err = updateBypassCIDRMapEntry(mapFD, prefix, &value, bpfNoExist)
+			if errors.Is(err, unix.EEXIST) {
+				continue
+			}
+			if err != nil {
+				return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapFD, added, nil))
+			}
+			added = append(added, prefix)
+		}
 	}
 	removed := make([]netip.Prefix, 0, len(removals))
-	for _, prefix := range removals {
-		err := deleteBypassCIDRMapEntry(mapFD, prefix)
-		if errors.Is(err, unix.ENOENT) {
-			continue
-		}
-		if err != nil {
+	processed, err = deleteBypassCIDRMapEntries(mapFD, removals)
+	if processed > uint32(len(removals)) {
+		return E.New("invalid eBPF batch delete count: ", processed)
+	}
+	removed = append(removed, removals[:processed]...)
+	if err != nil {
+		if !errors.Is(err, unix.ENOENT) {
 			return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapFD, added, removed))
 		}
-		removed = append(removed, prefix)
+		for _, prefix := range removals[processed:] {
+			err = deleteBypassCIDRMapEntry(mapFD, prefix)
+			if errors.Is(err, unix.ENOENT) {
+				continue
+			}
+			if err != nil {
+				return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapFD, added, removed))
+			}
+			removed = append(removed, prefix)
+		}
 	}
 	return nil
+}
+
+func updateBypassCIDRMapEntries(mapFD int, prefixes []netip.Prefix, flags uint64) (uint32, error) {
+	if len(prefixes) == 0 {
+		return 0, nil
+	}
+	values := make([]uint8, len(prefixes))
+	for index := range values {
+		values[index] = 1
+	}
+	if prefixes[0].Addr().Is4() {
+		keys := make([]ipv4CIDRLPMKey, len(prefixes))
+		for index, prefix := range prefixes {
+			keys[index] = ipv4CIDRLPMKey{PrefixLength: uint32(prefix.Bits()), Address: prefix.Addr().As4()}
+		}
+		return updateMapBatch(
+			mapFD,
+			unsafe.Pointer(&keys[0]),
+			unsafe.Pointer(&values[0]),
+			uint32(len(keys)),
+			unsafe.Sizeof(keys[0]),
+			unsafe.Sizeof(values[0]),
+			flags,
+			&bypassCIDRUpdateBatchSupport,
+		)
+	}
+	keys := make([]ipv6CIDRLPMKey, len(prefixes))
+	for index, prefix := range prefixes {
+		keys[index] = ipv6CIDRLPMKey{PrefixLength: uint32(prefix.Bits()), Address: prefix.Addr().As16()}
+	}
+	return updateMapBatch(
+		mapFD,
+		unsafe.Pointer(&keys[0]),
+		unsafe.Pointer(&values[0]),
+		uint32(len(keys)),
+		unsafe.Sizeof(keys[0]),
+		unsafe.Sizeof(values[0]),
+		flags,
+		&bypassCIDRUpdateBatchSupport,
+	)
+}
+
+func deleteBypassCIDRMapEntries(mapFD int, prefixes []netip.Prefix) (uint32, error) {
+	if len(prefixes) == 0 {
+		return 0, nil
+	}
+	if prefixes[0].Addr().Is4() {
+		keys := make([]ipv4CIDRLPMKey, len(prefixes))
+		for index, prefix := range prefixes {
+			keys[index] = ipv4CIDRLPMKey{PrefixLength: uint32(prefix.Bits()), Address: prefix.Addr().As4()}
+		}
+		return deleteMapBatch(
+			mapFD,
+			unsafe.Pointer(&keys[0]),
+			uint32(len(keys)),
+			unsafe.Sizeof(keys[0]),
+			&bypassCIDRDeleteBatchSupport,
+		)
+	}
+	keys := make([]ipv6CIDRLPMKey, len(prefixes))
+	for index, prefix := range prefixes {
+		keys[index] = ipv6CIDRLPMKey{PrefixLength: uint32(prefix.Bits()), Address: prefix.Addr().As16()}
+	}
+	return deleteMapBatch(
+		mapFD,
+		unsafe.Pointer(&keys[0]),
+		uint32(len(keys)),
+		unsafe.Sizeof(keys[0]),
+		&bypassCIDRDeleteBatchSupport,
+	)
 }
 
 func rollbackBypassCIDRPolicyMap(mapFD int, added []netip.Prefix, removed []netip.Prefix) error {

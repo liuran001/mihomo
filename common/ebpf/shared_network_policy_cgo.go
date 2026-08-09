@@ -5,11 +5,13 @@ package ebpf
 import (
 	"net/netip"
 	"slices"
+	"unsafe"
 
 	E "github.com/metacubex/sing/common/exceptions"
 )
 
 const maxSharedSourceCIDRPolicyEntries = 4096
+const maxSharedSourceMACPolicyEntries = 1024
 
 func (b *SharedNetworkBackend) initializeSourceCIDRPolicy(include, exclude []netip.Prefix) error {
 	includeIPv4, includeIPv6, err := compileBypassCIDRPolicy(include)
@@ -54,6 +56,41 @@ func (b *SharedNetworkBackend) initializeSourceCIDRPolicy(include, exclude []net
 	b.excludeSourceIPv4 = excludeIPv4
 	b.excludeSourceIPv6 = excludeIPv6
 	return b.updatePolicyFlagsLocked()
+}
+
+func (b *SharedNetworkBackend) initializeSourceMACPolicy(include, exclude []MACAddress) error {
+	if len(include) > maxSharedSourceMACPolicyEntries || len(exclude) > maxSharedSourceMACPolicyEntries {
+		return E.New("shared-network source MAC policy exceeds eBPF map capacity")
+	}
+	if b == nil || b.runtime == nil {
+		return errBackendClosed
+	}
+	if err := populateSharedNetworkMACPolicy(
+		int(b.runtime.include_source_mac_map_fd),
+		include,
+	); err != nil {
+		return E.Cause(err, "populate shared-network include source MAC policy")
+	}
+	if err := populateSharedNetworkMACPolicy(
+		int(b.runtime.exclude_source_mac_map_fd),
+		exclude,
+	); err != nil {
+		return E.Cause(err, "populate shared-network exclude source MAC policy")
+	}
+	b.includeSourceMAC = slices.Clone(include)
+	b.excludeSourceMAC = slices.Clone(exclude)
+	return b.updatePolicyFlagsLocked()
+}
+
+func populateSharedNetworkMACPolicy(mapFD int, addresses []MACAddress) error {
+	value := uint8(1)
+	for _, address := range addresses {
+		key := sharedNetworkMACKey{Address: address}
+		if err := updateMap(mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func (b *SharedNetworkBackend) UpdateBypassCIDR(prefixes []netip.Prefix) (bool, error) {
@@ -230,7 +267,11 @@ func rollbackSharedNetworkPolicyMaps(
 }
 
 func (b *SharedNetworkBackend) updatePolicyFlagsLocked() error {
+	// Keep cache lookups enabled after policy removal so existing bypass flows
+	// retain their decision until the normal TCP/UDP cache lifetime ends.
+	bypassFlowCacheFlag := b.control.Flags & sharedNetworkFlagBypassFlowCache
 	b.control.Flags &^= sharedNetworkPolicyFlags
+	b.control.Flags |= bypassFlowCacheFlag
 	if len(b.hostIPv4) != 0 {
 		b.control.Flags |= sharedNetworkFlagHostIPv4
 	}
@@ -248,6 +289,15 @@ func (b *SharedNetworkBackend) updatePolicyFlagsLocked() error {
 	}
 	if len(b.excludeSourceIPv4) != 0 || len(b.excludeSourceIPv6) != 0 {
 		b.control.Flags |= sharedNetworkFlagExcludeSource
+	}
+	if len(b.includeSourceMAC) != 0 {
+		b.control.Flags |= sharedNetworkFlagIncludeSourceMAC
+	}
+	if len(b.excludeSourceMAC) != 0 {
+		b.control.Flags |= sharedNetworkFlagExcludeSourceMAC
+	}
+	if sharedNetworkBypassFlowCacheRequired(b.control.Flags) {
+		b.control.Flags |= sharedNetworkFlagBypassFlowCache
 	}
 	return b.updateControl()
 }

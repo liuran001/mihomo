@@ -6,14 +6,16 @@ package ebpf
 #cgo CFLAGS: -I${SRCDIR}/native
 #include <errno.h>
 #include <stdlib.h>
-#include "ebpf.h"
+#include "runtime.h"
 
 static int singbox_ebpf_shared_network_prepare(
 	const uint8_t *object,
 	size_t object_size,
 	int bypass_ipv4_map_fd,
 	int bypass_ipv6_map_fd,
-	uint32_t map_capacity,
+	uint32_t proxy_capacity,
+	uint32_t bypass_capacity,
+	uint32_t fragment_capacity,
 	struct sb_ebpf_shared_network_runtime *runtime,
 	int *saved_errno) {
 	int result = sb_ebpf_shared_network_prepare(
@@ -21,7 +23,9 @@ static int singbox_ebpf_shared_network_prepare(
 		object_size,
 		bypass_ipv4_map_fd,
 		bypass_ipv6_map_fd,
-		map_capacity,
+		proxy_capacity,
+		bypass_capacity,
+		fragment_capacity,
 		runtime);
 	if (result != 0) *saved_errno = errno;
 	return result;
@@ -72,13 +76,21 @@ type SharedNetworkBackend struct {
 	includeSourceIPv6 []netip.Prefix
 	excludeSourceIPv4 []netip.Prefix
 	excludeSourceIPv6 []netip.Prefix
+	includeSourceMAC  []MACAddress
+	excludeSourceMAC  []MACAddress
 }
 
 func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConfig) (*SharedNetworkBackend, error) {
 	redirectIPv4 := config.RedirectIPv4
 	redirectIPv6 := config.RedirectIPv6
-	if err := validateMapCapacity("shared-network", config.MapCapacity); err != nil {
-		return nil, err
+	for name, capacity := range map[string]uint32{
+		"shared-network proxy":    config.MapCapacity.Proxy,
+		"shared-network bypass":   config.MapCapacity.Bypass,
+		"shared-network fragment": config.MapCapacity.Fragment,
+	} {
+		if err := validateMapCapacity(name, capacity); err != nil {
+			return nil, err
+		}
 	}
 	if config.ListenerPort == 0 {
 		return nil, E.New("missing shared-network listener port")
@@ -138,7 +150,9 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		C.size_t(len(sharedNetworkObject)),
 		C.int(bypassIPv4MapFD),
 		C.int(bypassIPv6MapFD),
-		C.uint32_t(config.MapCapacity),
+		C.uint32_t(config.MapCapacity.Proxy),
+		C.uint32_t(config.MapCapacity.Bypass),
+		C.uint32_t(config.MapCapacity.Fragment),
 		runtimeState,
 		&savedErrno,
 	)
@@ -181,6 +195,9 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 	if config.HijackDNS {
 		backend.control.Flags |= sharedNetworkFlagDNSHijack
 	}
+	if config.BypassPrivateAddress {
+		backend.control.Flags |= sharedNetworkFlagBypassPrivateAddress
+	}
 	if redirectIPv4.IsValid() {
 		backend.control.Flags |= sharedNetworkFlagIPv4
 		backend.control.TokenIPv4Prefix = redirectIPv4.Addr().As4()
@@ -192,6 +209,10 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		backend.control.TokenIPv6PrefixBits = uint8(redirectIPv6.Bits())
 	}
 	if err = backend.initializeSourceCIDRPolicy(config.IncludeSourceCIDR, config.ExcludeSourceCIDR); err != nil {
+		_ = backend.Close()
+		return nil, err
+	}
+	if err = backend.initializeSourceMACPolicy(config.IncludeSourceMAC, config.ExcludeSourceMAC); err != nil {
 		_ = backend.Close()
 		return nil, err
 	}
@@ -320,6 +341,8 @@ func (b *SharedNetworkBackend) Close() error {
 		b.includeSourceIPv6 = nil
 		b.excludeSourceIPv4 = nil
 		b.excludeSourceIPv6 = nil
+		b.includeSourceMAC = nil
+		b.excludeSourceMAC = nil
 		for reference := range b.flowReferences {
 			delete(b.flowReferences, reference)
 		}

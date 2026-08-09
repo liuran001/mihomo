@@ -1,296 +1,72 @@
-// Copyright 2026, Asterisk4Magisk contributors
 // Copyright 2026, sing-box contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-#include "ebpf.h"
+#include "runtime.h"
 
-#include <elf.h>
 #include <errno.h>
-#include <linux/bpf.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+#include <stddef.h>
 
-#ifndef R_BPF_64_64
-#define R_BPF_64_64 1U
-#endif
-#ifndef R_BPF_64_32
-#define R_BPF_64_32 10U
-#endif
+struct shared_network_map_context {
+    int control_map_fd;
+    int original_to_token_map_fd;
+    int bypass_flow_map_fd;
+    int reply_map_fd;
+    int listener_map_fd;
+    int fragment_map_fd;
+    int host_ipv4_map_fd;
+    int host_ipv6_map_fd;
+    int include_source_ipv4_map_fd;
+    int include_source_ipv6_map_fd;
+    int exclude_source_ipv4_map_fd;
+    int exclude_source_ipv6_map_fd;
+    int include_source_mac_map_fd;
+    int exclude_source_mac_map_fd;
+    int bypass_ipv4_map_fd;
+    int bypass_ipv6_map_fd;
+    int scratch_map_fd;
+};
 
-static bool shared_network_object_range_valid(size_t offset, size_t size, size_t total) {
-    return offset <= total && size <= total - offset;
+static int shared_network_object_map_fd(const char *name, void *context) {
+    static const struct sb_ebpf_map_binding bindings[] = {
+#define MAP_BINDING(NAME, FIELD) {NAME, offsetof(struct shared_network_map_context, FIELD)}
+        MAP_BINDING("shared_control", control_map_fd),
+        MAP_BINDING("shared_original_to_token", original_to_token_map_fd),
+        MAP_BINDING("shared_bypass_flow", bypass_flow_map_fd),
+        MAP_BINDING("shared_reply", reply_map_fd),
+        MAP_BINDING("shared_listener", listener_map_fd),
+        MAP_BINDING("shared_fragment", fragment_map_fd),
+        MAP_BINDING("shared_host_ipv4", host_ipv4_map_fd),
+        MAP_BINDING("shared_host_ipv6", host_ipv6_map_fd),
+        MAP_BINDING("shared_include_source_ipv4", include_source_ipv4_map_fd),
+        MAP_BINDING("shared_include_source_ipv6", include_source_ipv6_map_fd),
+        MAP_BINDING("shared_exclude_source_ipv4", exclude_source_ipv4_map_fd),
+        MAP_BINDING("shared_exclude_source_ipv6", exclude_source_ipv6_map_fd),
+        MAP_BINDING("shared_include_source_mac", include_source_mac_map_fd),
+        MAP_BINDING("shared_exclude_source_mac", exclude_source_mac_map_fd),
+        MAP_BINDING("shared_bypass_ipv4", bypass_ipv4_map_fd),
+        MAP_BINDING("shared_bypass_ipv6", bypass_ipv6_map_fd),
+        MAP_BINDING("shared_scratch", scratch_map_fd),
+#undef MAP_BINDING
+    };
+    return sb_ebpf_resolve_map_fd(
+        name,
+        context,
+        bindings,
+        sizeof(bindings) / sizeof(bindings[0]));
 }
 
-static const Elf64_Shdr *shared_network_object_section(
-    const Elf64_Ehdr *header,
-    size_t object_size,
-    size_t index) {
-    if (index >= header->e_shnum ||
-        header->e_shentsize != sizeof(Elf64_Shdr) ||
-        !shared_network_object_range_valid(
-            header->e_shoff,
-            (size_t)header->e_shnum * sizeof(Elf64_Shdr),
-            object_size)) {
-        return NULL;
-    }
-    return (const Elf64_Shdr *)(
-        (const uint8_t *)header + header->e_shoff + index * sizeof(Elf64_Shdr));
-}
+struct shared_network_program_definition {
+    const char *section;
+    const char *name;
+    size_t fd_offset;
+};
 
-static const char *shared_network_object_section_name(
-    const Elf64_Ehdr *header,
-    size_t object_size,
-    const Elf64_Shdr *section) {
-    const Elf64_Shdr *strings = shared_network_object_section(header, object_size, header->e_shstrndx);
-    if (strings == NULL || strings->sh_type != SHT_STRTAB ||
-        !shared_network_object_range_valid(strings->sh_offset, strings->sh_size, object_size) ||
-        section->sh_name >= strings->sh_size) {
-        return NULL;
-    }
-    return (const char *)header + strings->sh_offset + section->sh_name;
-}
-
-static const Elf64_Shdr *shared_network_object_find_section(
-    const Elf64_Ehdr *header,
-    size_t object_size,
-    const char *name,
-    size_t *index_out) {
-    for (size_t index = 0U; index < header->e_shnum; ++index) {
-        const Elf64_Shdr *section = shared_network_object_section(header, object_size, index);
-        const char *current = section == NULL
-            ? NULL
-            : shared_network_object_section_name(header, object_size, section);
-        if (current != NULL && strcmp(current, name) == 0) {
-            if (index_out != NULL) *index_out = index;
-            return section;
-        }
-    }
-    errno = ENOENT;
-    return NULL;
-}
-
-static int shared_network_object_map_fd(
-    const char *name,
-    int bypass_ipv4_map_fd,
-    int bypass_ipv6_map_fd,
-    const struct sb_ebpf_shared_network_runtime *runtime) {
-    if (strcmp(name, "shared_control") == 0) return runtime->control_map_fd;
-    if (strcmp(name, "shared_original_to_token") == 0) return runtime->original_to_token_map_fd;
-    if (strcmp(name, "shared_bypass_flow") == 0) return runtime->bypass_flow_map_fd;
-    if (strcmp(name, "shared_reply") == 0) return runtime->reply_map_fd;
-    if (strcmp(name, "shared_listener") == 0) return runtime->listener_map_fd;
-    if (strcmp(name, "shared_host_ipv4") == 0) return runtime->host_ipv4_map_fd;
-    if (strcmp(name, "shared_host_ipv6") == 0) return runtime->host_ipv6_map_fd;
-    if (strcmp(name, "shared_include_source_ipv4") == 0) return runtime->include_source_ipv4_map_fd;
-    if (strcmp(name, "shared_include_source_ipv6") == 0) return runtime->include_source_ipv6_map_fd;
-    if (strcmp(name, "shared_exclude_source_ipv4") == 0) return runtime->exclude_source_ipv4_map_fd;
-    if (strcmp(name, "shared_exclude_source_ipv6") == 0) return runtime->exclude_source_ipv6_map_fd;
-    if (strcmp(name, "shared_bypass_ipv4") == 0) return bypass_ipv4_map_fd;
-    if (strcmp(name, "shared_bypass_ipv6") == 0) return bypass_ipv6_map_fd;
-    if (strcmp(name, "shared_scratch") == 0) return runtime->scratch_map_fd;
-    errno = ENOENT;
-    return -1;
-}
-
-static int shared_network_object_relocate_section(
-    const Elf64_Ehdr *header,
-    size_t object_size,
-    size_t source_section_index,
-    size_t source_base,
-    size_t text_section_index,
-    size_t text_base,
-    struct bpf_insn *instructions,
-    size_t instruction_count,
-    int bypass_ipv4_map_fd,
-    int bypass_ipv6_map_fd,
-    const struct sb_ebpf_shared_network_runtime *runtime) {
-    for (size_t index = 0U; index < header->e_shnum; ++index) {
-        const Elf64_Shdr *relocations = shared_network_object_section(header, object_size, index);
-        if (relocations == NULL || relocations->sh_type != SHT_REL ||
-            relocations->sh_info != source_section_index) {
-            continue;
-        }
-        const Elf64_Shdr *symbols = shared_network_object_section(header, object_size, relocations->sh_link);
-        if (symbols == NULL || symbols->sh_type != SHT_SYMTAB ||
-            symbols->sh_entsize != sizeof(Elf64_Sym) ||
-            !shared_network_object_range_valid(symbols->sh_offset, symbols->sh_size, object_size)) {
-            errno = ENOEXEC;
-            return -1;
-        }
-        const Elf64_Shdr *strings = shared_network_object_section(header, object_size, symbols->sh_link);
-        if (strings == NULL || strings->sh_type != SHT_STRTAB ||
-            !shared_network_object_range_valid(strings->sh_offset, strings->sh_size, object_size) ||
-            relocations->sh_entsize != sizeof(Elf64_Rel) ||
-            !shared_network_object_range_valid(relocations->sh_offset, relocations->sh_size, object_size)) {
-            errno = ENOEXEC;
-            return -1;
-        }
-        const Elf64_Rel *entries = (const Elf64_Rel *)(
-            (const uint8_t *)header + relocations->sh_offset);
-        size_t relocation_count = relocations->sh_size / sizeof(Elf64_Rel);
-        const Elf64_Sym *symbol_table = (const Elf64_Sym *)(
-            (const uint8_t *)header + symbols->sh_offset);
-        size_t symbol_count = symbols->sh_size / sizeof(Elf64_Sym);
-        const char *string_table = (const char *)header + strings->sh_offset;
-        for (size_t relocation_index = 0U;
-             relocation_index < relocation_count;
-             ++relocation_index) {
-            const Elf64_Rel *relocation = &entries[relocation_index];
-            size_t symbol_index = ELF64_R_SYM(relocation->r_info);
-            if (symbol_index >= symbol_count ||
-                relocation->r_offset % sizeof(struct bpf_insn) != 0U) {
-                errno = ENOEXEC;
-                return -1;
-            }
-            size_t instruction_index = source_base + relocation->r_offset / sizeof(struct bpf_insn);
-            const Elf64_Sym *symbol = &symbol_table[symbol_index];
-            if (instruction_index >= instruction_count || symbol->st_name >= strings->sh_size) {
-                errno = ENOEXEC;
-                return -1;
-            }
-            uint32_t relocation_type = ELF64_R_TYPE(relocation->r_info);
-            if (relocation_type == R_BPF_64_64) {
-                if (instruction_index + 1U >= instruction_count) {
-                    errno = ENOEXEC;
-                    return -1;
-                }
-                int map_fd = shared_network_object_map_fd(
-                    string_table + symbol->st_name,
-                    bypass_ipv4_map_fd,
-                    bypass_ipv6_map_fd,
-                    runtime);
-                if (map_fd < 0) return -1;
-                instructions[instruction_index].src_reg = BPF_PSEUDO_MAP_FD;
-                instructions[instruction_index].imm = map_fd;
-                instructions[instruction_index + 1U].imm = 0;
-            } else if (relocation_type == R_BPF_64_32) {
-                size_t target_base;
-                if (symbol->st_shndx == text_section_index) {
-                    target_base = text_base;
-                } else if (symbol->st_shndx == source_section_index) {
-                    target_base = source_base;
-                } else {
-                    errno = ENOEXEC;
-                    return -1;
-                }
-                if (symbol->st_value % sizeof(struct bpf_insn) != 0U) {
-                    errno = ENOEXEC;
-                    return -1;
-                }
-                size_t target_index = target_base + symbol->st_value / sizeof(struct bpf_insn);
-                if (target_index >= instruction_count) {
-                    errno = ENOEXEC;
-                    return -1;
-                }
-                instructions[instruction_index].imm =
-                    (int32_t)(target_index - instruction_index - 1U);
-            } else {
-                errno = ENOEXEC;
-                return -1;
-            }
-        }
-    }
-    return 0;
-}
-
-static int shared_network_object_load_section(
-    const Elf64_Ehdr *header,
-    size_t object_size,
-    const char *section_name,
-    const struct sb_ebpf_program_descriptor *program,
-    int bypass_ipv4_map_fd,
-    int bypass_ipv6_map_fd,
-    const struct sb_ebpf_shared_network_runtime *runtime) {
-    size_t section_index = 0U;
-    size_t text_section_index = 0U;
-    const Elf64_Shdr *section = shared_network_object_find_section(
-        header,
-        object_size,
-        section_name,
-        &section_index);
-    const Elf64_Shdr *text_section = shared_network_object_find_section(
-        header,
-        object_size,
-        ".text",
-        &text_section_index);
-    if (section == NULL || text_section == NULL || section->sh_size == 0U ||
-        text_section->sh_size == 0U ||
-        section->sh_size % sizeof(struct bpf_insn) != 0U ||
-        text_section->sh_size % sizeof(struct bpf_insn) != 0U ||
-        !shared_network_object_range_valid(section->sh_offset, section->sh_size, object_size) ||
-        !shared_network_object_range_valid(text_section->sh_offset, text_section->sh_size, object_size)) {
-        fprintf(
-            stderr,
-            "%s section validation failed: section=%p text=%p object_size=%zu errno=%d\n",
-            section_name,
-            (const void *)section,
-            (const void *)text_section,
-            object_size,
-            errno);
-        errno = ENOEXEC;
-        return -1;
-    }
-    size_t combined_size = section->sh_size + text_section->sh_size;
-    struct bpf_insn *instructions = malloc(combined_size);
-    if (instructions == NULL) return -1;
-    memcpy(instructions, (const uint8_t *)header + section->sh_offset, section->sh_size);
-    memcpy(
-        (uint8_t *)instructions + section->sh_size,
-        (const uint8_t *)header + text_section->sh_offset,
-        text_section->sh_size);
-    size_t entry_instruction_count = section->sh_size / sizeof(struct bpf_insn);
-    size_t instruction_count = combined_size / sizeof(struct bpf_insn);
-    int result = -1;
-    int entry_relocation = shared_network_object_relocate_section(
-            header,
-            object_size,
-            section_index,
-            0U,
-            text_section_index,
-            entry_instruction_count,
-            instructions,
-            instruction_count,
-            bypass_ipv4_map_fd,
-            bypass_ipv6_map_fd,
-            runtime);
-    int text_relocation = entry_relocation == 0
-        ? shared_network_object_relocate_section(
-            header,
-            object_size,
-            text_section_index,
-            entry_instruction_count,
-            text_section_index,
-            entry_instruction_count,
-            instructions,
-            instruction_count,
-            bypass_ipv4_map_fd,
-            bypass_ipv6_map_fd,
-            runtime)
-        : -1;
-    if (entry_relocation == 0 && text_relocation == 0) {
-        result = sb_ebpf_load_prog(
-            instructions,
-            instruction_count,
-            program->name,
-            program->type,
-            program->attach_type,
-            true);
-    } else {
-        fprintf(
-            stderr,
-            "%s relocation failed: entry=%d text=%d errno=%d\n",
-            section_name,
-            entry_relocation,
-            text_relocation,
-            errno);
-    }
-    int saved_errno = errno;
-    free(instructions);
-    errno = saved_errno;
-    return result;
-}
+static const struct shared_network_program_definition shared_network_programs[] = {
+    {"classifier/ingress", "sb_share_in",
+     offsetof(struct sb_ebpf_shared_network_runtime, ingress_prog_fd)},
+    {"classifier/egress", "sb_share_out",
+     offsetof(struct sb_ebpf_shared_network_runtime, egress_prog_fd)},
+};
 
 int sb_ebpf_load_shared_network_programs(
     const uint8_t *object,
@@ -298,48 +74,52 @@ int sb_ebpf_load_shared_network_programs(
     int bypass_ipv4_map_fd,
     int bypass_ipv6_map_fd,
     struct sb_ebpf_shared_network_runtime *runtime) {
-    if (object == NULL || runtime == NULL ||
-        object_size < sizeof(Elf64_Ehdr) ||
+    if (object == NULL || object_size == 0U || runtime == NULL ||
         bypass_ipv4_map_fd < 0 || bypass_ipv6_map_fd < 0) {
         errno = EINVAL;
         return -1;
     }
-    const Elf64_Ehdr *header = (const Elf64_Ehdr *)object;
-    if (memcmp(header->e_ident, ELFMAG, SELFMAG) != 0 ||
-        header->e_ident[EI_CLASS] != ELFCLASS64 ||
-        header->e_ident[EI_DATA] != ELFDATA2LSB ||
-        header->e_machine != EM_BPF) {
-        fprintf(
-            stderr,
-            "shared-network BPF object validation failed: size=%zu class=%u data=%u machine=%u\n",
-            object_size,
-            header->e_ident[EI_CLASS],
-            header->e_ident[EI_DATA],
-            header->e_machine);
-        errno = ENOEXEC;
-        return -1;
-    }
-    struct shared_network_program_spec {
-        const char *section;
-        struct sb_ebpf_program_descriptor program;
-    } programs[] = {
-        {"classifier/ingress", {"sb_share_in", BPF_PROG_TYPE_SCHED_CLS,
-         (enum bpf_attach_type)0, &runtime->ingress_prog_fd}},
-        {"classifier/egress", {"sb_share_out", BPF_PROG_TYPE_SCHED_CLS,
-         (enum bpf_attach_type)0, &runtime->egress_prog_fd}},
+    struct shared_network_map_context map_context = {
+        .control_map_fd = runtime->control_map_fd,
+        .original_to_token_map_fd = runtime->original_to_token_map_fd,
+        .bypass_flow_map_fd = runtime->bypass_flow_map_fd,
+        .reply_map_fd = runtime->reply_map_fd,
+        .listener_map_fd = runtime->listener_map_fd,
+        .fragment_map_fd = runtime->fragment_map_fd,
+        .host_ipv4_map_fd = runtime->host_ipv4_map_fd,
+        .host_ipv6_map_fd = runtime->host_ipv6_map_fd,
+        .include_source_ipv4_map_fd = runtime->include_source_ipv4_map_fd,
+        .include_source_ipv6_map_fd = runtime->include_source_ipv6_map_fd,
+        .exclude_source_ipv4_map_fd = runtime->exclude_source_ipv4_map_fd,
+        .exclude_source_ipv6_map_fd = runtime->exclude_source_ipv6_map_fd,
+        .include_source_mac_map_fd = runtime->include_source_mac_map_fd,
+        .exclude_source_mac_map_fd = runtime->exclude_source_mac_map_fd,
+        .bypass_ipv4_map_fd = bypass_ipv4_map_fd,
+        .bypass_ipv6_map_fd = bypass_ipv6_map_fd,
+        .scratch_map_fd = runtime->scratch_map_fd,
     };
-    for (size_t index = 0U; index < sizeof(programs) / sizeof(programs[0]); ++index) {
-        struct shared_network_program_spec *spec = &programs[index];
-        *spec->program.fd = shared_network_object_load_section(
-            header,
+    for (size_t index = 0U;
+         index < sizeof(shared_network_programs) / sizeof(shared_network_programs[0]);
+         ++index) {
+        const struct shared_network_program_definition *definition =
+            &shared_network_programs[index];
+        int *program_fd = (int *)((uint8_t *)runtime + definition->fd_offset);
+        const struct sb_ebpf_program_descriptor program = {
+            definition->name,
+            BPF_PROG_TYPE_SCHED_CLS,
+            (enum bpf_attach_type)0,
+            program_fd,
+        };
+        *program_fd = sb_ebpf_load_object_program(
+            object,
             object_size,
-            spec->section,
-            &spec->program,
-            bypass_ipv4_map_fd,
-            bypass_ipv6_map_fd,
-            runtime);
-        if (*spec->program.fd < 0) {
-            sb_ebpf_set_error_stage(runtime->error_stage, spec->program.name);
+            definition->section,
+            &program,
+            shared_network_object_map_fd,
+            &map_context,
+            true);
+        if (*program_fd < 0) {
+            sb_ebpf_set_error_stage(runtime->error_stage, definition->name);
             return -1;
         }
     }

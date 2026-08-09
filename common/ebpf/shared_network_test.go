@@ -19,17 +19,47 @@ func TestSharedNetworkABI(t *testing.T) {
 	if size := unsafe.Sizeof(sharedNetworkOriginalKey{}); size != 44 {
 		t.Fatalf("unexpected shared-network original key size: %d", size)
 	}
+	if size := unsafe.Sizeof(sharedNetworkMACKey{}); size != 8 {
+		t.Fatalf("unexpected shared-network MAC key size: %d", size)
+	}
 	if size := unsafe.Sizeof(sharedNetworkReplyKey{}); size != 44 {
 		t.Fatalf("unexpected shared-network reply key size: %d", size)
 	}
-	if size := unsafe.Sizeof(sharedNetworkOriginalValue{}); size != 28 {
+	if size := unsafe.Sizeof(sharedNetworkOriginalValue{}); size != 36 {
 		t.Fatalf("unexpected shared-network original value size: %d", size)
 	}
 	if sharedNetworkFlagDNSHijack != 1<<4 {
 		t.Fatalf("unexpected shared-network DNS flag: %#x", sharedNetworkFlagDNSHijack)
 	}
-	if sharedNetworkPolicyFlags != 0x7e0 {
+	if sharedNetworkFlagBypassPrivateAddress != 1<<13 {
+		t.Fatalf("unexpected shared-network private-address flag: %#x", sharedNetworkFlagBypassPrivateAddress)
+	}
+	if sharedNetworkFlagBypassFlowCache != 1<<14 {
+		t.Fatalf("unexpected shared-network bypass-flow-cache flag: %#x", sharedNetworkFlagBypassFlowCache)
+	}
+	if sharedNetworkPolicyFlags != 0x5fe0 {
 		t.Fatalf("unexpected shared-network policy flags: %#x", sharedNetworkPolicyFlags)
+	}
+}
+
+func TestSharedNetworkBypassFlowCacheRequired(t *testing.T) {
+	if sharedNetworkBypassFlowCacheRequired(0) {
+		t.Fatal("empty policy unexpectedly requires bypass-flow cache lookups")
+	}
+	if sharedNetworkBypassFlowCacheRequired(sharedNetworkFlagHostIPv4) {
+		t.Fatal("host-only policy unexpectedly requires bypass-flow cache lookups")
+	}
+	for _, flags := range []uint32{
+		sharedNetworkFlagBypassIPv4,
+		sharedNetworkFlagBypassIPv6,
+		sharedNetworkFlagIncludeSource,
+		sharedNetworkFlagExcludeSource,
+		sharedNetworkFlagIncludeSourceMAC,
+		sharedNetworkFlagExcludeSourceMAC,
+	} {
+		if !sharedNetworkBypassFlowCacheRequired(flags) {
+			t.Fatalf("policy flags %#x did not enable bypass-flow cache lookups", flags)
+		}
 	}
 }
 
@@ -78,6 +108,7 @@ func TestMakeSharedNetworkFlowHandle(t *testing.T) {
 		Protocol:       ProtocolUDP,
 		Port:           original.Port(),
 		InterfaceIndex: 42,
+		SourceMAC:      [6]byte{0x02, 0x00, 0x00, 0x00, 0x00, 0x01},
 	}
 	copy(value.Addr[:], original.Addr().AsSlice())
 	flow := makeSharedNetworkFlowHandle(key, value)
@@ -87,6 +118,9 @@ func TestMakeSharedNetworkFlowHandle(t *testing.T) {
 		flow.replyKey.ListenerPort != tokenDestination.Port() ||
 		flow.listenerKey != key {
 		t.Fatalf("unexpected shared-network flow: %+v", flow)
+	}
+	if actual := sharedNetworkOriginalMAC(value); actual.String() != "02:00:00:00:00:01" {
+		t.Fatalf("unexpected source MAC: %s", actual)
 	}
 }
 

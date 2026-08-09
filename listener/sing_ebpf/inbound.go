@@ -39,20 +39,24 @@ type Inbound struct {
 	additions []inbound.Addition
 	options   LC.EBPF
 
-	cgroupPath          string
-	enableTCP           bool
-	enableUDP           bool
-	dnsMode             string
-	cgroupIPv6Mode      string
-	cgroupIPv6Available bool
-	cgroupIPv6Probe     cgroupIPv6ProbeState
-	cgroupIPv6ProbeLock sync.Mutex
-	redirectIPv4Prefix  netip.Prefix
-	redirectIPv6Prefix  netip.Prefix
-	cgroupMapCapacity   ECommon.CgroupMapCapacity
-	cgroupPolicy        ECommon.CgroupPolicy
-	androidUIDOptions   *androidUIDOptions
-	udpTimeout          time.Duration
+	cgroupPath               string
+	enableTCP                bool
+	enableUDP                bool
+	dnsMode                  string
+	cgroupIPv6Mode           string
+	cgroupIPv6Available      bool
+	cgroupIPv6Probe          cgroupIPv6ProbeState
+	cgroupIPv6ProbeLock      sync.Mutex
+	redirectIPv4Prefix       netip.Prefix
+	redirectIPv6Prefix       netip.Prefix
+	cgroupMapCapacity        ECommon.CgroupMapCapacity
+	cgroupPolicy             ECommon.CgroupPolicy
+	androidUIDOptions        *androidUIDOptions
+	udpTimeout               time.Duration
+	bypassPrivateAddress     bool
+	sharedNetworkMapCapacity ECommon.SharedNetworkMapCapacities
+	sharedNetworkIncludeMAC  []ECommon.MACAddress
+	sharedNetworkExcludeMAC  []ECommon.MACAddress
 
 	listeners internalListenerSet
 
@@ -120,7 +124,6 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 	if err != nil {
 		return nil, E.Cause(err, "parse exclude_uid_range")
 	}
-	excludeUIDRanges = append(excludeUIDRanges, platformExcludedUIDRanges(runtime.GOOS)...)
 	udpTimeout := time.Duration(options.UDPTimeout)
 	if udpTimeout == 0 {
 		udpTimeout = 5 * time.Minute
@@ -130,25 +133,45 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		return nil, err
 	}
 
+	sharedNetworkMapCapacity, err := normalizeSharedNetworkMapCapacity(options.SharedNetwork.MapCapacity)
+	if err != nil {
+		return nil, err
+	}
+	sharedNetworkIncludeMAC, err := parseSharedNetworkMACAddresses("include_mac_address", options.SharedNetwork.IncludeMACAddress)
+	if err != nil {
+		return nil, err
+	}
+	sharedNetworkExcludeMAC, err := parseSharedNetworkMACAddresses("exclude_mac_address", options.SharedNetwork.ExcludeMACAddress)
+	if err != nil {
+		return nil, err
+	}
+	bypassPrivateAddress := options.BypassPrivateAddress == nil || *options.BypassPrivateAddress
+
 	inboundListener := &Inbound{
-		ctx:                 ctx,
-		tunnel:              tunnel,
-		additions:           additions,
-		options:             options,
-		cgroupPath:          cgroupPath,
-		enableTCP:           enableTCP,
-		enableUDP:           enableUDP,
-		dnsMode:             dnsMode,
-		cgroupIPv6Mode:      cgroupIPv6Mode,
-		cgroupIPv6Available: true,
-		redirectIPv4Prefix:  redirectIPv4Prefix,
-		redirectIPv6Prefix:  redirectIPv6Prefix,
-		cgroupMapCapacity:   cgroupMapCapacity,
-		udpTimeout:          udpTimeout,
+		ctx:                      ctx,
+		tunnel:                   tunnel,
+		additions:                additions,
+		options:                  options,
+		cgroupPath:               cgroupPath,
+		enableTCP:                enableTCP,
+		enableUDP:                enableUDP,
+		dnsMode:                  dnsMode,
+		cgroupIPv6Mode:           cgroupIPv6Mode,
+		cgroupIPv6Available:      true,
+		redirectIPv4Prefix:       redirectIPv4Prefix,
+		redirectIPv6Prefix:       redirectIPv6Prefix,
+		cgroupMapCapacity:        cgroupMapCapacity,
+		udpTimeout:               udpTimeout,
+		bypassPrivateAddress:     bypassPrivateAddress,
+		sharedNetworkMapCapacity: sharedNetworkMapCapacity,
+		sharedNetworkIncludeMAC:  sharedNetworkIncludeMAC,
+		sharedNetworkExcludeMAC:  sharedNetworkExcludeMAC,
 		cgroupPolicy: ECommon.CgroupPolicy{
-			HijackDNS:  dnsMode == dnsModeHijack,
-			IncludeUID: includeUIDRanges,
-			ExcludeUID: excludeUIDRanges,
+			HijackDNS:               dnsMode == dnsModeHijack,
+			IncludeUIDConfigured:    len(options.IncludeUID) > 0 || len(options.IncludeUIDRange) > 0 || len(options.IncludePackage) > 0,
+			IncludeUID:              includeUIDRanges,
+			ExcludeUID:              excludeUIDRanges,
+			ExcludeAndroidDNSTether: runtime.GOOS == "android",
 		},
 		androidUIDOptions: newAndroidUIDOptions(options),
 	}
@@ -179,18 +202,15 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		}
 		options.SharedNetwork.IncludeSourceCIDR = includeSource
 		options.SharedNetwork.ExcludeSourceCIDR = excludeSource
-		sharedMapCapacity, capacityErr := normalizeMapCapacityValue(
-			"shared_network.map_capacity",
-			options.SharedNetwork.MapCapacity,
-			ECommon.SharedNetworkMapCapacity,
-		)
-		if capacityErr != nil {
-			return nil, capacityErr
+		tcPriority := options.SharedNetwork.TCPriority
+		if tcPriority == 0 {
+			tcPriority = defaultSharedNetworkTCPriority
 		}
 		inboundListener.sharedNetwork = newSharedNetwork(
 			inboundListener,
 			options.SharedNetwork.IncludeInterface,
-			sharedMapCapacity,
+			sharedNetworkMapCapacity,
+			tcPriority,
 		)
 	}
 

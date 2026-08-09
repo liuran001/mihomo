@@ -69,6 +69,7 @@ func (b *SharedNetworkBackend) lookupFlow(
 	}
 	return OriginalDestination{
 		Destination: netip.AddrPortFrom(address, value.Port),
+		SourceMAC:   sharedNetworkOriginalMAC(value),
 	}, &flow, nil
 }
 

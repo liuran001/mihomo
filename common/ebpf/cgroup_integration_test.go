@@ -206,22 +206,32 @@ func TestSharedNetworkSharedMapProgramLoadIntegration(t *testing.T) {
 			dnsMode = "hijack"
 		}
 		t.Run(dnsMode, func(t *testing.T) {
-			prepareSharedNetworkProgramLoad(t, backend, hijackDNS)
+			prepareSharedNetworkProgramLoad(t, backend, hijackDNS, true)
 		})
 	}
+	t.Run("proxy_private", func(t *testing.T) {
+		prepareSharedNetworkProgramLoad(t, backend, true, false)
+	})
 }
 
-func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend, hijackDNS bool) *SharedNetworkBackend {
+func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend, hijackDNS bool, bypassPrivateAddress bool) *SharedNetworkBackend {
 	t.Helper()
 	sharedBackend, err := PrepareSharedNetwork(cgroupBackend, SharedNetworkConfig{
-		ListenerPort: 65531,
-		EnableTCP:    true,
-		EnableUDP:    true,
-		HijackDNS:    hijackDNS,
-		RedirectIPv4: netip.MustParsePrefix("127.128.0.0/9"),
-		RedirectIPv6: netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
-		MapCapacity:  SharedNetworkMapCapacity,
-		UDPTimeout:   5 * time.Minute,
+		ListenerPort:         65531,
+		EnableTCP:            true,
+		EnableUDP:            true,
+		HijackDNS:            hijackDNS,
+		BypassPrivateAddress: bypassPrivateAddress,
+		RedirectIPv4:         netip.MustParsePrefix("127.128.0.0/9"),
+		RedirectIPv6:         netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
+		IncludeSourceMAC:     []MACAddress{{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}},
+		ExcludeSourceMAC:     []MACAddress{{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}},
+		MapCapacity: SharedNetworkMapCapacities{
+			Proxy:    SharedNetworkMapCapacity,
+			Bypass:   SharedNetworkMapCapacity,
+			Fragment: SharedNetworkMapCapacity,
+		},
+		UDPTimeout: 5 * time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -236,6 +246,16 @@ func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend,
 	}
 	if hasDNSHijack := sharedBackend.control.Flags&sharedNetworkFlagDNSHijack != 0; hasDNSHijack != hijackDNS {
 		t.Fatalf("unexpected shared-network DNS hijack flag: %t", hasDNSHijack)
+	}
+	if hasBypassPrivateAddress := sharedBackend.control.Flags&sharedNetworkFlagBypassPrivateAddress != 0; hasBypassPrivateAddress != bypassPrivateAddress {
+		t.Fatalf("unexpected shared-network private-address bypass flag: %t", hasBypassPrivateAddress)
+	}
+	if sharedBackend.control.Flags&sharedNetworkFlagIncludeSourceMAC == 0 ||
+		sharedBackend.control.Flags&sharedNetworkFlagExcludeSourceMAC == 0 {
+		t.Fatal("shared-network source MAC policy is disabled")
+	}
+	if sharedBackend.control.Flags&sharedNetworkFlagBypassFlowCache == 0 {
+		t.Fatal("shared-network bypass-flow cache lookup is disabled with source policy")
 	}
 	if err = sharedBackend.UpdateHostAddresses([]netip.Addr{
 		netip.MustParseAddr("192.0.2.1"),
@@ -589,8 +609,36 @@ func testLookupAndDeleteFallback(t *testing.T, backend *CgroupBackend) {
 	}
 }
 
-func TestCgroupBackendTGIDSelfBypassIntegration(t *testing.T) {
-	requireEBPFIntegration(t, "test TGID self bypass")
+func TestCgroupBackendTGIDProbeIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "probe BPF-visible TGID")
+	cgroupPath, err := DetectCgroup2Mount()
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, err := PrepareCgroup(CgroupConfig{
+		Path:         cgroupPath,
+		EnableTCP:    true,
+		RedirectIPv4: netip.MustParsePrefix("127.128.0.0/9"),
+		MapCapacity:  DefaultCgroupMapCapacity(),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := backend.Close(); err != nil {
+			t.Errorf("close TGID probe backend: %v", err)
+		}
+	})
+	if err = backend.LoadPrograms(65531); err != nil {
+		t.Fatal(err)
+	}
+	if backend.SelfBypassMode() != "tgid" {
+		t.Fatalf("expected TGID self bypass for the current cgroup, got %s", backend.SelfBypassMode())
+	}
+}
+
+func TestCgroupBackendSelfBypassFallbackIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "test self-bypass fallback")
 	cgroupMount, err := DetectCgroup2Mount()
 	if err != nil {
 		t.Fatal(err)
@@ -626,6 +674,14 @@ func TestCgroupBackendTGIDSelfBypassIntegration(t *testing.T) {
 		}
 	})
 
+	protectedSocket := prepareProtectedIntegrationSocket(
+		t,
+		backend,
+		"tcp4",
+		unix.SOCK_STREAM|unix.SOCK_NONBLOCK,
+		unix.IPPROTO_TCP,
+	)
+	defer protectedSocket.Close()
 	readyReader, readyWriter, err := os.Pipe()
 	if err != nil {
 		t.Fatal(err)
@@ -634,7 +690,7 @@ func TestCgroupBackendTGIDSelfBypassIntegration(t *testing.T) {
 	var helperOutput bytes.Buffer
 	helper := exec.Command(os.Args[0], "-test.run=^TestCgroupBackendTGIDSelfBypassHelper$")
 	helper.Env = append(os.Environ(), integrationTGIDHelperEnv+"=1")
-	helper.ExtraFiles = []*os.File{readyReader}
+	helper.ExtraFiles = []*os.File{readyReader, protectedSocket}
 	helper.Stdout = &helperOutput
 	helper.Stderr = &helperOutput
 	if err = helper.Start(); err != nil {
@@ -650,11 +706,11 @@ func TestCgroupBackendTGIDSelfBypassIntegration(t *testing.T) {
 		_ = helper.Process.Kill()
 		_ = helper.Wait()
 	})
-	if err = backend.loadPrograms(listenerPort, uint32(helper.Process.Pid)); err != nil {
+	if err = backend.LoadPrograms(listenerPort); err != nil {
 		t.Fatal(err)
 	}
-	if backend.SelfBypassMode() != "tgid" {
-		t.Skip("kernel rejected TGID self bypass and loaded the socket-cookie fallback")
+	if backend.SelfBypassMode() != "socket_cookie" {
+		t.Fatalf("expected socket-cookie fallback for an external cgroup, got %s", backend.SelfBypassMode())
 	}
 	if err = backend.Attach(); err != nil {
 		t.Fatal(err)
@@ -698,12 +754,12 @@ func TestCgroupBackendTGIDSelfBypassHelper(t *testing.T) {
 	if _, err := io.ReadFull(readyPipe, make([]byte, 1)); err != nil {
 		t.Fatal(err)
 	}
-	fileDescriptor, err := unix.Socket(unix.AF_INET, unix.SOCK_STREAM|unix.SOCK_NONBLOCK|unix.SOCK_CLOEXEC, unix.IPPROTO_TCP)
-	if err != nil {
-		t.Fatal(err)
+	protectedSocket := os.NewFile(4, "protected-socket")
+	if protectedSocket == nil {
+		t.Fatal("missing protected socket")
 	}
-	defer unix.Close(fileDescriptor)
-	err = unix.Connect(fileDescriptor, &unix.SockaddrInet4{Port: 443, Addr: [4]byte{198, 51, 100, 30}})
+	defer protectedSocket.Close()
+	err := unix.Connect(int(protectedSocket.Fd()), &unix.SockaddrInet4{Port: 443, Addr: [4]byte{198, 51, 100, 30}})
 	if err != nil && !errors.Is(err, unix.EINPROGRESS) && !errors.Is(err, unix.ENETUNREACH) {
 		t.Fatal(err)
 	}
@@ -819,7 +875,7 @@ func TestCgroupBackendTrafficHelper(t *testing.T) {
 
 func TestSharedNetworkStandaloneProgramLoadIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "load standalone shared-network programs")
-	backend := prepareSharedNetworkProgramLoad(t, nil, true)
+	backend := prepareSharedNetworkProgramLoad(t, nil, true, true)
 	updated, err := backend.UpdateBypassCIDR([]netip.Prefix{
 		netip.MustParsePrefix("198.51.100.0/24"),
 		netip.MustParsePrefix("2001:db8::/32"),

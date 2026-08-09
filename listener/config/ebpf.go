@@ -7,30 +7,40 @@ import (
 )
 
 type EBPF struct {
-	Network            []string          `json:"network" yaml:"network"`
-	UDPTimeout         int64             `json:"udp-timeout" yaml:"udp-timeout"`
-	DNSMode            string            `json:"dns-mode" yaml:"dns-mode"`
-	CgroupIPv6Mode     string            `json:"cgroup-ipv6-mode" yaml:"cgroup-ipv6-mode"`
-	CgroupPath         string            `json:"cgroup-path" yaml:"cgroup-path"`
-	RedirectAddress    []netip.Prefix    `json:"redirect-address" yaml:"redirect-address"`
-	BypassRuleSet      []string          `json:"bypass-rule-set" yaml:"bypass-rule-set"`
-	IncludeUID         []uint32          `json:"include-uid" yaml:"include-uid"`
-	IncludeUIDRange    []string          `json:"include-uid-range" yaml:"include-uid-range"`
-	ExcludeUID         []uint32          `json:"exclude-uid" yaml:"exclude-uid"`
-	ExcludeUIDRange    []string          `json:"exclude-uid-range" yaml:"exclude-uid-range"`
-	IncludeAndroidUser []int             `json:"include-android-user" yaml:"include-android-user"`
-	IncludePackage     []string          `json:"include-package" yaml:"include-package"`
-	ExcludePackage     []string          `json:"exclude-package" yaml:"exclude-package"`
-	MapCapacity        EBPFMapCapacity   `json:"map-capacity" yaml:"map-capacity"`
-	SharedNetwork      EBPFSharedNetwork `json:"shared-network" yaml:"shared-network"`
+	Network              []string          `json:"network" yaml:"network"`
+	UDPTimeout           int64             `json:"udp-timeout" yaml:"udp-timeout"`
+	DNSMode              string            `json:"dns-mode" yaml:"dns-mode"`
+	CgroupIPv6Mode       string            `json:"cgroup-ipv6-mode" yaml:"cgroup-ipv6-mode"`
+	CgroupPath           string            `json:"cgroup-path" yaml:"cgroup-path"`
+	RedirectAddress      []netip.Prefix    `json:"redirect-address" yaml:"redirect-address"`
+	BypassPrivateAddress *bool             `json:"bypass-private-address" yaml:"bypass-private-address" inbound:"bypass-private-address,omitempty"`
+	BypassRuleSet        []string          `json:"bypass-rule-set" yaml:"bypass-rule-set"`
+	IncludeUID           []uint32          `json:"include-uid" yaml:"include-uid"`
+	IncludeUIDRange      []string          `json:"include-uid-range" yaml:"include-uid-range"`
+	ExcludeUID           []uint32          `json:"exclude-uid" yaml:"exclude-uid"`
+	ExcludeUIDRange      []string          `json:"exclude-uid-range" yaml:"exclude-uid-range"`
+	IncludeAndroidUser   []int             `json:"include-android-user" yaml:"include-android-user"`
+	IncludePackage       []string          `json:"include-package" yaml:"include-package"`
+	ExcludePackage       []string          `json:"exclude-package" yaml:"exclude-package"`
+	MapCapacity          EBPFMapCapacity   `json:"map-capacity" yaml:"map-capacity"`
+	SharedNetwork        EBPFSharedNetwork `json:"shared-network" yaml:"shared-network"`
 }
 
 type EBPFSharedNetwork struct {
-	Enabled           bool           `json:"enabled" yaml:"enabled" inbound:"enabled,omitempty"`
-	IncludeInterface  []string       `json:"include-interface" yaml:"include-interface" inbound:"include-interface,omitempty"`
-	IncludeSourceCIDR []netip.Prefix `json:"include-source-cidr" yaml:"include-source-cidr" inbound:"include-source-cidr,omitempty"`
-	ExcludeSourceCIDR []netip.Prefix `json:"exclude-source-cidr" yaml:"exclude-source-cidr" inbound:"exclude-source-cidr,omitempty"`
-	MapCapacity       uint32         `json:"map-capacity" yaml:"map-capacity" inbound:"map-capacity,omitempty"`
+	Enabled           bool                         `json:"enabled" yaml:"enabled" inbound:"enabled,omitempty"`
+	IncludeInterface  []string                     `json:"include-interface" yaml:"include-interface" inbound:"include-interface,omitempty"`
+	IncludeSourceCIDR []netip.Prefix               `json:"include-source-cidr" yaml:"include-source-cidr" inbound:"include-source-cidr,omitempty"`
+	ExcludeSourceCIDR []netip.Prefix               `json:"exclude-source-cidr" yaml:"exclude-source-cidr" inbound:"exclude-source-cidr,omitempty"`
+	IncludeMACAddress []string                     `json:"include-mac-address" yaml:"include-mac-address" inbound:"include-mac-address,omitempty"`
+	ExcludeMACAddress []string                     `json:"exclude-mac-address" yaml:"exclude-mac-address" inbound:"exclude-mac-address,omitempty"`
+	TCPriority        uint16                       `json:"tc-priority" yaml:"tc-priority" inbound:"tc-priority,omitempty"`
+	MapCapacity       EBPFSharedNetworkMapCapacity `json:"map-capacity" yaml:"map-capacity" inbound:"map-capacity,omitempty"`
+}
+
+type EBPFSharedNetworkMapCapacity struct {
+	Proxy    *uint32 `json:"proxy" yaml:"proxy" inbound:"proxy,omitempty"`
+	Bypass   *uint32 `json:"bypass" yaml:"bypass" inbound:"bypass,omitempty"`
+	Fragment *uint32 `json:"fragment" yaml:"fragment" inbound:"fragment,omitempty"`
 }
 
 type EBPFMapCapacity struct {
