@@ -37,6 +37,10 @@ func (s *sharedNetwork) NewConnection(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
+	if s.inbound.hijackDNS(original.Destination) {
+		go s.relayTCPDNS(conn, flow)
+		return
+	}
 	metadata := &C.Metadata{
 		NetWork: C.TCP,
 		Type:    C.EBPF,
@@ -77,6 +81,10 @@ func (s *sharedNetwork) NewPacket(data []byte, oob []byte, source netip.AddrPort
 	}
 
 	clientState := s.udpClientTable.loadOrCreate(client)
+	if s.inbound.hijackDNS(original.Destination) {
+		s.relayUDPDNS(data, client, clientState, original.Destination)
+		return
+	}
 	metadata := &C.Metadata{
 		NetWork: C.UDP,
 		Type:    C.EBPF,

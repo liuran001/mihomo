@@ -33,6 +33,10 @@ func (i *Inbound) NewConnection(conn net.Conn) {
 		_ = conn.Close()
 		return
 	}
+	if i.hijackDNS(original.Destination) {
+		go i.relayTCPDNS(conn)
+		return
+	}
 	sourceAddr, err := netip.ParseAddrPort(conn.RemoteAddr().String())
 	if err != nil {
 		_ = conn.Close()
@@ -84,6 +88,10 @@ func (i *Inbound) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
 	clientState := i.udpClientTable.loadOrCreate(client)
 	if original.ConnectedUDP {
 		clientState.setConnected(true)
+	}
+	if i.hijackDNS(original.Destination) {
+		i.relayUDPDNS(data, client, clientState, original.Destination)
+		return
 	}
 
 	metadata := &C.Metadata{
