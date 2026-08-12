@@ -1,0 +1,167 @@
+name: eBPF test
+
+on:
+  push:
+    branches:
+      - ebpf-inbound
+      - "automation/ebpf-*"
+  pull_request:
+    branches:
+      - ebpf-inbound
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ebpf-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  GO_VERSION: "1.26"
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    env:
+      SKIP_INTEROP_TEST: "1"
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          go vet ./...
+          go test ./... -count=1
+
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libc6-dev linux-libc-dev
+
+      - name: Generate BPF object
+        run: make ebpf_generate
+
+      - name: Test eBPF packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          CGO_ENABLED=1 go test -count=1 -tags "with_gvisor with_ebpf" ./common/ebpf/... ./listener/sing_ebpf/...
+
+  generate-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libc6-dev linux-libc-dev
+
+      - name: Generate BPF object
+        run: make ebpf_generate
+
+      - name: Check generated object
+        run: make ebpf_check
+
+  build:
+    needs:
+      - test
+      - generate-check
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - goos: linux
+            goarch: arm64
+          - goos: linux
+            goarch: amd64
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c
+        with:
+          go-download-base-url: "https://github.com/MetaCubeX/go/releases/download/build"
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Install BPF build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang libc6-dev linux-libc-dev
+
+      - name: Install cross compiler
+        if: ${{ matrix.goarch == 'arm64' }}
+        run: |
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Setup environment
+        run: |
+          echo "CGO_ENABLED=1" >> "$GITHUB_ENV"
+          if [ "${{ matrix.goarch }}" = "arm64" ]; then
+            echo "CC=aarch64-linux-gnu-gcc" >> "$GITHUB_ENV"
+          fi
+
+      - name: Download dependencies
+        run: go mod download
+
+      - name: Generate BPF object
+        run: make ebpf_generate
+
+      - name: Build metadata
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist build
+          git fetch --depth=1 https://github.com/MetaCubeX/mihomo.git Alpha
+          echo "$(git rev-parse FETCH_HEAD)" > build/UPSTREAM_SHA
+          echo "$(git rev-parse HEAD)" > build/COMMIT_SHA
+          echo "${GOOS}/${GOARCH}" > build/PLATFORM
+          go version > build/GO_VERSION
+          version="$(git describe --tags --always --abbrev=12)"
+          echo "${version}" > build/VERSION
+          echo "version=${version}" >> "$GITHUB_ENV"
+          echo "build_time=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_ENV"
+
+      - name: Build static binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          output="dist/mihomo-ebpf-${GOOS}-${GOARCH}"
+          if [ "${{ matrix.goarch }}" = "arm64" ]; then
+            export CC=aarch64-linux-gnu-gcc
+          fi
+          go build -v -tags "with_gvisor with_ebpf" -trimpath \
+            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${version}' \
+                      -X 'github.com/metacubex/mihomo/constant.BuildTime=${build_time}' \
+                      -w -s -buildid= -extldflags '-static'" \
+            -o "${output}" .
+          sha256sum "${output}" > "${output}.sha256"
+          cp build/* dist/
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: mihomo-ebpf-${{ matrix.goos }}-${{ matrix.goarch }}
+          path: |
+            dist/*
+            build/*
+          if-no-files-found: error

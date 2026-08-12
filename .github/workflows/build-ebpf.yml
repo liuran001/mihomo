@@ -3,7 +3,6 @@ name: Build eBPF branch
 on:
   push:
     branches:
-      - Alpha
       - ebpf-inbound
       - "automation/ebpf-*"
   pull_request:
