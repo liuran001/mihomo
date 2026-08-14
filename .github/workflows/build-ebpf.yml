@@ -89,6 +89,13 @@ jobs:
             goamd64: v3
           - goos: linux
             goarch: arm64
+          - goos: linux
+            goarch: arm64
+            static: true
+          - goos: linux
+            goarch: amd64
+            goamd64: v3
+            static: true
           - goos: android
             goarch: arm64
     steps:
@@ -190,21 +197,27 @@ jobs:
           GOOS: ${{ matrix.goos }}
           GOARCH: ${{ matrix.goarch }}
           GOAMD64: ${{ matrix.goamd64 }}
+          STATIC: ${{ matrix.static }}
         shell: bash
         run: |
           set -euo pipefail
           output="dist/mihomo-ebpf-${GOOS}-${GOARCH}"
+          extldflags=""
+          if [ "$STATIC" = "true" ]; then
+            output="${output}-static"
+            extldflags="-extldflags '-static'"
+          fi
           go build -v -tags "with_gvisor with_ebpf" -trimpath \
             -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${version}' \
                       -X 'github.com/metacubex/mihomo/constant.BuildTime=${build_time}' \
-                      -w -s -buildid=" \
+                      -w -s -buildid= ${extldflags}" \
             -o "${output}" .
           sha256sum "${output}" > "${output}.sha256"
           cp build/* dist/
 
       - uses: actions/upload-artifact@v7
         with:
-          name: mihomo-ebpf-${{ matrix.goos }}-${{ matrix.goarch }}
+          name: mihomo-ebpf-${{ matrix.goos }}-${{ matrix.goarch }}${{ matrix.static && '-static' || '' }}
           path: |
             dist/*
             build/*
@@ -276,3 +289,64 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags with_gvisor -trimpath -o mihomo-windows-amd64.exe .
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -tags with_gvisor -trimpath -o mihomo-darwin-arm64 .
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags with_gvisor -trimpath -o mihomo-linux-noebpf .
+
+  release:
+    needs: build
+    # Only push-triggered builds publish a rolling prerelease; manual
+    # (workflow_dispatch) and pull_request runs build artifacts only.
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: v1.19.22-ebpf
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Assemble release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit_sha="${{ github.sha }}"
+          commit_msg="$(git log -1 --format=%s "$commit_sha" 2>/dev/null || git log -1 --format=%s)"
+          version_file=$(find artifacts -path '*/build/VERSION' | head -1)
+          upstream_sha="$(sed -n '1p' "$(find artifacts -path '*/build/UPSTREAM_SHA' | head -1)")"
+          version="$(sed -n '1p' "$version_file")"
+          {
+            echo "## 本次构建"
+            echo "- 触发: ${{ github.event_name }} (${{ github.ref }})"
+            echo "- 提交: \`${commit_sha}\` — ${commit_msg}"
+            echo "- 上游 Alpha: \`${upstream_sha}\`"
+            echo "- 版本: \`${version}\`"
+            echo
+            echo "## 二进制"
+            for f in artifacts/mihomo-ebpf-*/dist/mihomo-ebpf-*; do
+              [ -f "$f" ] || continue
+              name="$(basename "$f")"
+              sha="$(sha256sum "$f" | awk '{print $1}')"
+              echo "- \`${name}\`: ${sha}"
+            done
+          } > notes.md
+
+      - name: Delete previous prerelease and tag
+        shell: bash
+        run: |
+          gh release delete "${RELEASE_TAG}" --yes --repo "${{ github.repository }}" || true
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/${RELEASE_TAG}" || true
+
+      - name: Create prerelease
+        shell: bash
+        run: |
+          gh release create "${RELEASE_TAG}" \
+            artifacts/mihomo-ebpf-*/dist/mihomo-ebpf-* \
+            artifacts/mihomo-ebpf-*/dist/*.sha256 \
+            --repo "${{ github.repository }}" \
+            --title "mihomo Meta — eBPF inbound (${RELEASE_TAG})" \
+            --notes-file notes.md \
+            --prerelease
