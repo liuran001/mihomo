@@ -342,21 +342,32 @@ jobs:
               echo "- \`${name}\`: ${sha}"
             done
           } > notes.md
-
-      - name: Delete previous prerelease and tag
+      - name: Delete previous release and tag (optional)
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release delete "${RELEASE_TAG}" --yes --repo "${{ github.repository }}" || true
           gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/${RELEASE_TAG}" || true
-
-      - name: Create prerelease
+    
+      - name: Create prerelease (without assets)
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "${RELEASE_TAG}" \
-            artifacts/mihomo-ebpf-*/dist/mihomo-ebpf-* \
-            artifacts/mihomo-ebpf-*/dist/*.sha256 \
             --repo "${{ github.repository }}" \
             --title "mihomo Meta — eBPF inbound (${RELEASE_TAG})" \
             --notes-file notes.md \
-            --prerelease \
-            --clobber      
+            --prerelease
+    
+      - name: Upload assets with clobber
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload "${RELEASE_TAG}" \
+            artifacts/mihomo-ebpf-*/dist/mihomo-ebpf-* \
+            artifacts/mihomo-ebpf-*/dist/*.sha256 \
+            --repo "${{ github.repository }}" \
+            --clobber
