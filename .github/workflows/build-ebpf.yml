@@ -300,6 +300,7 @@ jobs:
       contents: write
     env:
       RELEASE_TAG: v1.19.22-ebpf
+      GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v6
         with:
