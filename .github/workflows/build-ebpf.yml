@@ -309,6 +309,14 @@ jobs:
       - uses: actions/download-artifact@v7
         with:
           path: artifacts
+ 
+      - name: Clean up existing release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release delete "${RELEASE_TAG}" --yes --repo "${{ github.repository }}" 2>/dev/null || true
+          gh api -X DELETE "repos/${{ github.repository }}/git/refs/tags/${RELEASE_TAG}" 2>/dev/null || true
 
       - name: Assemble release notes
         shell: bash
@@ -350,4 +358,5 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "mihomo Meta — eBPF inbound (${RELEASE_TAG})" \
             --notes-file notes.md \
-            --prerelease
+            --prerelease \
+            --clobber      
