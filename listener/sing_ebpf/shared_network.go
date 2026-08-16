@@ -7,6 +7,7 @@ import (
 	"time"
 
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
+	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/log"
 
 	E "github.com/metacubex/sing/common/exceptions"
@@ -17,6 +18,7 @@ import (
 type sharedNetwork struct {
 	inbound        *Inbound
 	interfaces     []string
+	options        LC.EBPFShared
 	sharedBackend  *ECommon.SharedNetworkBackend
 	tcManager      *sharedTCManager
 	listeners      internalListenerSet
@@ -31,10 +33,15 @@ type sharedNetwork struct {
 	periodicDone    chan struct{}
 }
 
-func newSharedNetwork(inbound *Inbound, options []string, mapCapacity ECommon.SharedNetworkMapCapacities, tcPriority uint16) *sharedNetwork {
+func newSharedNetwork(inbound *Inbound, sharedOptions LC.EBPFShared, mapCapacity ECommon.SharedNetworkMapCapacities) *sharedNetwork {
+	tcPriority := sharedOptions.Advanced.TCPriority
+	if tcPriority == 0 {
+		tcPriority = defaultSharedNetworkTCPriority
+	}
 	return &sharedNetwork{
 		inbound:     inbound,
-		interfaces:  append([]string(nil), options...),
+		interfaces:  append([]string(nil), sharedOptions.Interface...),
+		options:     sharedOptions,
 		mapCapacity: mapCapacity,
 		tcPriority:  tcPriority,
 	}
@@ -48,12 +55,13 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		ListenerPort:         s.listeners.selectedPort(),
 		EnableTCP:            s.inbound.enableTCP,
 		EnableUDP:            s.inbound.enableUDP,
-		HijackDNS:            s.inbound.dnsMode == dnsModeHijack,
+		HijackDNS:            s.inbound.dnsMode != dnsModeOff,
+		DNSRespectBypass:     s.inbound.dnsMode == dnsModeRespectBypass,
 		BypassPrivateAddress: s.inbound.bypassPrivateAddress,
 		RedirectIPv4:         s.inbound.redirectIPv4Prefix,
-		RedirectIPv6:         s.inbound.redirectIPv6Prefix,
-		IncludeSourceCIDR:    s.inbound.options.SharedNetwork.IncludeSourceCIDR,
-		ExcludeSourceCIDR:    s.inbound.options.SharedNetwork.ExcludeSourceCIDR,
+		RedirectIPv6:         s.inbound.sharedRedirectIPv6Prefix(),
+		IncludeSourceCIDR:    s.options.IncludeSourceCIDR,
+		ExcludeSourceCIDR:    s.options.ExcludeSourceCIDR,
 		IncludeSourceMAC:     s.inbound.sharedNetworkIncludeMAC,
 		ExcludeSourceMAC:     s.inbound.sharedNetworkExcludeMAC,
 		MapCapacity:          s.mapCapacity,
@@ -63,7 +71,11 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		return E.Errors(err, s.closeListeners())
 	}
 	s.setSharedBackend(backend)
-	if err = backend.SetBypassCIDRState(s.inbound.currentBypassCIDR()); err != nil {
+	if cgroupBackend == nil {
+		if _, err = backend.UpdateBypassCIDR(s.inbound.currentBypassCIDR()); err != nil {
+			return E.Errors(err, s.Close())
+		}
+	} else if err = backend.SetBypassCIDRState(s.inbound.currentBypassCIDR()); err != nil {
 		return E.Errors(err, s.Close())
 	}
 	s.tcManager = &sharedTCManager{
@@ -80,12 +92,14 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		return E.Errors(err, s.Close())
 	}
 	s.startUDPPeriodic()
-	log.Infoln("[EBPF] shared-network TC interception ready: downstream_interfaces=[%s], redirect_listener_port=%d, dns_mode=%s, source_cidr={include:%d, exclude:%d}, tc_priority=%d, map_capacity=%d, programs=[tc/ingress, tc/egress]",
+	log.Infoln("[EBPF] shared-network TC interception ready: downstream_interfaces=[%s], redirect_listener_port=%d, dns_mode=%s, ipv6_mode=%s, bypass_private_address=%v, source_cidr={include:%d, exclude:%d}, tc_priority=%d, map_capacity=%d, programs=[tc/ingress, tc/egress]",
 		s.tcManager.InterfaceString(),
 		s.listeners.selectedPort(),
 		s.inbound.dnsMode,
-		len(s.inbound.options.SharedNetwork.IncludeSourceCIDR),
-		len(s.inbound.options.SharedNetwork.ExcludeSourceCIDR),
+		s.inbound.sharedIPv6Mode,
+		s.inbound.bypassPrivateAddress,
+		len(s.options.IncludeSourceCIDR),
+		len(s.options.ExcludeSourceCIDR),
 		s.tcPriority,
 		s.mapCapacity,
 	)

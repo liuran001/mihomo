@@ -17,20 +17,92 @@ import (
 
 const (
 	dnsModeHijack        = "hijack"
+	dnsModeRespectBypass = "respect_bypass"
 	dnsModeOff           = "off"
 	cgroupIPv6ModeAlways = "always"
 	cgroupIPv6ModeAuto   = "auto"
 	cgroupIPv6ModeOff    = "off"
+	sharedIPv6ModeAlways = "always"
+	sharedIPv6ModeOff    = "off"
+	ebpfModeLocal        = "local"
+	ebpfModeShared       = "shared"
+	ebpfModeHybrid       = "hybrid"
 )
 
-var defaultRedirectIPv4Prefix = netip.MustParsePrefix("127.128.0.0/9")
+func normalizeMode(mode string) (string, bool, bool, error) {
+	switch mode {
+	case "", ebpfModeLocal:
+		return ebpfModeLocal, true, false, nil
+	case ebpfModeShared:
+		return ebpfModeShared, false, true, nil
+	case ebpfModeHybrid:
+		return ebpfModeHybrid, true, true, nil
+	default:
+		return "", false, false, E.New("unknown eBPF mode: ", mode)
+	}
+}
+
+func validateLocalOptions(enabled bool, options LC.EBPFLocal) error {
+	if enabled {
+		return nil
+	}
+	if options.CgroupPath != "" {
+		return E.New("local.cgroup_path requires local or hybrid mode")
+	}
+	if options.IPv6Mode != "" {
+		return E.New("local.ipv6_mode requires local or hybrid mode")
+	}
+	if len(options.IncludeUID) > 0 || len(options.IncludeUIDRange) > 0 ||
+		len(options.ExcludeUID) > 0 || len(options.ExcludeUIDRange) > 0 ||
+		len(options.IncludeAndroidUser) > 0 || len(options.IncludePackage) > 0 ||
+		len(options.ExcludePackage) > 0 {
+		return E.New("local UID policy requires local or hybrid mode")
+	}
+	if options.StateCapacity != 0 {
+		return E.New("local.state_capacity requires local or hybrid mode")
+	}
+	return nil
+}
+
+func validateSharedOptions(enabled bool, options LC.EBPFShared) error {
+	if enabled {
+		return nil
+	}
+	if len(options.Interface) > 0 || options.IPv6Mode != "" ||
+		len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
+		len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0 ||
+		options.StateCapacity != 0 || options.Advanced.TCPriority != 0 {
+		return E.New("shared options require shared or hybrid mode")
+	}
+	return nil
+}
+
+func validateAndroidUIDOptions(goos string, options LC.EBPFLocal) error {
+	if !hasAndroidUIDOptions(options) {
+		return nil
+	}
+	if goos != "android" {
+		return E.New("include_android_user, include_package, and exclude_package are only supported on Android")
+	}
+	const maxAndroidUserID = (uint64(^uint32(0)-1) - (androidUserRange - 1)) / androidUserRange
+	for _, userID := range options.IncludeAndroidUser {
+		if userID < 0 || uint64(userID) > maxAndroidUserID {
+			return E.New("invalid include_android_user: ", userID)
+		}
+	}
+	return nil
+}
+
+func hasAndroidUIDOptions(options LC.EBPFLocal) bool {
+	return len(options.IncludeAndroidUser) > 0 || len(options.IncludePackage) > 0 || len(options.ExcludePackage) > 0
+}
 
 func normalizeDNSMode(mode string) (string, error) {
 	switch mode {
 	case "", dnsModeHijack:
 		return dnsModeHijack, nil
-	case dnsModeOff:
-		return dnsModeOff, nil
+	case dnsModeRespectBypass, dnsModeOff:
+		return mode, nil
 	default:
 		return "", E.New("unknown eBPF dns_mode: ", mode)
 	}
@@ -38,48 +110,58 @@ func normalizeDNSMode(mode string) (string, error) {
 
 func normalizeCgroupIPv6Mode(mode string) (string, error) {
 	switch mode {
-	case "", cgroupIPv6ModeAlways:
-		return cgroupIPv6ModeAlways, nil
-	case cgroupIPv6ModeAuto, cgroupIPv6ModeOff:
+	case "", cgroupIPv6ModeAuto:
+		return cgroupIPv6ModeAuto, nil
+	case cgroupIPv6ModeAlways, cgroupIPv6ModeOff:
 		return mode, nil
 	default:
-		return "", E.New("unknown eBPF cgroup_ipv6_mode: ", mode)
+		return "", E.New("unknown eBPF local.ipv6_mode: ", mode)
 	}
 }
 
-func validateCgroupAddressFamilies(ipv6Mode string, ipv4Prefix netip.Prefix, ipv6Prefix netip.Prefix) error {
-	if !ipv4Prefix.IsValid() && (!ipv6Prefix.IsValid() || ipv6Mode == cgroupIPv6ModeOff) {
-		return E.New("eBPF local cgroup interception has no enabled address family")
+func normalizeSharedIPv6Mode(mode string) (string, error) {
+	switch mode {
+	case "", sharedIPv6ModeAlways:
+		return sharedIPv6ModeAlways, nil
+	case sharedIPv6ModeOff:
+		return sharedIPv6ModeOff, nil
+	default:
+		return "", E.New("unknown eBPF shared.ipv6_mode: ", mode)
 	}
-	return nil
 }
 
-func normalizeCgroupMapCapacity(options LC.EBPFMapCapacity) (ECommon.CgroupMapCapacity, error) {
+func normalizeCgroupMapCapacity(configured uint32) (ECommon.CgroupMapCapacity, error) {
 	capacity := ECommon.DefaultCgroupMapCapacity()
-	var err error
-	capacity.TCPRedirect, err = normalizeMapCapacityValue("map_capacity.tcp_redirect", options.TCPRedirect, capacity.TCPRedirect)
-	if err != nil {
-		return ECommon.CgroupMapCapacity{}, err
+	if configured == 0 {
+		return capacity, nil
 	}
-	capacity.UDPRedirect, err = normalizeMapCapacityValue("map_capacity.udp_redirect", options.UDPRedirect, capacity.UDPRedirect)
-	if err != nil {
-		return ECommon.CgroupMapCapacity{}, err
+	if configured > ECommon.MaxConfigurableMapCapacity {
+		return ECommon.CgroupMapCapacity{}, E.New(
+			"local.state_capacity must be between 0 and ",
+			ECommon.MaxConfigurableMapCapacity,
+		)
 	}
-	capacity.SocketBypass, err = normalizeMapCapacityValue("map_capacity.socket_bypass", options.SocketBypass, capacity.SocketBypass)
-	if err != nil {
-		return ECommon.CgroupMapCapacity{}, err
-	}
+	capacity.TCPRedirect = configured
+	capacity.UDPRedirect = configured
+	capacity.SocketBypass = configured
 	return capacity, nil
 }
 
-func normalizeMapCapacityValue(name string, configured uint32, defaultValue uint32) (uint32, error) {
+func normalizeSharedNetworkMapCapacity(configured uint32) (ECommon.SharedNetworkMapCapacities, error) {
+	capacity := ECommon.DefaultSharedNetworkMapCapacities()
 	if configured == 0 {
-		return defaultValue, nil
+		return capacity, nil
 	}
 	if configured > ECommon.MaxConfigurableMapCapacity {
-		return 0, E.New(name, " must be between 1 and ", ECommon.MaxConfigurableMapCapacity)
+		return ECommon.SharedNetworkMapCapacities{}, E.New(
+			"shared.state_capacity must be between 0 and ",
+			ECommon.MaxConfigurableMapCapacity,
+		)
 	}
-	return configured, nil
+	capacity.Proxy = configured
+	capacity.Bypass = configured
+	capacity.Fragment = configured
+	return capacity, nil
 }
 
 func normalizeCgroupPath(cgroupPath string) (string, error) {
@@ -90,38 +172,6 @@ func normalizeCgroupPath(cgroupPath string) (string, error) {
 		return "", E.New("eBPF cgroup_path must be absolute")
 	}
 	return filepath.Clean(cgroupPath), nil
-}
-
-func normalizeRedirectAddresses(addresses []netip.Prefix) (netip.Prefix, netip.Prefix, error) {
-	if len(addresses) == 0 {
-		return defaultRedirectIPv4Prefix, netip.Prefix{}, nil
-	}
-	var ipv4Prefix netip.Prefix
-	var ipv6Prefix netip.Prefix
-	for _, address := range addresses {
-		if !address.IsValid() {
-			return netip.Prefix{}, netip.Prefix{}, E.New("invalid eBPF redirect address")
-		}
-		address = address.Masked()
-		if err := ECommon.ValidateRedirectPrefix(address); err != nil {
-			return netip.Prefix{}, netip.Prefix{}, err
-		}
-		switch {
-		case address.Addr().Is4():
-			if ipv4Prefix.IsValid() {
-				return netip.Prefix{}, netip.Prefix{}, E.New("duplicate IPv4 eBPF redirect address")
-			}
-			ipv4Prefix = address
-		case address.Addr().Is6() && !address.Addr().Is4In6():
-			if ipv6Prefix.IsValid() {
-				return netip.Prefix{}, netip.Prefix{}, E.New("duplicate IPv6 eBPF redirect address")
-			}
-			ipv6Prefix = address
-		default:
-			return netip.Prefix{}, netip.Prefix{}, E.New("invalid eBPF redirect address family: ", address)
-		}
-	}
-	return ipv4Prefix, ipv6Prefix, nil
 }
 
 func parseUIDRanges(uidList []uint32, rangeList []string) ([]ECommon.UIDRange, error) {
@@ -156,24 +206,40 @@ func parseUIDRanges(uidList []uint32, rangeList []string) ([]ECommon.UIDRange, e
 	return uidRanges, nil
 }
 
-func validateAndroidUIDOptions(goos string, options LC.EBPF) error {
-	if !hasAndroidUIDOptions(options) {
-		return nil
+func normalizeSharedNetworkOptions(options LC.EBPFShared) (LC.EBPFShared, error) {
+	if len(options.Interface) == 0 {
+		return LC.EBPFShared{}, E.New("shared.interface must not be empty")
 	}
-	if goos != "android" {
-		return E.New("include_android_user, include_package, and exclude_package are only supported on Android")
+	if options.Advanced.TCPriority == 0 {
+		options.Advanced.TCPriority = defaultSharedNetworkTCPriority
 	}
-	const maxAndroidUserID = (uint64(^uint32(0)-1) - (androidUserRange - 1)) / androidUserRange
-	for _, userID := range options.IncludeAndroidUser {
-		if userID < 0 || uint64(userID) > maxAndroidUserID {
-			return E.New("invalid include_android_user: ", userID)
+	seen := make(map[string]struct{}, len(options.Interface))
+	interfaces := make([]string, 0, len(options.Interface))
+	for _, interfaceName := range options.Interface {
+		interfaceName = strings.TrimSpace(interfaceName)
+		if interfaceName == "" {
+			return LC.EBPFShared{}, E.New("shared.interface contains an empty interface name")
 		}
+		if interfaceName == "lo" {
+			return LC.EBPFShared{}, E.New("shared.interface must not contain lo")
+		}
+		if _, loaded := seen[interfaceName]; loaded {
+			continue
+		}
+		seen[interfaceName] = struct{}{}
+		interfaces = append(interfaces, interfaceName)
 	}
-	return nil
-}
-
-func hasAndroidUIDOptions(options LC.EBPF) bool {
-	return len(options.IncludeAndroidUser) > 0 || len(options.IncludePackage) > 0 || len(options.ExcludePackage) > 0
+	options.Interface = interfaces
+	var err error
+	options.IncludeSourceCIDR, err = normalizeSourceCIDRs(options.IncludeSourceCIDR)
+	if err != nil {
+		return LC.EBPFShared{}, err
+	}
+	options.ExcludeSourceCIDR, err = normalizeSourceCIDRs(options.ExcludeSourceCIDR)
+	if err != nil {
+		return LC.EBPFShared{}, err
+	}
+	return options, nil
 }
 
 func normalizeSourceCIDRs(prefixes []netip.Prefix) ([]netip.Prefix, error) {
@@ -181,7 +247,7 @@ func normalizeSourceCIDRs(prefixes []netip.Prefix) ([]netip.Prefix, error) {
 	seen := make(map[netip.Prefix]struct{}, len(prefixes))
 	for _, prefix := range prefixes {
 		if !prefix.IsValid() {
-			return nil, E.New("invalid shared-network source CIDR")
+			return nil, E.New("invalid shared source CIDR")
 		}
 		prefix = prefix.Masked()
 		if prefix.Addr().Is4In6() && prefix.Bits() >= 96 {
@@ -202,10 +268,10 @@ func parseSharedNetworkMACAddresses(name string, addresses []string) ([]ECommon.
 	for index, address := range addresses {
 		hardwareAddress, err := net.ParseMAC(address)
 		if err != nil {
-			return nil, E.Cause(err, "parse shared_network.", name, "[", index, "]")
+			return nil, E.Cause(err, "parse shared.", name, "[", index, "]")
 		}
 		if len(hardwareAddress) != len(ECommon.MACAddress{}) {
-			return nil, E.New("shared_network.", name, "[", index, "] must be a 48-bit MAC address")
+			return nil, E.New("shared.", name, "[", index, "] must be a 48-bit MAC address")
 		}
 		var mac ECommon.MACAddress
 		copy(mac[:], hardwareAddress)
@@ -218,27 +284,9 @@ func parseSharedNetworkMACAddresses(name string, addresses []string) ([]ECommon.
 	return parsed, nil
 }
 
-func normalizeSharedNetworkMapCapacity(options LC.EBPFSharedNetworkMapCapacity) (ECommon.SharedNetworkMapCapacities, error) {
-	capacity := ECommon.DefaultSharedNetworkMapCapacities()
-	var err error
-	capacity.Proxy, err = normalizeMapCapacityValuePtr("shared_network.map_capacity.proxy", options.Proxy, capacity.Proxy)
-	if err != nil {
-		return ECommon.SharedNetworkMapCapacities{}, err
+func validateSharedNetworkProtocols(enabled bool, enableUDP bool, dnsMode string) error {
+	if enabled && dnsMode != dnsModeOff && !enableUDP {
+		return E.New("shared mode with DNS interception requires UDP")
 	}
-	capacity.Bypass, err = normalizeMapCapacityValuePtr("shared_network.map_capacity.bypass", options.Bypass, capacity.Bypass)
-	if err != nil {
-		return ECommon.SharedNetworkMapCapacities{}, err
-	}
-	capacity.Fragment, err = normalizeMapCapacityValuePtr("shared_network.map_capacity.fragment", options.Fragment, capacity.Fragment)
-	if err != nil {
-		return ECommon.SharedNetworkMapCapacities{}, err
-	}
-	return capacity, nil
-}
-
-func normalizeMapCapacityValuePtr(name string, configured *uint32, defaultValue uint32) (uint32, error) {
-	if configured == nil {
-		return defaultValue, nil
-	}
-	return normalizeMapCapacityValue(name, *configured, defaultValue)
+	return nil
 }

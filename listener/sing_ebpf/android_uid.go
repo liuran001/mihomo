@@ -25,7 +25,7 @@ type androidUIDOptions struct {
 	excludePackage     []string
 }
 
-func newAndroidUIDOptions(options LC.EBPF) *androidUIDOptions {
+func newAndroidUIDOptions(options LC.EBPFLocal) *androidUIDOptions {
 	if !hasAndroidUIDOptions(options) {
 		return nil
 	}

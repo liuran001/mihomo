@@ -2,45 +2,46 @@ package config
 
 import (
 	"net/netip"
-	"strconv"
 	"strings"
 )
 
 type EBPF struct {
-	Network              []string          `json:"network" yaml:"network"`
-	UDPTimeout           int64             `json:"udp-timeout" yaml:"udp-timeout"`
-	DNSMode              string            `json:"dns-mode" yaml:"dns-mode"`
-	CgroupIPv6Mode       string            `json:"cgroup-ipv6-mode" yaml:"cgroup-ipv6-mode"`
-	CgroupPath           string            `json:"cgroup-path" yaml:"cgroup-path"`
-	RedirectAddress      []netip.Prefix    `json:"redirect-address" yaml:"redirect-address"`
-	BypassPrivateAddress *bool             `json:"bypass-private-address" yaml:"bypass-private-address" inbound:"bypass-private-address,omitempty"`
-	BypassRuleSet        []string          `json:"bypass-rule-set" yaml:"bypass-rule-set"`
-	IncludeUID           []uint32          `json:"include-uid" yaml:"include-uid"`
-	IncludeUIDRange      []string          `json:"include-uid-range" yaml:"include-uid-range"`
-	ExcludeUID           []uint32          `json:"exclude-uid" yaml:"exclude-uid"`
-	ExcludeUIDRange      []string          `json:"exclude-uid-range" yaml:"exclude-uid-range"`
-	IncludeAndroidUser   []int             `json:"include-android-user" yaml:"include-android-user"`
-	IncludePackage       []string          `json:"include-package" yaml:"include-package"`
-	ExcludePackage       []string          `json:"exclude-package" yaml:"exclude-package"`
-	MapCapacity          EBPFMapCapacity   `json:"map-capacity" yaml:"map-capacity"`
-	SharedNetwork        EBPFSharedNetwork `json:"shared-network" yaml:"shared-network"`
+	Mode                 string     `json:"mode" yaml:"mode" inbound:"mode,omitempty"`
+	Network              []string   `json:"network" yaml:"network"`
+	UDPTimeout           int64      `json:"udp-timeout" yaml:"udp-timeout"`
+	DNSMode              string     `json:"dns-mode" yaml:"dns-mode"`
+	BypassPrivateAddress *bool      `json:"bypass-private-address" yaml:"bypass-private-address" inbound:"bypass-private-address,omitempty"`
+	BypassRuleSet        []string   `json:"bypass-rule-set" yaml:"bypass-rule-set"`
+	Local                EBPFLocal  `json:"local" yaml:"local" inbound:"local,omitempty"`
+	Shared               EBPFShared `json:"shared" yaml:"shared" inbound:"shared,omitempty"`
 }
 
-type EBPFSharedNetwork struct {
-	Enabled           bool                         `json:"enabled" yaml:"enabled" inbound:"enabled,omitempty"`
-	IncludeInterface  []string                     `json:"include-interface" yaml:"include-interface" inbound:"include-interface,omitempty"`
-	IncludeSourceCIDR []netip.Prefix               `json:"include-source-cidr" yaml:"include-source-cidr" inbound:"include-source-cidr,omitempty"`
-	ExcludeSourceCIDR []netip.Prefix               `json:"exclude-source-cidr" yaml:"exclude-source-cidr" inbound:"exclude-source-cidr,omitempty"`
-	IncludeMACAddress []string                     `json:"include-mac-address" yaml:"include-mac-address" inbound:"include-mac-address,omitempty"`
-	ExcludeMACAddress []string                     `json:"exclude-mac-address" yaml:"exclude-mac-address" inbound:"exclude-mac-address,omitempty"`
-	TCPriority        uint16                       `json:"tc-priority" yaml:"tc-priority" inbound:"tc-priority,omitempty"`
-	MapCapacity       EBPFSharedNetworkMapCapacity `json:"map-capacity" yaml:"map-capacity" inbound:"map-capacity,omitempty"`
+type EBPFLocal struct {
+	CgroupPath         string   `json:"cgroup-path" yaml:"cgroup-path" inbound:"cgroup-path,omitempty"`
+	IPv6Mode           string   `json:"ipv6-mode" yaml:"ipv6-mode" inbound:"ipv6-mode,omitempty"`
+	IncludeUID         []uint32 `json:"include-uid" yaml:"include-uid" inbound:"include-uid,omitempty"`
+	IncludeUIDRange    []string `json:"include-uid-range" yaml:"include-uid-range" inbound:"include-uid-range,omitempty"`
+	ExcludeUID         []uint32 `json:"exclude-uid" yaml:"exclude-uid" inbound:"exclude-uid,omitempty"`
+	ExcludeUIDRange    []string `json:"exclude-uid-range" yaml:"exclude-uid-range" inbound:"exclude-uid-range,omitempty"`
+	IncludeAndroidUser []int    `json:"include-android-user" yaml:"include-android-user" inbound:"include-android-user,omitempty"`
+	IncludePackage     []string `json:"include-package" yaml:"include-package" inbound:"include-package,omitempty"`
+	ExcludePackage     []string `json:"exclude-package" yaml:"exclude-package" inbound:"exclude-package,omitempty"`
+	StateCapacity      uint32   `json:"state-capacity" yaml:"state-capacity" inbound:"state-capacity,omitempty"`
 }
 
-type EBPFSharedNetworkMapCapacity struct {
-	Proxy    *uint32 `json:"proxy" yaml:"proxy" inbound:"proxy,omitempty"`
-	Bypass   *uint32 `json:"bypass" yaml:"bypass" inbound:"bypass,omitempty"`
-	Fragment *uint32 `json:"fragment" yaml:"fragment" inbound:"fragment,omitempty"`
+type EBPFShared struct {
+	Interface         []string           `json:"interface" yaml:"interface" inbound:"interface,omitempty"`
+	IPv6Mode          string             `json:"ipv6-mode" yaml:"ipv6-mode" inbound:"ipv6-mode,omitempty"`
+	IncludeSourceCIDR []netip.Prefix     `json:"include-source-cidr" yaml:"include-source-cidr" inbound:"include-source-cidr,omitempty"`
+	ExcludeSourceCIDR []netip.Prefix     `json:"exclude-source-cidr" yaml:"exclude-source-cidr" inbound:"exclude-source-cidr,omitempty"`
+	IncludeMACAddress []string           `json:"include-mac-address" yaml:"include-mac-address" inbound:"include-mac-address,omitempty"`
+	ExcludeMACAddress []string           `json:"exclude-mac-address" yaml:"exclude-mac-address" inbound:"exclude-mac-address,omitempty"`
+	StateCapacity     uint32             `json:"state-capacity" yaml:"state-capacity" inbound:"state-capacity,omitempty"`
+	Advanced          EBPFSharedAdvanced `json:"advanced" yaml:"advanced" inbound:"advanced,omitempty"`
+}
+
+type EBPFSharedAdvanced struct {
+	TCPriority uint16 `json:"tc-priority" yaml:"tc-priority" inbound:"tc-priority,omitempty"`
 }
 
 type EBPFMapCapacity struct {
@@ -51,27 +52,11 @@ type EBPFMapCapacity struct {
 
 func (c EBPF) String() string {
 	builder := &strings.Builder{}
-	builder.WriteString("network=")
+	builder.WriteString("mode=")
+	builder.WriteString(c.Mode)
+	builder.WriteString(", network=")
 	builder.WriteString(strings.Join(c.Network, ","))
-	if c.CgroupPath != "" {
-		builder.WriteString(", cgroup_path=")
-		builder.WriteString(c.CgroupPath)
-	}
-	builder.WriteString(", redirect_address=")
-	for index, prefix := range c.RedirectAddress {
-		if index > 0 {
-			builder.WriteByte(',')
-		}
-		builder.WriteString(prefix.String())
-	}
 	builder.WriteString(", dns_mode=")
 	builder.WriteString(c.DNSMode)
-	builder.WriteString(", map_capacity={tcp_redirect:")
-	builder.WriteString(strconv.FormatUint(uint64(c.MapCapacity.TCPRedirect), 10))
-	builder.WriteString(", udp_redirect:")
-	builder.WriteString(strconv.FormatUint(uint64(c.MapCapacity.UDPRedirect), 10))
-	builder.WriteString(", socket_bypass:")
-	builder.WriteString(strconv.FormatUint(uint64(c.MapCapacity.SocketBypass), 10))
-	builder.WriteByte('}')
 	return builder.String()
 }

@@ -12,7 +12,7 @@ import (
 )
 
 func TestValidateAndroidUIDOptions(t *testing.T) {
-	androidOptions := LC.EBPF{
+	androidOptions := LC.EBPFLocal{
 		IncludeAndroidUser: []int{0, 10},
 		IncludePackage:     []string{"com.example.include"},
 		ExcludePackage:     []string{"com.example.exclude"},
