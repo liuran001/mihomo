@@ -255,3 +255,76 @@ jobs:
           CGO_ENABLED=0 GOOS=windows GOARCH=amd64 go build -tags with_gvisor -trimpath -o mihomo-windows-amd64.exe .
           CGO_ENABLED=0 GOOS=darwin GOARCH=arm64 go build -tags with_gvisor -trimpath -o mihomo-darwin-arm64 .
           CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -tags with_gvisor -trimpath -o mihomo-linux-noebpf .
+  release:
+    needs: build
+    # Only push-triggered builds publish the rolling prerelease; manual
+    # (workflow_dispatch) and pull_request runs build artifacts only.
+    if: ${{ github.event_name == 'push' }}
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: v1.19.22-ebpf
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - uses: actions/download-artifact@v7
+        with:
+          path: artifacts
+
+      - name: Assemble release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          commit_sha="${{ github.sha }}"
+          commit_msg="$(git log -1 --format=%s "$commit_sha" 2>/dev/null || git log -1 --format=%s)"
+          upstream_sha="$(sed -n '1p' "$(find artifacts -path '*/build/UPSTREAM_SHA' | head -1)")"
+          version="$(sed -n '1p' "$(find artifacts -path '*/build/VERSION' | head -1)")"
+          {
+            echo "## 本次构建"
+            echo "- 触发: ${{ github.event_name }} (${{ github.ref }})"
+            echo "- 提交: \`${commit_sha}\` — ${commit_msg}"
+            echo "- 上游 Alpha: \`${upstream_sha}\`"
+            echo "- 版本: \`${version}\`"
+            echo
+            echo "## 二进制"
+            for f in $(find artifacts -type f -name 'mihomo-ebpf-*' ! -name '*.sha256' | sort); do
+              [ -f "$f" ] || continue
+              name="$(basename "$f")"
+              sha="$(sha256sum "$f" | awk '{print $1}')"
+              echo "- \`${name}\`: ${sha}"
+            done
+          } > notes.md
+
+      - name: Create or update rolling prerelease
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh release create "${RELEASE_TAG}" \
+            --repo "${{ github.repository }}" \
+            --title "mihomo Meta — eBPF inbound (${RELEASE_TAG})" \
+            --notes-file notes.md \
+            --prerelease --clobber || true
+          gh release edit "${RELEASE_TAG}" \
+            --repo "${{ github.repository }}" \
+            --notes-file notes.md || true
+
+      - name: Upload assets (deduped, clobber)
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mapfile -t assets < <(find artifacts -type f \
+            \( -name 'mihomo-ebpf-*' -o -name '*.sha256' \) | sort -u)
+          if [ "${#assets[@]}" -eq 0 ]; then
+            echo "no build assets found" >&2
+            exit 1
+          fi
+          gh release upload "${RELEASE_TAG}" "${assets[@]}" \
+            --repo "${{ github.repository }}" \
+            --clobber
