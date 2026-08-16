@@ -1,3 +1,5 @@
+//go:build with_ebpf && (linux || android)
+
 package ebpf
 
 import (
@@ -14,16 +16,16 @@ import (
 const (
 	maxUIDPolicyEntries        = 4096
 	maxBypassCIDRPolicyEntries = 65536
-	androidDNSTetherUID        = 1052
 )
 
 type CgroupPolicy struct {
-	EnableBypassCIDR        bool
-	HijackDNS               bool
-	IncludeUIDConfigured    bool
-	IncludeUID              []UIDRange
-	ExcludeUID              []UIDRange
-	ExcludeAndroidDNSTether bool
+	EnableBypassCIDR     bool
+	HijackDNS            bool
+	DNSRespectBypass     bool
+	BypassPrivateAddress bool
+	IncludeUIDConfigured bool
+	IncludeUID           []UIDRange
+	ExcludeUID           []UIDRange
 }
 
 type UIDRange struct {
@@ -61,12 +63,6 @@ func compileUIDPolicy(policy CgroupPolicy) ([]uidLPMKey, bool, error) {
 	uidRanges := policy.ExcludeUID
 	if defaultBypass {
 		uidRanges = subtractUIDRanges(policy.IncludeUID, policy.ExcludeUID)
-	}
-	if policy.ExcludeAndroidDNSTether {
-		uidRanges = subtractUIDRanges(uidRanges, []UIDRange{{
-			Start: androidDNSTetherUID,
-			End:   androidDNSTetherUID,
-		}})
 	}
 	entries := compileUIDRanges(uidRanges)
 	if len(entries) > maxUIDPolicyEntries {

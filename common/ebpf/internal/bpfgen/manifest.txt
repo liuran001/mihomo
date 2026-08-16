@@ -1,0 +1,20 @@
+generator: Android NDK r29 Clang 21
+targets: bpfel,bpfeb
+cflags: -mcpu=v1 -O2 -g0 -ffreestanding -nostdinc -Inative -isystem <clang-resource>/include -isystem <ndk-sysroot>/usr/include -isystem <ndk-sysroot>/usr/include/aarch64-linux-android
+include_environment: cleared
+bpf2go: v0.22.1-0.20260724091036-00feb08ae4e5
+clang: Android (13989888, +pgo, +bolt, +lto, +mlgo, based on r563880c) clang version 21.0.0 (https://android.googlesource.com/toolchain/llvm-project 5e96669f06077099aa41290cdb4c5e6fa0f59349)
+fa9bf5ef6208dbb6f9ba05f6c95e421330536b846ea6d6d5946eab3b9e313bc7  native/abi.h
+9eff464b63eb7eb2324e3f75d9c1d5c8d8021bd9865a7a703e3475ace9fa48f0  native/bpf_compat.h
+3045a051b8cbab6a0dc3eb82b34c07b41496cf580748125e7d3676df9a77dfe7  native/cgroup.bpf.c
+0e8f1b93ef8f064996a7760a457019d8adcb668b29642a27a5cb3a99f5eb3205  native/private_address.h
+5b3e69dcb3773432e002dffea68ff59539715c1685d8e15f0b6f9c5cd1bc8440  native/shared_network.bpf.c
+1889113007bcf4c5077356dfa3818c4072a1c5f82dfc7715d048755ee7f64ece  native/shared_network.h
+191eadc263238988c3ec080c64d724fb9d1b4d0606f0dcb1f05444aa9fd75431  native/shared_network_flow.h
+8e21c1be9fcb8d667f14706fe681c4c4d382250856fe583c8a22c7e32a3372ff  native/shared_network_packet.h
+10191971adc8a17017116c518531f3ef2b09f40cac2532dd6411e7043ece81bf  native/shared_network_policy.h
+488fb2b99f1c09d35cf24895f25e9c1ec46b0a6040cf15884c5cfb07ae09d45c  native/shared_network_rewrite.h
+c48cb80c620e013ac6c3cd6b50f89a6497488c0e51d5597af9368ad75e159756  internal/bpfgen/cgroup_bpfeb.o
+5e4fc864ffca041c0eb389c0ac35d411952ac1ce151d3524858f51b8f522e633  internal/bpfgen/cgroup_bpfel.o
+1865592ac0a068d446544975edccb3facdb9a32a53a758089fbc7c7d558c77df  internal/bpfgen/shared_network_bpfeb.o
+8fd306fcfb911dce89f06da3f322aa645a653806e5f2546bbeb12ba0ffe0bf10  internal/bpfgen/shared_network_bpfel.o

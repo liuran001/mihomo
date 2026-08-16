@@ -1,6 +1,9 @@
+//go:build with_ebpf && (linux || android)
+
 package ebpf
 
 import (
+	"encoding/binary"
 	"net"
 	"net/netip"
 	"time"
@@ -9,24 +12,83 @@ import (
 )
 
 const (
-	ProtocolTCP                = 6
-	ProtocolUDP                = 17
-	TCPRedirectMapCapacity     = 65536
-	UDPRedirectMapCapacity     = 65536
-	SocketBypassMapCapacity    = 65536
-	SharedNetworkMapCapacity   = 65536
-	MaxConfigurableMapCapacity = 1 << 20
-	udpFlowActionProxy         = 1
-	udpFlowActionBypass        = 2
+	ProtocolTCP                  = 6
+	ProtocolUDP                  = 17
+	TCPRedirectMapCapacity       = 65536
+	UDPRedirectMapCapacity       = 65536
+	SocketBypassMapCapacity      = 65536
+	SharedNetworkMapCapacity     = 65536
+	MaxConfigurableMapCapacity   = 1 << 20
+	cgroupStatTCPRedirectFailure = 0
+	cgroupStatUDPRedirectFailure
+	udpFlowActionProxy  = 1
+	udpFlowActionBypass = 2
 
 	addressFamilyIPv4 = 2
 	addressFamilyIPv6 = 10
 )
 
+const (
+	cgroupFlagTCP = 1 << iota
+	cgroupFlagUDP
+	cgroupFlagIPv4
+	cgroupFlagIPv6
+	cgroupFlagHijackDNS
+	cgroupFlagUIDPolicy
+	cgroupFlagUIDDefaultBypass
+	cgroupFlagBypassIPv4
+	cgroupFlagBypassIPv6
+	cgroupFlagAutoIPv6
+	cgroupFlagUDPFlow
+	cgroupFlagBypassPrivateAddress
+	cgroupFlagDNSRespectBypass
+)
+
+type cgroupControl struct {
+	Flags                uint32
+	SelfTGID             uint32
+	UDPTimeoutSeconds    uint32
+	RedirectIPv4Prefix   uint32
+	RedirectIPv4HostMask uint32
+	ListenerPort         uint16
+	Reserved             uint16
+	RedirectIPv6Prefix   [8]byte
+}
+
+type udpPeerKey struct {
+	SocketCookie uint64
+}
+
+type udpPeerValue struct {
+	Family   uint8
+	Protocol uint8
+	Port     uint16
+	Addr     [16]byte
+}
+
+func cgroupIPv4Redirect(prefix netip.Prefix) (uint32, uint32) {
+	if !prefix.IsValid() {
+		return 0, 0
+	}
+	hostMask := uint32(1<<(32-prefix.Bits())) - 1
+	return binary.BigEndian.Uint32(prefix.Addr().AsSlice()) &^ hostMask, hostMask
+}
+
 type CgroupMapCapacity struct {
 	TCPRedirect  uint32
 	UDPRedirect  uint32
 	SocketBypass uint32
+}
+
+type MapUsage struct {
+	Entries  uint32
+	Capacity uint32
+}
+
+type CgroupTCPRedirectSweepResult struct {
+	Scanned uint32
+	Removed uint32
+	Usage   MapUsage
 }
 
 type SharedNetworkMapCapacities struct {
@@ -86,6 +148,7 @@ type originalDestinationValue struct {
 	Flags        uint8
 	Reserved     [3]byte
 	SocketCookie uint64
+	CreatedAtNS  uint64
 }
 
 type udpFlowKey struct {

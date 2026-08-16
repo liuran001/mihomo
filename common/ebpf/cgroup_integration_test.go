@@ -1,4 +1,4 @@
-//go:build with_ebpf && (linux || android) && cgo && ebpf_integration
+//go:build with_ebpf && (linux || android) && ebpf_integration
 
 package ebpf
 
@@ -74,16 +74,39 @@ func TestCgroupBackendProgramLoadIntegration(t *testing.T) {
 			}
 		}
 	}
+	t.Run("bypass_private_address", func(t *testing.T) {
+		testCgroupBackendProgramLoad(t, cgroupProgramLoadOptions{
+			enableTCP:            true,
+			enableUDP:            true,
+			enableIPv6:           true,
+			bypassPrivateAddress: true,
+			selfTGID:             uint32(os.Getpid()),
+			expectedSelfBypass:   "tgid",
+		})
+	})
+	t.Run("dns_respect_bypass", func(t *testing.T) {
+		testCgroupBackendProgramLoad(t, cgroupProgramLoadOptions{
+			enableTCP:          true,
+			enableUDP:          true,
+			enableIPv6:         true,
+			hijackDNS:          true,
+			dnsRespectBypass:   true,
+			selfTGID:           uint32(os.Getpid()),
+			expectedSelfBypass: "tgid",
+		})
+	})
 }
 
 type cgroupProgramLoadOptions struct {
-	enableTCP          bool
-	enableUDP          bool
-	enableIPv6         bool
-	autoIPv6           bool
-	hijackDNS          bool
-	selfTGID           uint32
-	expectedSelfBypass string
+	enableTCP            bool
+	enableUDP            bool
+	enableIPv6           bool
+	autoIPv6             bool
+	hijackDNS            bool
+	bypassPrivateAddress bool
+	dnsRespectBypass     bool
+	selfTGID             uint32
+	expectedSelfBypass   string
 }
 
 func testCgroupBackendProgramLoad(t *testing.T, options cgroupProgramLoadOptions) {
@@ -98,7 +121,11 @@ func testCgroupBackendProgramLoad(t *testing.T, options cgroupProgramLoadOptions
 		RedirectIPv6:  netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
 		MapCapacity:   DefaultCgroupMapCapacity(),
 		UDPTimeout:    5 * time.Minute,
-		Policy:        CgroupPolicy{HijackDNS: options.hijackDNS},
+		Policy: CgroupPolicy{
+			HijackDNS:            options.hijackDNS,
+			BypassPrivateAddress: options.bypassPrivateAddress,
+			DNSRespectBypass:     options.dnsRespectBypass,
+		},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -108,6 +135,45 @@ func testCgroupBackendProgramLoad(t *testing.T, options cgroupProgramLoadOptions
 			t.Errorf("close eBPF backend: %v", err)
 		}
 	})
+	if options.enableTCP {
+		usage, usageErr := backend.RedirectMapUsage(ProtocolTCP)
+		if !errors.Is(usageErr, unix.ENODATA) {
+			t.Fatalf("unexpected TCP usage error before first sweep: %v", usageErr)
+		}
+		if usage.Entries != 0 || usage.Capacity != backend.mapCapacity.TCPRedirect {
+			t.Fatalf("unexpected TCP usage before first sweep: %+v", usage)
+		}
+		sweep, sweepErr := backend.SweepStaleTCPRedirects(time.Nanosecond)
+		if sweepErr != nil {
+			t.Fatal(sweepErr)
+		}
+		if sweep.Scanned != 0 || sweep.Removed != 0 ||
+			sweep.Usage != (MapUsage{Capacity: backend.mapCapacity.TCPRedirect}) {
+			t.Fatalf("unexpected empty TCP sweep result: %+v", sweep)
+		}
+		usage, usageErr = backend.RedirectMapUsage(ProtocolTCP)
+		if usageErr != nil {
+			t.Fatal(usageErr)
+		}
+		if usage != (MapUsage{Capacity: backend.mapCapacity.TCPRedirect}) {
+			t.Fatalf("unexpected cached TCP usage: %+v", usage)
+		}
+	}
+	for _, protocol := range []struct {
+		enabled bool
+		value   uint8
+	}{
+		{options.enableTCP, ProtocolTCP},
+		{options.enableUDP, ProtocolUDP},
+	} {
+		if !protocol.enabled {
+			continue
+		}
+		failures, failureErr := backend.RedirectReservationFailures(protocol.value)
+		if failureErr != nil || failures != 0 {
+			t.Fatalf("unexpected redirect reservation failures: count=%d err=%v", failures, failureErr)
+		}
+	}
 	pendingSocket := prepareProtectedIntegrationSocket(t, backend, "udp4", unix.SOCK_DGRAM, unix.IPPROTO_UDP)
 	defer pendingSocket.Close()
 	pendingCookie, err := readSocketCookie(pendingSocket.Fd())
@@ -206,21 +272,25 @@ func TestSharedNetworkSharedMapProgramLoadIntegration(t *testing.T) {
 			dnsMode = "hijack"
 		}
 		t.Run(dnsMode, func(t *testing.T) {
-			prepareSharedNetworkProgramLoad(t, backend, hijackDNS, true)
+			prepareSharedNetworkProgramLoad(t, backend, hijackDNS, false, true)
 		})
 	}
+	t.Run("respect_bypass", func(t *testing.T) {
+		prepareSharedNetworkProgramLoad(t, backend, true, true, true)
+	})
 	t.Run("proxy_private", func(t *testing.T) {
-		prepareSharedNetworkProgramLoad(t, backend, true, false)
+		prepareSharedNetworkProgramLoad(t, backend, true, false, false)
 	})
 }
 
-func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend, hijackDNS bool, bypassPrivateAddress bool) *SharedNetworkBackend {
+func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend, hijackDNS bool, dnsRespectBypass bool, bypassPrivateAddress bool) *SharedNetworkBackend {
 	t.Helper()
 	sharedBackend, err := PrepareSharedNetwork(cgroupBackend, SharedNetworkConfig{
 		ListenerPort:         65531,
 		EnableTCP:            true,
 		EnableUDP:            true,
 		HijackDNS:            hijackDNS,
+		DNSRespectBypass:     dnsRespectBypass,
 		BypassPrivateAddress: bypassPrivateAddress,
 		RedirectIPv4:         netip.MustParsePrefix("127.128.0.0/9"),
 		RedirectIPv6:         netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
@@ -241,11 +311,40 @@ func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend,
 			t.Errorf("close shared-network token backend: %v", err)
 		}
 	})
+	failures, failureErr := sharedBackend.TokenReservationFailures()
+	if failureErr != nil || failures != 0 {
+		t.Fatalf("unexpected token reservation failures: count=%d err=%v", failures, failureErr)
+	}
+	usage, usageErr := sharedBackend.ProxyMapUsage()
+	if !errors.Is(usageErr, unix.ENODATA) {
+		t.Fatalf("unexpected proxy usage error before first sweep: %v", usageErr)
+	}
+	if usage.Entries != 0 || usage.Capacity != sharedBackend.mapCapacity.Proxy {
+		t.Fatalf("unexpected proxy usage before first sweep: %+v", usage)
+	}
+	sweep, sweepErr := sharedBackend.SweepOrphanedFlows(time.Nanosecond)
+	if sweepErr != nil {
+		t.Fatal(sweepErr)
+	}
+	if sweep.Scanned != 0 || sweep.Removed != 0 || sweep.Retained != 0 ||
+		sweep.Usage != (MapUsage{Capacity: sharedBackend.mapCapacity.Proxy}) {
+		t.Fatalf("unexpected empty shared-network sweep result: %+v", sweep)
+	}
+	usage, usageErr = sharedBackend.ProxyMapUsage()
+	if usageErr != nil {
+		t.Fatal(usageErr)
+	}
+	if usage != (MapUsage{Capacity: sharedBackend.mapCapacity.Proxy}) {
+		t.Fatalf("unexpected cached proxy usage: %+v", usage)
+	}
 	if sharedBackend.IngressProgramFD() < 0 || sharedBackend.EgressProgramFD() < 0 {
 		t.Fatal("shared-network token programs were not loaded")
 	}
 	if hasDNSHijack := sharedBackend.control.Flags&sharedNetworkFlagDNSHijack != 0; hasDNSHijack != hijackDNS {
 		t.Fatalf("unexpected shared-network DNS hijack flag: %t", hasDNSHijack)
+	}
+	if respectsDNSBypass := sharedBackend.control.Flags&sharedNetworkFlagDNSRespectBypass != 0; respectsDNSBypass != dnsRespectBypass {
+		t.Fatalf("unexpected shared-network DNS respect-bypass flag: %t", respectsDNSBypass)
 	}
 	if hasBypassPrivateAddress := sharedBackend.control.Flags&sharedNetworkFlagBypassPrivateAddress != 0; hasBypassPrivateAddress != bypassPrivateAddress {
 		t.Fatalf("unexpected shared-network private-address bypass flag: %t", hasBypassPrivateAddress)
@@ -875,7 +974,7 @@ func TestCgroupBackendTrafficHelper(t *testing.T) {
 
 func TestSharedNetworkStandaloneProgramLoadIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "load standalone shared-network programs")
-	backend := prepareSharedNetworkProgramLoad(t, nil, true, true)
+	backend := prepareSharedNetworkProgramLoad(t, nil, true, false, true)
 	updated, err := backend.UpdateBypassCIDR([]netip.Prefix{
 		netip.MustParsePrefix("198.51.100.0/24"),
 		netip.MustParsePrefix("2001:db8::/32"),

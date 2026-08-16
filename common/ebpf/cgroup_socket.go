@@ -1,4 +1,4 @@
-//go:build with_ebpf && (linux || android) && cgo
+//go:build with_ebpf && (linux || android)
 
 package ebpf
 
@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/netip"
 	"syscall"
+	"time"
 	"unsafe"
 
 	"github.com/metacubex/sing/common/control"
@@ -25,16 +26,9 @@ func (b *CgroupBackend) SocketProtectFunc() control.Func {
 		return nil
 	}
 	return func(network string, address string, rawConn syscall.RawConn) error {
-		b.access.RLock()
-		if b.runtime == nil {
-			b.access.RUnlock()
-			return errBackendClosed
-		}
-		if b.runtime.self_bypass_tgid {
-			b.access.RUnlock()
+		if b.selfBypassTGID.Load() {
 			return nil
 		}
-		b.access.RUnlock()
 		return control.Raw(rawConn, func(fd uintptr) error {
 			cookie, err := readSocketCookie(fd)
 			if err != nil {
@@ -166,6 +160,125 @@ func mapLookupAndDeleteUnavailable(err error) bool {
 		errors.Is(err, linuxErrnoNotSupported)
 }
 
+type tcpRedirectEntry struct {
+	key   listenerLookupKey
+	value originalDestinationValue
+}
+
+func (b *CgroupBackend) SweepStaleTCPRedirects(maxAge time.Duration) (CgroupTCPRedirectSweepResult, error) {
+	if b == nil {
+		return CgroupTCPRedirectSweepResult{}, errBackendClosed
+	}
+	if maxAge <= 0 {
+		return CgroupTCPRedirectSweepResult{}, unix.EINVAL
+	}
+	b.tcpSweepAccess.Lock()
+	defer b.tcpSweepAccess.Unlock()
+
+	var now unix.Timespec
+	if err := unix.ClockGettime(unix.CLOCK_MONOTONIC, &now); err != nil {
+		return CgroupTCPRedirectSweepResult{}, err
+	}
+	nowNS := uint64(now.Sec)*uint64(time.Second) + uint64(now.Nsec)
+	maxAgeNS := uint64(maxAge)
+	if nowNS <= maxAgeNS {
+		return CgroupTCPRedirectSweepResult{Usage: MapUsage{Capacity: b.mapCapacity.TCPRedirect}}, nil
+	}
+	staleBefore := nowNS - maxAgeNS
+
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return CgroupTCPRedirectSweepResult{}, errBackendClosed
+	}
+	b.tcpSweepCandidates = b.tcpSweepCandidates[:0]
+	scanned, err := b.tcpSweepScratch.scan(
+		b.tcpRedirectMapFD,
+		b.mapCapacity.TCPRedirect,
+		func(key listenerLookupKey, value originalDestinationValue) {
+			if value.CreatedAtNS != 0 && value.CreatedAtNS <= staleBefore {
+				b.tcpSweepCandidates = append(b.tcpSweepCandidates, tcpRedirectEntry{key: key, value: value})
+			}
+		},
+	)
+	if err != nil {
+		return CgroupTCPRedirectSweepResult{}, err
+	}
+	result := CgroupTCPRedirectSweepResult{
+		Scanned: scanned,
+		Usage:   MapUsage{Entries: scanned, Capacity: b.mapCapacity.TCPRedirect},
+	}
+	var sweepErr error
+	for _, entry := range b.tcpSweepCandidates {
+		var current originalDestinationValue
+		if err = lookupMap(b.tcpRedirectMapFD, unsafe.Pointer(&entry.key), unsafe.Pointer(&current)); err != nil {
+			if !errors.Is(err, unix.ENOENT) {
+				sweepErr = E.Errors(sweepErr, err)
+			}
+			continue
+		}
+		if current != entry.value {
+			continue
+		}
+		if err = deleteMap(b.tcpRedirectMapFD, unsafe.Pointer(&entry.key)); err != nil {
+			if !errors.Is(err, unix.ENOENT) {
+				sweepErr = E.Errors(sweepErr, err)
+			}
+			continue
+		}
+		result.Removed++
+	}
+	result.Usage.Entries -= result.Removed
+	b.tcpRedirectUsage.Store(result.Usage.Entries)
+	b.tcpRedirectUsageKnown.Store(true)
+	return result, sweepErr
+}
+
+func (b *CgroupBackend) RedirectMapUsage(protocol uint8) (MapUsage, error) {
+	if b == nil {
+		return MapUsage{}, errBackendClosed
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return MapUsage{}, errBackendClosed
+	}
+	if protocol == ProtocolTCP {
+		usage := MapUsage{
+			Entries:  b.tcpRedirectUsage.Load(),
+			Capacity: b.mapCapacity.TCPRedirect,
+		}
+		if !b.tcpRedirectUsageKnown.Load() {
+			return usage, unix.ENODATA
+		}
+		return usage, nil
+	}
+	mapFD, err := b.redirectMap(protocol)
+	if err != nil {
+		return MapUsage{}, err
+	}
+	entries, err := countMapEntries(
+		mapFD,
+		unsafe.Sizeof(listenerLookupKey{}),
+		b.mapCapacity.UDPRedirect,
+	)
+	return MapUsage{Entries: entries, Capacity: b.mapCapacity.UDPRedirect}, err
+}
+
+func (b *CgroupBackend) LookupAndDeleteMode() string {
+	if b == nil {
+		return "unavailable"
+	}
+	switch b.lookupAndDeleteMode.Load() {
+	case mapLookupAndDeleteSupported:
+		return "atomic"
+	case mapLookupAndDeleteUnsupported:
+		return "lookup_delete_fallback"
+	default:
+		return "unknown"
+	}
+}
+
 func (b *CgroupBackend) DeleteRedirect(protocol uint8, listenerDestination netip.AddrPort) error {
 	if b == nil {
 		return errBackendClosed
@@ -215,4 +328,29 @@ func (b *CgroupBackend) redirectMap(protocol uint8) (int, error) {
 	default:
 		return -1, E.New("unsupported eBPF redirect protocol: ", protocol)
 	}
+}
+
+func (b *CgroupBackend) RedirectReservationFailures(protocol uint8) (uint64, error) {
+	if b == nil {
+		return 0, errBackendClosed
+	}
+	var key uint32
+	switch protocol {
+	case ProtocolTCP:
+		key = cgroupStatTCPRedirectFailure
+	case ProtocolUDP:
+		key = cgroupStatUDPRedirectFailure
+	default:
+		return 0, unix.EPROTONOSUPPORT
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return 0, errBackendClosed
+	}
+	var failures uint64
+	if err := lookupMap(b.statsMapFD, unsafe.Pointer(&key), unsafe.Pointer(&failures)); err != nil {
+		return 0, err
+	}
+	return failures, nil
 }

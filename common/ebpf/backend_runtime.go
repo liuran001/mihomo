@@ -1,13 +1,15 @@
-//go:build with_ebpf && (linux || android) && cgo
+//go:build with_ebpf && (linux || android)
 
 package ebpf
 
 import (
+	"errors"
 	"syscall"
-	"unsafe"
 
 	E "github.com/metacubex/sing/common/exceptions"
 
+	CiliumEBPF "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/features"
 	"golang.org/x/sys/unix"
 )
 
@@ -45,23 +47,8 @@ func checkKernelCapabilities(scope string, cgroupPath string) error {
 		}
 	}
 
-	attribute := mapCreateAttr{
-		MapType:    bpfMapTypeArray,
-		KeySize:    4,
-		ValueSize:  4,
-		MaxEntries: 1,
-	}
-	fd, _, errno := unix.Syscall(
-		unix.SYS_BPF,
-		bpfMapCreate,
-		uintptr(unsafe.Pointer(&attribute)),
-		unsafe.Sizeof(attribute),
-	)
-	if errno != 0 {
-		return eBPFOperationError("probe "+scope+" BPF_MAP_CREATE", errno)
-	}
-	if err := unix.Close(int(fd)); err != nil {
-		return E.Cause(err, "close eBPF capability probe map")
+	if err := features.HaveMapType(CiliumEBPF.Array); err != nil {
+		return eBPFOperationError("probe "+scope+" BPF_MAP_TYPE_ARRAY", err)
 	}
 	return nil
 }
@@ -74,7 +61,8 @@ func eBPFBackendOperationError(operation string, stage string, err error) error 
 }
 
 func eBPFOperationError(operation string, err error) error {
-	if errno, isErrno := err.(syscall.Errno); isErrno {
+	var errno syscall.Errno
+	if errors.As(err, &errno) {
 		switch errno {
 		case unix.EBUSY:
 			return E.Cause(errno, "another eBPF inbound is already active on this cgroup: ", operation)

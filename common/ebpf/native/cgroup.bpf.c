@@ -1,18 +1,11 @@
 // Copyright 2026, sing-box contributors
 // SPDX-License-Identifier: GPL-3.0-or-later
 
-// Experimental cgroup backend implemented as BPF C. The production
-// testing-ref1nd branch retains the hand-written instruction emitter.
-
 #include "abi.h"
+#include "bpf_compat.h"
+#include "private_address.h"
 
 #include <linux/bpf.h>
-#include <linux/in.h>
-#include <linux/socket.h>
-#include <stdbool.h>
-
-#define SEC(name) __attribute__((section(name), used))
-#define INLINE static __attribute__((always_inline))
 #define BPF_NOEXIST 1U
 #define AF_INET_VALUE 2U
 #define AF_INET6_VALUE 10U
@@ -32,14 +25,6 @@ enum cgroup_protocol_mode {
     CGROUP_PROTOCOL_UDP_ONLY,
 };
 
-struct bpf_map_def {
-    __u32 type;
-    __u32 key_size;
-    __u32 value_size;
-    __u32 max_entries;
-    __u32 map_flags;
-};
-
 #define MAP(name, key, value, map_type) \
     struct bpf_map_def SEC("maps") name = { \
         .type = map_type, .key_size = sizeof(key), .value_size = sizeof(value), \
@@ -57,6 +42,12 @@ MAP(cgroup_uid_policy, struct sb_ebpf_uid_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
 MAP(cgroup_bypass_ipv4, struct sb_ebpf_ipv4_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
 MAP(cgroup_bypass_ipv6, struct sb_ebpf_ipv6_cidr_lpm_key, __u8, BPF_MAP_TYPE_LPM_TRIE);
 MAP(cgroup_ipv6_available, __u32, __u32, BPF_MAP_TYPE_ARRAY);
+struct bpf_map_def SEC("maps") cgroup_stats = {
+    .type = BPF_MAP_TYPE_ARRAY,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(__u64),
+    .max_entries = SB_EBPF_CGROUP_STAT_COUNT,
+};
 
 static void *(*map_lookup)(void *map, const void *key) = (void *)BPF_FUNC_map_lookup_elem;
 static long (*map_update)(void *map, const void *key, const void *value, __u64 flags) =
@@ -74,6 +65,13 @@ INLINE const struct sb_ebpf_cgroup_control *control(void) {
     __u32 key = 0U;
     return map_lookup(&cgroup_control, &key);
 }
+INLINE void record_redirect_failure(__u8 protocol) {
+    __u32 key = protocol == TCP_VALUE
+        ? SB_EBPF_CGROUP_STAT_TCP_REDIRECT_FAILURE
+        : SB_EBPF_CGROUP_STAT_UDP_REDIRECT_FAILURE;
+    __u64 *counter = map_lookup(&cgroup_stats, &key);
+    if (counter != 0) __sync_fetch_and_add(counter, 1U);
+}
 
 INLINE bool is_tgid_self(const struct sb_ebpf_cgroup_control *config) {
     if (config->self_tgid == 0U) return false;
@@ -87,12 +85,8 @@ INLINE bool is_cookie_bypassed(void *ctx) {
 }
 
 INLINE bool uid_bypassed(const struct sb_ebpf_cgroup_control *config) {
-    if ((config->flags & (SB_EBPF_CGROUP_FLAG_UID_POLICY |
-        SB_EBPF_CGROUP_FLAG_EXCLUDE_ANDROID_DNS_TETHER)) == 0U) return false;
-    __u32 uid = swap32((__u32)get_current_uid_gid());
-    if ((config->flags & SB_EBPF_CGROUP_FLAG_EXCLUDE_ANDROID_DNS_TETHER) != 0U &&
-        uid == SB_EBPF_ANDROID_DNS_TETHER_UID) return true;
     if ((config->flags & SB_EBPF_CGROUP_FLAG_UID_POLICY) == 0U) return false;
+    __u32 uid = swap32((__u32)get_current_uid_gid());
     struct sb_ebpf_uid_lpm_key key = {
         .prefixlen = 32U,
     };
@@ -175,6 +169,7 @@ INLINE void original_v4(
     __builtin_memcpy(value->addr, &address, sizeof(address));
     value->flags = connected_udp ? SB_EBPF_ORIGINAL_DST_FLAG_CONNECTED_UDP : 0U;
     value->socket_cookie = cookie;
+    value->created_at_ns = protocol == TCP_VALUE ? ktime_get_ns() : 0U;
 }
 
 INLINE void original_v6(
@@ -191,13 +186,14 @@ INLINE void original_v6(
     __builtin_memcpy(value->addr, address, sizeof(value->addr));
     value->flags = connected_udp ? SB_EBPF_ORIGINAL_DST_FLAG_CONNECTED_UDP : 0U;
     value->socket_cookie = cookie;
+    value->created_at_ns = protocol == TCP_VALUE ? ktime_get_ns() : 0U;
 }
 
 INLINE bool equal_original(const struct sb_ebpf_original_dst *left, const struct sb_ebpf_original_dst *right) {
     const __u32 *l = (const __u32 *)left;
     const __u32 *r = (const __u32 *)right;
 #pragma clang loop unroll(full)
-    for (__u32 index = 0U; index < sizeof(*left) / sizeof(__u32); ++index) {
+    for (__u32 index = 0U; index < __builtin_offsetof(struct sb_ebpf_original_dst, created_at_ns) / sizeof(__u32); ++index) {
         if (l[index] != r[index]) return false;
     }
     return true;
@@ -238,6 +234,7 @@ INLINE bool token_v4(
                 : map_update(&cgroup_udp_redirect, key, value, BPF_NOEXIST)) == 0) return true;
         seed += 0x9e3779b9U;
     }
+    record_redirect_failure(protocol);
     return false;
 }
 
@@ -269,6 +266,7 @@ INLINE bool token_v6(
         seed0 += 0x9e3779b9U;
         seed1 += 0x7f4a7c15U;
     }
+    record_redirect_failure(protocol);
     return false;
 }
 
@@ -492,10 +490,15 @@ INLINE int handle_v4(
             ctx, config, AF_INET_VALUE, protocol, port, flow_address, cookie, false);
         if (cached != FLOW_CACHE_MISS) return 1;
     }
-    if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) != 0U && port == 53U) {
+    if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) != 0U &&
+        (config->flags & SB_EBPF_CGROUP_FLAG_DNS_RESPECT_BYPASS) == 0U && port == 53U) {
         // DNS hijack intentionally bypasses destination and CIDR policy checks.
     } else {
         if (ipv4_destination_bypassed(destination)) return 1;
+        __u8 destination_bytes[4];
+        __builtin_memcpy(destination_bytes, &destination, sizeof(destination_bytes));
+        if ((config->flags & SB_EBPF_CGROUP_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
+            sb_ebpf_ipv4_private_address(destination_bytes)) return 1;
         if ((config->flags & SB_EBPF_CGROUP_FLAG_BYPASS_IPV4) != 0U &&
             bypass_ipv4_cidr(destination)) {
             if (!connect_hook) {
@@ -568,8 +571,13 @@ INLINE int handle_v6(
                 ctx, config, AF_INET_VALUE, protocol, port, flow_address, cookie, true);
             if (cached != FLOW_CACHE_MISS) return 1;
         }
-        if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) == 0U || port != 53U) {
+        if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) == 0U ||
+            (config->flags & SB_EBPF_CGROUP_FLAG_DNS_RESPECT_BYPASS) != 0U || port != 53U) {
             if (ipv4_destination_bypassed(destination)) return 1;
+            __u8 destination_bytes[4];
+            __builtin_memcpy(destination_bytes, &destination, sizeof(destination_bytes));
+            if ((config->flags & SB_EBPF_CGROUP_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
+                sb_ebpf_ipv4_private_address(destination_bytes)) return 1;
             if ((config->flags & SB_EBPF_CGROUP_FLAG_BYPASS_IPV4) != 0U &&
                 bypass_ipv4_cidr(destination)) {
                 if (!connect_hook) {
@@ -609,8 +617,11 @@ INLINE int handle_v6(
             ctx, config, AF_INET6_VALUE, protocol, port, flow_address, cookie, false);
         if (cached != FLOW_CACHE_MISS) return 1;
     }
-    if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) == 0U || port != 53U) {
+    if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) == 0U ||
+        (config->flags & SB_EBPF_CGROUP_FLAG_DNS_RESPECT_BYPASS) != 0U || port != 53U) {
         if (ipv6_destination_bypassed(address)) return 1;
+        if ((config->flags & SB_EBPF_CGROUP_FLAG_BYPASS_PRIVATE_ADDRESS) != 0U &&
+            sb_ebpf_ipv6_private_address((const __u8 *)address)) return 1;
         if ((config->flags & SB_EBPF_CGROUP_FLAG_BYPASS_IPV6) != 0U &&
             bypass_ipv6_cidr(address)) {
             if (!connect_hook) {

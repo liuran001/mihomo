@@ -1,55 +1,57 @@
-# clang builds the bpfel objects against the system UAPI headers; it is
-# installed on CI and ships with Termux. Override via BPF_CLANG if needed.
-BPF_CLANG ?= clang
-# Auto-detect the system include root; Termux uses a non-standard prefix.
-BPF_SYSTEM_INCLUDE ?= $(shell for d in /usr/include /data/data/com.termux/files/usr/include; do [ -f "$$d/linux/bpf.h" ] && echo "$$d" && break; done)
-BPF_HOST_CC ?= cc
-BPF_MULTIARCH ?= $(shell $(BPF_HOST_CC) -print-multiarch 2>/dev/null)
-# asm/types.h lives in a multiarch dir on Debian/Ubuntu and in the Android arch
-# dir on Termux.
-BPF_MULTIARCH_INCLUDE ?= $(shell for d in \
-	$(BPF_SYSTEM_INCLUDE)/$(BPF_MULTIARCH) \
-	$(BPF_SYSTEM_INCLUDE)/aarch64-linux-android \
-	$(BPF_SYSTEM_INCLUDE)/x86_64-linux-gnu \
-	$(BPF_SYSTEM_INCLUDE)/aarch64-linux-gnu; do [ -f "$$d/asm/types.h" ] && echo "$$d" && break; done)
-BPF_CFLAGS ?= -target bpfel -mcpu=v1 -O2 -g0 -ffreestanding
-BPF_INCLUDE_FLAGS := -Inative -I$(BPF_SYSTEM_INCLUDE)
-ifneq (,$(wildcard $(BPF_MULTIARCH_INCLUDE)))
-BPF_INCLUDE_FLAGS += -I$(BPF_MULTIARCH_INCLUDE)
-endif
+ANDROID_NDK_HOME ?= /usr/share/android-ndk-r29
+NDK_TOOLCHAIN := $(ANDROID_NDK_HOME)/toolchains/llvm/prebuilt/linux-x86_64
+BPF_CLANG ?= $(NDK_TOOLCHAIN)/bin/clang
+BPF_STRIP ?= $(NDK_TOOLCHAIN)/bin/llvm-strip
+BPF_OBJCOPY ?= $(NDK_TOOLCHAIN)/bin/llvm-objcopy
+BPF_SYSROOT ?= $(NDK_TOOLCHAIN)/sysroot
+BPF_RESOURCE_INCLUDE ?= $(shell $(BPF_CLANG) -print-resource-dir 2>/dev/null)/include
+BPF_UAPI_ARCH_INCLUDE ?= $(BPF_SYSROOT)/usr/include/aarch64-linux-android
+BPF_CFLAGS ?= -mcpu=v1 -O2 -g0 -ffreestanding
+BPF_INCLUDE_FLAGS := -nostdinc -Inative -isystem $(BPF_RESOURCE_INCLUDE) \
+	-isystem $(BPF_SYSROOT)/usr/include -isystem $(BPF_UAPI_ARCH_INCLUDE)
 
-SHARED_NETWORK_SOURCE := native/shared_network.bpf.c
-SHARED_NETWORK_OBJECT := native/shared_network.bpf.o
-CGROUP_SOURCE := native/cgroup.bpf.c
-CGROUP_OBJECT := native/cgroup.bpf.o
-OBJECTS := $(SHARED_NETWORK_OBJECT) $(CGROUP_OBJECT)
+GENERATED_DIR := internal/bpfgen
+GENERATED := $(addprefix $(GENERATED_DIR)/,cgroup_bpfel.go cgroup_bpfel.o cgroup_bpfeb.go cgroup_bpfeb.o \
+	shared_network_bpfel.go shared_network_bpfel.o shared_network_bpfeb.go shared_network_bpfeb.o manifest.txt)
+NATIVE_SOURCES := $(sort $(wildcard native/*.c native/*.h))
 
 .PHONY: generate check clean
 
 generate:
-	@set -eu; \
-	for pair in "$(SHARED_NETWORK_SOURCE):$(SHARED_NETWORK_OBJECT)" "$(CGROUP_SOURCE):$(CGROUP_OBJECT)"; do \
-		source="$${pair%%:*}"; object="$${pair#*:}"; \
-		temporary="$$(mktemp "$$object.XXXXXX")"; \
-		trap 'rm -f "$$temporary"' EXIT; \
-		$(BPF_CLANG) $(BPF_CFLAGS) $(BPF_INCLUDE_FLAGS) -c "$$source" -o "$$temporary"; \
-		mv "$$temporary" "$$object"; \
-		trap - EXIT; \
+	@test -x "$(BPF_CLANG)" || { echo "Android NDK r29 Clang not found at $(BPF_CLANG)" >&2; exit 1; }
+	@test -x "$(BPF_STRIP)" || { echo "Android NDK r29 llvm-strip not found at $(BPF_STRIP)" >&2; exit 1; }
+	@test -x "$(BPF_OBJCOPY)" || { echo "Android NDK r29 llvm-objcopy not found at $(BPF_OBJCOPY)" >&2; exit 1; }
+	@test -f "$(BPF_SYSROOT)/usr/include/linux/bpf.h" || { echo "Android NDK Linux UAPI headers not found under $(BPF_SYSROOT)" >&2; exit 1; }
+	@test -f "$(BPF_UAPI_ARCH_INCLUDE)/asm/types.h" || { echo "Android NDK arm64 UAPI asm headers not found under $(BPF_UAPI_ARCH_INCLUDE)" >&2; exit 1; }
+	@$(BPF_CLANG) --version | head -n 1 | grep -q 'clang version 21\.' || { echo "eBPF objects must be generated with NDK r29 Clang 21" >&2; exit 1; }
+	@mkdir -p $(GENERATED_DIR)
+	env -u CPATH -u C_INCLUDE_PATH -u CPLUS_INCLUDE_PATH -u OBJC_INCLUDE_PATH \
+	BPF2GO_CC="$(BPF_CLANG)" \
+	BPF2GO_STRIP="$(BPF_STRIP)" \
+	BPF2GO_CFLAGS="$(BPF_CFLAGS) $(BPF_INCLUDE_FLAGS)" \
+		go generate -tags with_ebpf generate.go
+	@for object in $(GENERATED_DIR)/*_bpfel.o $(GENERATED_DIR)/*_bpfeb.o; do \
+		$(BPF_OBJCOPY) --remove-section=.BTF --remove-section=.BTF.ext "$$object"; \
 	done
+	@{ \
+		echo 'generator: Android NDK r29 Clang 21'; \
+		echo 'targets: bpfel,bpfeb'; \
+		echo 'cflags: $(BPF_CFLAGS) -nostdinc -Inative -isystem <clang-resource>/include -isystem <ndk-sysroot>/usr/include -isystem <ndk-sysroot>/usr/include/aarch64-linux-android'; \
+		echo 'include_environment: cleared'; \
+		echo "bpf2go: $$(go list -m -f {{.Version}} github.com/cilium/ebpf)"; \
+		$(BPF_CLANG) --version | head -n 1 | sed 's/^/clang: /'; \
+		sha256sum $(NATIVE_SOURCES) $(GENERATED_DIR)/*.o; \
+	} > $(GENERATED_DIR)/manifest.txt
 
 check:
-	@set -eu; \
-	for pair in "$(SHARED_NETWORK_SOURCE):$(SHARED_NETWORK_OBJECT)" "$(CGROUP_SOURCE):$(CGROUP_OBJECT)"; do \
-		source="$${pair%%:*}"; object="$${pair#*:}"; \
-		temporary="$$(mktemp "$$object.XXXXXX")"; \
-		trap 'rm -f "$$temporary"' EXIT; \
-		$(BPF_CLANG) $(BPF_CFLAGS) $(BPF_INCLUDE_FLAGS) -c "$$source" -o "$$temporary"; \
-		if ! cmp -s "$$object" "$$temporary"; then \
-			echo "$$object is stale; run 'make generate' in this directory" >&2; exit 1; \
-		fi; \
-		rm -f "$$temporary"; \
-		trap - EXIT; \
+	@temporary="$$(mktemp -d)"; \
+	trap 'rm -rf "$$temporary"' EXIT; \
+	mkdir -p "$$temporary/$(GENERATED_DIR)"; \
+	cp $(GENERATED) "$$temporary/$(GENERATED_DIR)"; \
+	$(MAKE) generate; \
+	for file in $(GENERATED); do \
+		cmp -s "$$file" "$$temporary/$$file" || { echo "$$file is stale; run 'make generate' in common/ebpf" >&2; exit 1; }; \
 	done
 
 clean:
-	rm -f $(OBJECTS)
+	rm -f $(GENERATED)

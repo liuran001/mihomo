@@ -1,4 +1,4 @@
-//go:build with_ebpf && (linux || android) && cgo
+//go:build with_ebpf && (linux || android)
 
 package ebpf
 
@@ -28,5 +28,15 @@ func TestMapLookupAndDeleteUnavailable(t *testing.T) {
 				t.Fatal("unexpected lookup-and-delete availability result")
 			}
 		})
+	}
+}
+
+func TestSocketProtectTGIDFastPath(t *testing.T) {
+	backend := &CgroupBackend{
+		runtime: &cgroupRuntime{self_bypass_tgid: true},
+	}
+	backend.selfBypassTGID.Store(true)
+	if err := backend.SocketProtectFunc()("tcp4", "example.com:443", nil); err != nil {
+		t.Fatal(err)
 	}
 }

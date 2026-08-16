@@ -9,67 +9,75 @@ The Go implementation is grouped by data path and responsibility:
 
 - `cgroup_abi.go`, `cgroup_policy.go`, and `cgroup_mount.go` contain portable
   ABI, policy compilation, and cgroup discovery logic.
-- `cgroup_backend_cgo.go`, `cgroup_socket_cgo.go`, and
-  `cgroup_policy_cgo.go` manage the native cgroup runtime, socket redirect
+- `cgroup_backend.go`, `cgroup_socket.go`, and `cgroup_policy_runtime.go`
+  manage the cgroup runtime, socket redirect
   maps, and live policy maps.
 - `shared_network_abi.go` and `shared_network_policy.go` contain the portable
   TC map ABI and host-address policy compilation.
-- `shared_network_cgo.go`, `shared_network_flow_cgo.go`, and
-  `shared_network_policy_cgo.go` manage the native TC runtime, flow maps, and
-  live host-address maps.
-- `backend_cgo.go` contains memlock, capability-probe, and load-error helpers
-  shared by the cgroup and TC backends.
+- `shared_network_backend.go`, `shared_network_flow.go`, and
+  `shared_network_policy_runtime.go` manage the TC runtime, flow maps, and live
+  host-address maps.
+- `generate.go` drives `bpf2go`; `internal/bpfgen` isolates the tracked objects,
+  generated bindings, and their provenance manifest from handwritten code.
+- `loader.go` uses `github.com/cilium/ebpf` to derive maps from that spec, load
+  selected programs, query stale cgroup programs, and manage attachments.
+- `backend_runtime.go` uses a targeted cilium feature probe plus on-demand
+  memlock and shared load-error handling. It intentionally avoids the
+  `rlimit` package's process-init probe on vendor Android kernels.
 - `map.go` contains the small BPF map syscall boundary shared by both data
-  paths. Files ending in `_stub.go` preserve the same API when cgo is disabled.
+  paths. The runtime does not require cgo.
 
 ## Native layout
 
-The Go and `cgo_*.c` files in this directory form the cgo boundary. cgo only
-compiles C files located directly in the package directory, so the wrappers
-include implementation files from `native/`:
-
-- `native/cgroup.c` contains the shared cgroup definitions and includes the
-  program and runtime implementation in one cgo translation unit.
 - `native/cgroup.bpf.c` and `native/shared_network.bpf.c` are compiled to the
   embedded cgroup and TC ingress/egress objects.
-- `native/cgroup_loader.c` selects cgroup object sections, loads them, and
-  retains the TGID to socket-cookie compatibility fallback.
-- `native/cgroup_runtime.c` creates the cgroup maps and manages prepare,
-  attach, and close operations.
-- `native/object_loader.c` validates, relocates, and loads both objects without
-  libbpf. Backend-specific map and program tables live in
-  `native/cgroup_loader.c` and `native/shared_network_loader.c`.
-- `native/shared_network_runtime.c` creates and manages the shared-network
-  maps and programs.
-- `native/bpf.c` contains the BPF syscall, loader, attach, and cleanup
-  helpers.
-- `native/abi.h` contains only the cgroup map ABI shared by userspace and BPF
-  C. `native/runtime.h` is the private userspace runtime API shared with Go.
+- `native/bpf_compat.h` keeps the non-CO-RE map ABI explicit, while
+  `native/shared_network_packet.h` contains packet layouts and bounded parser
+  constants shared by the TC classifier.
+- `native/shared_network_policy.h`, `native/shared_network_flow.h`, and
+  `native/shared_network_rewrite.h` split policy, state, and checksum/rewrite
+  helpers while remaining part of one verifier-friendly translation unit.
+- `native/abi.h` contains the cgroup map ABI, `native/shared_network.h` contains
+  the TC map ABI, and `native/private_address.h` is shared data-plane policy.
 
-Helpers used only by one native component remain static in that component
-instead of being exposed through `native/runtime.h`.
+There is no userspace C loader or cgo runtime boundary. The BPF C sources are
+the data plane; the Go runtime owns map and program handles through
+`cilium/ebpf`.
 
 ## Embedded eBPF objects
 
-`native/cgroup.bpf.o` and `native/shared_network.bpf.o` are generated and
-intentionally not tracked. They are architecture-neutral `bpfel` bytecode
-consumed by `go:embed`, rather than Android or Linux native objects. Their GPL
-sources are `native/cgroup.bpf.c` and `native/shared_network.bpf.c`.
+`internal/bpfgen/*_bpf{el,eb}.o`, together with their Go bindings, are generated
+by `bpf2go` and tracked. They are architecture-neutral
+BPF bytecode, not Android or Linux native objects. Shipping both byte orders
+also avoids silently using a little-endian object on a big-endian OpenWrt
+target. Their GPL sources are `native/cgroup.bpf.c` and
+`native/shared_network.bpf.c`.
 
-The regular cgo compiler cannot create these objects as part of its Android or
-Linux C compilation: cgo produces native machine code, while the cgroup and TC
-programs must be compiled separately with `-target bpfel`. When `TAGS` contains
-`with_ebpf`, the root `make build` target performs that generation automatically.
-Generate them explicitly before direct `go build` or `go test` commands:
+Normal builds consume the committed output and do not invoke a C compiler:
+
+```sh
+CGO_ENABLED=0 TAGS=with_ebpf make build
+```
+
+Regeneration after a BPF C change uses the pinned Android NDK r29 Clang 21
+toolchain and its Linux UAPI sysroot. It intentionally does not read host
+`/usr/local/include` or `/usr/include`: generation clears include-path
+environment variables, uses `-nostdinc`, and admits only Clang resource
+headers, `native`, and the pinned NDK sysroot.
+The NDK arm64 UAPI `asm` directory supplies architecture typedefs while
+bpf2go still emits architecture-neutral little- and big-endian BPF objects.
 
 ```sh
 ANDROID_NDK_HOME=/usr/share/android-ndk-r29 make ebpf_generate
 ```
 
-The generated objects remain ignored by Git. `make ebpf_check` is available
-for local reproducibility checks after generation. Both use the baseline BPF
-v1 instruction set so changing the host or NDK Clang does not silently raise
-the kernel instruction-set requirement.
+`make ebpf_check` verifies that the committed output and
+`internal/bpfgen/manifest.txt` are current. The manifest records the generator,
+targets, normalized compiler flags, compiler, C/header hashes, and object
+hashes. Generation
+targets the baseline BPF v1 instruction set and strips BTF/CO-RE metadata, so
+runtime loading does not depend on kernel BTF and remains suitable for the
+Linux 5.10 compatibility baseline.
 
 When native IPv6 interception is disabled, the cgroup loader selects smaller
 IPv4-mapped `connect6`, `sendmsg6`, and `recvmsg6` sections. These preserve
@@ -77,23 +85,47 @@ IPv4 traffic from dual-stack applications without loading the unused native
 IPv6 policy and redirect path. Dual-stack configurations continue to select
 the complete IPv6 sections.
 
+## Compatibility boundary
+
+Linux 5.10 is the mandatory kernel baseline. The implementation therefore
+keeps cgroup sock-address hooks for local traffic and clsact TC filters for
+shared-network traffic. It does not require kernel BTF, CO-RE, TCX, BPF timers,
+dynptrs, kfuncs, or pinned bpffs objects. Newer attachment mechanisms may be
+added only as optional fast paths with the current cgroup and TC mechanisms as
+fallbacks.
+
+Android arm64 GKI and Linux amd64/arm64 are the production validation targets.
+The generated objects also cover both byte orders, and other 64-bit OpenWrt
+architectures may work, but cilium/ebpf treats architectures other than amd64
+and arm64 as best effort. A successful cross-build is not a substitute for a
+verifier, attach/detach, and traffic test on the target kernel. 32-bit targets
+are not a production compatibility promise.
+
+The hot original-destination and policy map operations retain a narrow direct
+syscall boundary. This avoids reflection or serialization on every accepted
+flow while cilium/ebpf owns ELF parsing, map/program construction, verifier
+logs, object lifetime, feature queries, and attachment helpers. Any migration
+of the hot operations to generic map methods must be allocation-benchmarked
+first.
+
 ## Testing
 
-Run the focused Linux tests with cgo, without cgo, and under the race detector:
+Run the focused Linux tests and the race detector:
 
 ```sh
-CGO_ENABLED=1 go test -tags with_ebpf ./common/ebpf ./protocol/ebpf ./include
 CGO_ENABLED=0 go test -tags with_ebpf ./common/ebpf ./protocol/ebpf ./include
 CGO_ENABLED=1 go test -race -tags with_ebpf ./common/ebpf ./protocol/ebpf ./include
 ```
 
-An Android cross-build validates the NDK headers, native ABI, and cgo boundary:
+An Android cross-build validates build tags, syscall types, and the embedded
+object ABI without requiring an NDK:
 
 ```sh
-GOOS=android GOARCH=arm64 CGO_ENABLED=1 \
-CC="$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang" \
+GOOS=android GOARCH=arm64 CGO_ENABLED=0 \
 go test -c -tags with_ebpf -o /tmp/sing-box-ebpf-android.test ./protocol/ebpf
 ```
+The complete sing-box tag set may use `CGO_ENABLED=1` and an NDK when other
+features require cgo; the eBPF runtime itself is unaffected.
 
 The root integration tests are excluded from normal test builds and require
 the `ebpf_integration` build tag. The program-load test creates the maps and

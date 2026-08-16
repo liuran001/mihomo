@@ -412,7 +412,7 @@ if [ "$mode" = all ] || [ "$mode" = local ]; then
 	check_helper local required cgroup_sock_addr map_delete_elem "Reclaims or replaces UDP state."
 	check_helper local required cgroup_sock_addr get_socket_cookie "Identifies UDP sockets and provides the cookie self-protection fallback."
 	if [ "$platform" = Android ]; then
-		check_helper local required cgroup_sock_addr get_current_uid_gid "Enforces UID policy, including the mandatory Android dns_tether exclusion."
+		check_helper local required cgroup_sock_addr get_current_uid_gid "Enforces the configured UID policy."
 	else
 		check_helper local fallback cgroup_sock_addr get_current_uid_gid "Required only when include_uid or exclude_uid policy is configured."
 	fi

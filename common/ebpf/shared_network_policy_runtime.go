@@ -1,4 +1,4 @@
-//go:build with_ebpf && (linux || android) && cgo
+//go:build with_ebpf && (linux || android)
 
 package ebpf
 
@@ -10,8 +10,10 @@ import (
 	E "github.com/metacubex/sing/common/exceptions"
 )
 
-const maxSharedSourceCIDRPolicyEntries = 4096
-const maxSharedSourceMACPolicyEntries = 1024
+const (
+	maxSharedSourceCIDRPolicyEntries = 4096
+	maxSharedSourceMACPolicyEntries  = 1024
+)
 
 func (b *SharedNetworkBackend) initializeSourceCIDRPolicy(include, exclude []netip.Prefix) error {
 	includeIPv4, includeIPv6, err := compileBypassCIDRPolicy(include)

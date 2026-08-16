@@ -1,4 +1,4 @@
-//go:build with_ebpf && (linux || android) && cgo
+//go:build with_ebpf && (linux || android)
 
 package ebpf
 

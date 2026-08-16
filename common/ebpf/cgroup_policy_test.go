@@ -83,47 +83,26 @@ func TestCompileExcludeOnlyUIDPolicy(t *testing.T) {
 	}
 }
 
-func TestCompileUIDPolicyExcludesAndroidDNSTetherDirectly(t *testing.T) {
+func TestCompileUID1052UsesConfiguredPolicy(t *testing.T) {
 	entries, defaultBypass, err := compileUIDPolicy(CgroupPolicy{
-		ExcludeUID:              []UIDRange{{Start: androidDNSTetherUID, End: androidDNSTetherUID}},
-		ExcludeAndroidDNSTether: true,
+		ExcludeUID: []UIDRange{{Start: 1052, End: 1052}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if defaultBypass || len(entries) != 0 {
-		t.Fatalf("default Android policy still uses the UID map: default_bypass=%v entries=%v", defaultBypass, entries)
+	if defaultBypass || !uidMatchesPrefixes(1052, entries) {
+		t.Fatalf("UID 1052 was not handled as a configured exclusion: default_bypass=%v entries=%v", defaultBypass, entries)
 	}
 
 	entries, defaultBypass, err = compileUIDPolicy(CgroupPolicy{
-		ExcludeUID:              []UIDRange{{Start: 1000, End: 1100}},
-		ExcludeAndroidDNSTether: true,
+		IncludeUIDConfigured: true,
+		IncludeUID:           []UIDRange{{Start: 1052, End: 1052}},
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if defaultBypass {
-		t.Fatal("exclude-only policy unexpectedly enables default bypass")
-	}
-	if uidMatchesPrefixes(1052, entries) {
-		t.Fatal("directly excluded UID remained in the policy map")
-	}
-	for _, uid := range []uint32{1000, 1051, 1053, 1100} {
-		if !uidMatchesPrefixes(uid, entries) {
-			t.Fatalf("UID %d was removed with the directly excluded UID", uid)
-		}
-	}
-
-	entries, defaultBypass, err = compileUIDPolicy(CgroupPolicy{
-		IncludeUIDConfigured:    true,
-		IncludeUID:              []UIDRange{{Start: 1000, End: 1100}},
-		ExcludeAndroidDNSTether: true,
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !defaultBypass || uidMatchesPrefixes(androidDNSTetherUID, entries) {
-		t.Fatalf("unexpected include policy for Android dns_tether: default_bypass=%v entries=%v", defaultBypass, entries)
+	if !defaultBypass || !uidMatchesPrefixes(1052, entries) {
+		t.Fatalf("UID 1052 was not handled as a configured inclusion: default_bypass=%v entries=%v", defaultBypass, entries)
 	}
 }
 

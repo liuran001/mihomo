@@ -1,3 +1,5 @@
+//go:build with_ebpf && (linux || android)
+
 package ebpf
 
 import (
@@ -10,7 +12,7 @@ func TestCgroupRedirectABI(t *testing.T) {
 	if size := unsafe.Sizeof(listenerLookupKey{}); size != 20 {
 		t.Fatalf("unexpected redirect key size: %d", size)
 	}
-	if size := unsafe.Sizeof(originalDestinationValue{}); size != 32 {
+	if size := unsafe.Sizeof(originalDestinationValue{}); size != 40 {
 		t.Fatalf("unexpected original destination size: %d", size)
 	}
 	if offset := unsafe.Offsetof(listenerLookupKey{}.TokenAddr); offset != 4 {
@@ -24,6 +26,9 @@ func TestCgroupRedirectABI(t *testing.T) {
 	}
 	if offset := unsafe.Offsetof(originalDestinationValue{}.SocketCookie); offset != 24 {
 		t.Fatalf("unexpected socket cookie offset: %d", offset)
+	}
+	if offset := unsafe.Offsetof(originalDestinationValue{}.CreatedAtNS); offset != 32 {
+		t.Fatalf("unexpected creation time offset: %d", offset)
 	}
 	if size := unsafe.Sizeof(udpFlowKey{}); size != 32 {
 		t.Fatalf("unexpected UDP flow key size: %d", size)

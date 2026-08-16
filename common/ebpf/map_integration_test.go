@@ -8,6 +8,7 @@ import (
 	"testing"
 	"unsafe"
 
+	CiliumEBPF "github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -21,23 +22,18 @@ func TestMapBatchIntegration(t *testing.T) {
 		{name: "fallback", forceFallback: true},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			attribute := mapCreateAttr{
-				MapType:    1,
+			const maxEntries = 8
+			mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+				Type:       CiliumEBPF.Hash,
 				KeySize:    uint32(unsafe.Sizeof(uint32(0))),
 				ValueSize:  uint32(unsafe.Sizeof(uint64(0))),
-				MaxEntries: 8,
+				MaxEntries: maxEntries,
+			})
+			if err != nil {
+				t.Fatal(err)
 			}
-			fd, _, errno := unix.Syscall(
-				unix.SYS_BPF,
-				bpfMapCreate,
-				uintptr(unsafe.Pointer(&attribute)),
-				unsafe.Sizeof(attribute),
-			)
-			if errno != 0 {
-				t.Fatal(errno)
-			}
-			mapFD := int(fd)
-			t.Cleanup(func() { _ = unix.Close(mapFD) })
+			t.Cleanup(func() { _ = mapInstance.Close() })
+			mapFD := mapInstance.FD()
 
 			keys := []uint32{1, 2, 3, 4}
 			values := []uint64{10, 20, 30, 40}
@@ -71,6 +67,36 @@ func TestMapBatchIntegration(t *testing.T) {
 					t.Fatalf("unexpected value for key %d: %d", key, value)
 				}
 			}
+			entries, err := countMapEntries(mapFD, unsafe.Sizeof(keys[0]), maxEntries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if entries != uint32(len(keys)) {
+				t.Fatalf("unexpected map entry count: %d", entries)
+			}
+			var scanScratch mapScanScratch[uint32, uint64]
+			if test.forceFallback {
+				scanScratch.lookupSupport.mode.Store(mapBatchUnsupported)
+			}
+			scannedValues := make(map[uint32]uint64)
+			scanned, err := scanScratch.scan(
+				mapFD,
+				maxEntries,
+				func(key uint32, value uint64) {
+					scannedValues[key] = value
+				},
+			)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if scanned != uint32(len(keys)) {
+				t.Fatalf("unexpected scanned map entry count: %d", scanned)
+			}
+			for index, key := range keys {
+				if value := scannedValues[key]; value != values[index] {
+					t.Fatalf("unexpected scanned value for key %d: %d", key, value)
+				}
+			}
 
 			processed, err = deleteMapBatch(
 				mapFD,
@@ -88,6 +114,13 @@ func TestMapBatchIntegration(t *testing.T) {
 				if err = lookupMap(mapFD, unsafe.Pointer(&key), unsafe.Pointer(&value)); !errors.Is(err, unix.ENOENT) {
 					t.Fatalf("deleted key %d remains: %v", key, err)
 				}
+			}
+			entries, err = countMapEntries(mapFD, unsafe.Sizeof(keys[0]), maxEntries)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if entries != 0 {
+				t.Fatalf("unexpected map entry count after delete: %d", entries)
 			}
 		})
 	}

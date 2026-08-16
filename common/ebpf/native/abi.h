@@ -24,9 +24,11 @@
 #define SB_EBPF_CGROUP_FLAG_BYPASS_IPV6 (1U << 8U)
 #define SB_EBPF_CGROUP_FLAG_AUTO_IPV6 (1U << 9U)
 #define SB_EBPF_CGROUP_FLAG_UDP_FLOW (1U << 10U)
-#define SB_EBPF_CGROUP_FLAG_EXCLUDE_ANDROID_DNS_TETHER (1U << 11U)
-
-#define SB_EBPF_ANDROID_DNS_TETHER_UID 1052U
+#define SB_EBPF_CGROUP_FLAG_BYPASS_PRIVATE_ADDRESS (1U << 11U)
+#define SB_EBPF_CGROUP_FLAG_DNS_RESPECT_BYPASS (1U << 12U)
+#define SB_EBPF_CGROUP_STAT_TCP_REDIRECT_FAILURE 0U
+#define SB_EBPF_CGROUP_STAT_UDP_REDIRECT_FAILURE 1U
+#define SB_EBPF_CGROUP_STAT_COUNT 2U
 
 struct sb_ebpf_cgroup_control {
     __u32 flags;
@@ -56,6 +58,7 @@ struct sb_ebpf_original_dst {
     __u8 flags;
     __u8 reserved[3];
     __u64 socket_cookie;
+    __u64 created_at_ns;
 };
 
 struct sb_ebpf_udp_peer_key {
@@ -87,8 +90,9 @@ struct sb_ebpf_udp_flow_value {
 };
 
 _Static_assert(sizeof(struct sb_ebpf_listener_key) == 20U, "unexpected redirect key ABI");
-_Static_assert(sizeof(struct sb_ebpf_original_dst) == 32U, "unexpected original destination ABI");
+_Static_assert(sizeof(struct sb_ebpf_original_dst) == 40U, "unexpected original destination ABI");
 _Static_assert(__builtin_offsetof(struct sb_ebpf_original_dst, socket_cookie) == 24U, "unexpected socket cookie ABI");
+_Static_assert(__builtin_offsetof(struct sb_ebpf_original_dst, created_at_ns) == 32U, "unexpected creation time ABI");
 _Static_assert(sizeof(struct sb_ebpf_udp_peer_key) == 8U, "unexpected UDP peer key ABI");
 _Static_assert(sizeof(struct sb_ebpf_udp_peer_value) == 20U, "unexpected UDP peer value ABI");
 _Static_assert(sizeof(struct sb_ebpf_udp_flow_key) == 32U, "unexpected UDP flow key ABI");
