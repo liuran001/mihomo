@@ -19,7 +19,7 @@ import (
 // straight to the resolver service (the same pipeline behind dns.listen and
 // the type: dns outbound) and write the reply back through the redirect path.
 func (i *Inbound) hijackDNS(destination netip.AddrPort) bool {
-	return i.dnsMode == dnsModeHijack && destination.Port() == 53
+	return i.dnsMode != dnsModeOff && destination.Port() == 53
 }
 
 func (i *Inbound) relayTCPDNS(conn net.Conn) {
