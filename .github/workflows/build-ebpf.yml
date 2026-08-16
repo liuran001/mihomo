@@ -172,7 +172,7 @@ jobs:
           extldflags=""
           if [ "$STATIC" = "true" ]; then
             output="${output}-static"
-            extldflags="-extldflags '-static'"
+            extldflags="-extldflags=-static"
           fi
           go build -v -tags "with_gvisor with_ebpf" -trimpath \
             -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${version}' \
