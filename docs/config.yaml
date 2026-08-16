@@ -1339,6 +1339,8 @@ proxies: # socks5
     #   reject-after-time: 180                            # AmneziaWG v3+
     #   keepalive-timeout: 10                             # AmneziaWG v3+
     #   max-handshake-attempts: 18                        # AmneziaWG v3+
+    #   random-trailers: true                             # AmneziaWG v3.1+
+    #   disable-cookies: true                             # AmneziaWG v3.1+
 
   # tailscale
   - name: "tailscale"
@@ -1443,6 +1445,7 @@ proxies: # socks5
     #   UV_DEVICE_ID: "laptop-001"
     # ping: 10 # 默认值为 0
     # ping-restart: 60 # 默认值为 0
+    # tran-window: 3600 # 旧 data key 在 rekey 后保留的秒数；默认 3600，显式设为 0 表示立即过期，应与服务端 --tran-window 对齐
     # handshake-timeout: 30 # 单位为秒；配置后握手时不受外层连接超时影响；默认值为 0，表示仅使用外层连接超时
     # mtu: 1500
     udp: true
