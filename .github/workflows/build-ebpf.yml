@@ -170,11 +170,14 @@ jobs:
           set -euo pipefail
           output="dist/mihomo-ebpf-${GOOS}-${GOARCH}"
           if [ "$STATIC" = "true" ]; then
+            # CGO_ENABLED=0 guarantees a fully static binary (no external
+            # linker, no NEEDED libc); -extldflags '-static' proved unreliable
+            # with the cross gcc on the hosted runner.
             output="${output}-static"
-            go build -v -tags "with_gvisor with_ebpf" -trimpath \
+            CGO_ENABLED=0 go build -v -tags "with_gvisor with_ebpf" -trimpath \
               -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${version}' \
                         -X 'github.com/metacubex/mihomo/constant.BuildTime=${build_time}' \
-                        -w -s -buildid= -extldflags '-static'" \
+                        -w -s -buildid=" \
               -o "${output}" .
           else
             go build -v -tags "with_gvisor with_ebpf" -trimpath \
