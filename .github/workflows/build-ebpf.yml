@@ -169,16 +169,20 @@ jobs:
         run: |
           set -euo pipefail
           output="dist/mihomo-ebpf-${GOOS}-${GOARCH}"
-          extldflags=""
           if [ "$STATIC" = "true" ]; then
             output="${output}-static"
-            extldflags="-extldflags=-static"
+            go build -v -tags "with_gvisor with_ebpf" -trimpath \
+              -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${version}' \
+                        -X 'github.com/metacubex/mihomo/constant.BuildTime=${build_time}' \
+                        -w -s -buildid= -extldflags '-static'" \
+              -o "${output}" .
+          else
+            go build -v -tags "with_gvisor with_ebpf" -trimpath \
+              -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${version}' \
+                        -X 'github.com/metacubex/mihomo/constant.BuildTime=${build_time}' \
+                        -w -s -buildid=" \
+              -o "${output}" .
           fi
-          go build -v -tags "with_gvisor with_ebpf" -trimpath \
-            -ldflags "-X 'github.com/metacubex/mihomo/constant.Version=${version}' \
-                      -X 'github.com/metacubex/mihomo/constant.BuildTime=${build_time}' \
-                      -w -s -buildid= ${extldflags}" \
-            -o "${output}" .
           sha256sum "${output}" > "${output}.sha256"
           cp build/* dist/
 
