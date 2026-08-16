@@ -161,6 +161,9 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 	if err != nil {
 		return nil, err
 	}
+	if err = checkLPMTriePolicyCompatibility("UID", len(uidPolicyEntries)); err != nil {
+		return nil, err
+	}
 	if cgroupPath == "" {
 		cgroupPath, err = DetectCgroup2Mount()
 		if err != nil {

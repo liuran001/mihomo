@@ -61,6 +61,9 @@ func (b *CgroupBackend) UpdateBypassCIDR(prefixes []netip.Prefix) (bool, error) 
 	if err != nil {
 		return false, E.Cause(err, "compile bypass CIDR policy")
 	}
+	if err = checkLPMTriePolicyCompatibility("bypass CIDR", len(ipv4Prefixes)+len(ipv6Prefixes)); err != nil {
+		return false, err
+	}
 	if len(ipv4Prefixes) > maxBypassCIDRPolicyEntries {
 		return false, E.New("IPv4 bypass CIDR policy has too many eBPF map entries: ",
 			len(ipv4Prefixes), " > ", maxBypassCIDRPolicyEntries)

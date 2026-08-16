@@ -30,6 +30,12 @@ func (b *SharedNetworkBackend) initializeSourceCIDRPolicy(include, exclude []net
 		len(excludeIPv6) > maxSharedSourceCIDRPolicyEntries {
 		return E.New("shared-network source CIDR policy exceeds eBPF map capacity")
 	}
+	if err = checkLPMTriePolicyCompatibility(
+		"shared-network source CIDR",
+		len(includeIPv4)+len(includeIPv6)+len(excludeIPv4)+len(excludeIPv6),
+	); err != nil {
+		return err
+	}
 	if b == nil || b.runtime == nil {
 		return errBackendClosed
 	}
@@ -99,6 +105,9 @@ func (b *SharedNetworkBackend) UpdateBypassCIDR(prefixes []netip.Prefix) (bool, 
 	ipv4, ipv6, err := compileBypassCIDRPolicy(prefixes)
 	if err != nil {
 		return false, E.Cause(err, "compile shared-network bypass CIDR policy")
+	}
+	if err = checkLPMTriePolicyCompatibility("shared-network bypass CIDR", len(ipv4)+len(ipv6)); err != nil {
+		return false, err
 	}
 	if len(ipv4) > maxBypassCIDRPolicyEntries || len(ipv6) > maxBypassCIDRPolicyEntries {
 		return false, E.New("shared-network bypass CIDR policy exceeds eBPF map capacity")
