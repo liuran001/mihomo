@@ -312,7 +312,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --title "mihomo Meta — eBPF inbound (${RELEASE_TAG})" \
             --notes-file notes.md \
-            --prerelease --clobber || true
+            --prerelease || true
           gh release edit "${RELEASE_TAG}" \
             --repo "${{ github.repository }}" \
             --notes-file notes.md || true
