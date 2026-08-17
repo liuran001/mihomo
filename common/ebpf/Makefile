@@ -6,9 +6,11 @@ BPF_OBJCOPY ?= $(NDK_TOOLCHAIN)/bin/llvm-objcopy
 BPF_SYSROOT ?= $(NDK_TOOLCHAIN)/sysroot
 BPF_RESOURCE_INCLUDE ?= $(shell $(BPF_CLANG) -print-resource-dir 2>/dev/null)/include
 BPF_UAPI_ARCH_INCLUDE ?= $(BPF_SYSROOT)/usr/include/aarch64-linux-android
-BPF_CFLAGS ?= -mcpu=v1 -O2 -g0 -ffreestanding
+BPF_CFLAGS ?= -mcpu=v1 -O2 -g0 -ffreestanding -mllvm -disable-block-placement -mllvm -disable-branch-fold
 BPF_INCLUDE_FLAGS := -nostdinc -Inative -isystem $(BPF_RESOURCE_INCLUDE) \
 	-isystem $(BPF_SYSROOT)/usr/include -isystem $(BPF_UAPI_ARCH_INCLUDE)
+GO_GENERATE_HOST_OS := $(shell go env GOHOSTOS)
+GO_GENERATE_HOST_ARCH := $(shell go env GOHOSTARCH)
 
 GENERATED_DIR := internal/bpfgen
 GENERATED := $(addprefix $(GENERATED_DIR)/,cgroup_bpfel.go cgroup_bpfel.o cgroup_bpfeb.go cgroup_bpfeb.o \
@@ -29,6 +31,7 @@ generate:
 	BPF2GO_CC="$(BPF_CLANG)" \
 	BPF2GO_STRIP="$(BPF_STRIP)" \
 	BPF2GO_CFLAGS="$(BPF_CFLAGS) $(BPF_INCLUDE_FLAGS)" \
+	GOOS="$(GO_GENERATE_HOST_OS)" GOARCH="$(GO_GENERATE_HOST_ARCH)" CGO_ENABLED=0 \
 		go generate -tags with_ebpf generate.go
 	@for object in $(GENERATED_DIR)/*_bpfel.o $(GENERATED_DIR)/*_bpfeb.o; do \
 		$(BPF_OBJCOPY) --remove-section=.BTF --remove-section=.BTF.ext "$$object"; \

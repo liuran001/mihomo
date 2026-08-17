@@ -26,6 +26,10 @@
 #define SB_EBPF_CGROUP_FLAG_UDP_FLOW (1U << 10U)
 #define SB_EBPF_CGROUP_FLAG_BYPASS_PRIVATE_ADDRESS (1U << 11U)
 #define SB_EBPF_CGROUP_FLAG_DNS_RESPECT_BYPASS (1U << 12U)
+#define SB_EBPF_CGROUP_FLAG_HOST_IPV4 (1U << 13U)
+#define SB_EBPF_CGROUP_FLAG_HOST_IPV6 (1U << 14U)
+#define SB_EBPF_CGROUP_FLAG_FAKEIP_IPV4 (1U << 15U)
+#define SB_EBPF_CGROUP_FLAG_FAKEIP_IPV6 (1U << 16U)
 #define SB_EBPF_CGROUP_STAT_TCP_REDIRECT_FAILURE 0U
 #define SB_EBPF_CGROUP_STAT_UDP_REDIRECT_FAILURE 1U
 #define SB_EBPF_CGROUP_STAT_COUNT 2U
@@ -39,9 +43,13 @@ struct sb_ebpf_cgroup_control {
     __u16 listener_port;
     __u16 reserved;
     __u8 redirect_ipv6_prefix[8];
+    __u8 fakeip_ipv4_prefix[4];
+    __u8 fakeip_ipv4_mask[4];
+    __u8 fakeip_ipv6_prefix[16];
+    __u8 fakeip_ipv6_mask[16];
 };
 
-_Static_assert(sizeof(struct sb_ebpf_cgroup_control) == 32U, "unexpected cgroup control ABI");
+_Static_assert(sizeof(struct sb_ebpf_cgroup_control) == 72U, "unexpected cgroup control ABI");
 
 struct sb_ebpf_listener_key {
     __u8 family;

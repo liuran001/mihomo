@@ -9,6 +9,9 @@ import (
 )
 
 func TestCgroupRedirectABI(t *testing.T) {
+	if size := unsafe.Sizeof(cgroupControl{}); size != 72 {
+		t.Fatalf("unexpected cgroup control size: %d", size)
+	}
 	if size := unsafe.Sizeof(listenerLookupKey{}); size != 20 {
 		t.Fatalf("unexpected redirect key size: %d", size)
 	}
@@ -57,5 +60,46 @@ func TestBypassCIDRABI(t *testing.T) {
 	}
 	if size := unsafe.Sizeof(ipv6CIDRLPMKey{}); size != 20 {
 		t.Fatalf("unexpected IPv6 CIDR LPM key size: %d", size)
+	}
+}
+
+func TestOriginalDestinationFromValue(t *testing.T) {
+	testCases := []struct {
+		name     string
+		value    originalDestinationValue
+		expected netip.AddrPort
+	}{
+		{
+			name: "IPv4",
+			value: originalDestinationValue{
+				Family: addressFamilyIPv4,
+				Port:   5353,
+				Addr:   [16]byte{198, 51, 100, 20},
+			},
+			expected: netip.MustParseAddrPort("198.51.100.20:5353"),
+		},
+		{
+			name: "IPv6",
+			value: func() originalDestinationValue {
+				value := originalDestinationValue{Family: addressFamilyIPv6, Port: 443, Flags: 1}
+				value.Addr = netip.MustParseAddr("2001:db8::1").As16()
+				return value
+			}(),
+			expected: netip.MustParseAddrPort("[2001:db8::1]:443"),
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			actual, err := originalDestinationFromValue(testCase.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if actual.Destination != testCase.expected {
+				t.Fatalf("unexpected destination: %v", actual.Destination)
+			}
+			if actual.ConnectedUDP != (testCase.value.Flags&1 != 0) {
+				t.Fatalf("unexpected connected UDP flag: %v", actual.ConnectedUDP)
+			}
+		})
 	}
 }

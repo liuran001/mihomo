@@ -148,14 +148,15 @@ NOINLINE int reserve_token_attempt(
 }
 
 NOINLINE bool reserve_token(struct sb_shared_scratch *scratch, const struct sb_shared_control *control) {
+    int result = SB_SHARED_TOKEN_RETRY;
 #pragma clang loop unroll(full)
     for (__u32 attempt = 0U; attempt < SB_SHARED_TOKEN_ATTEMPTS; ++attempt) {
-        int result = reserve_token_attempt(scratch, control, attempt);
-        if (result == SB_SHARED_TOKEN_RESERVED) return true;
-        if (result == SB_SHARED_TOKEN_FAILED) { record_token_reservation_failure(); return false; }
+        if (result == SB_SHARED_TOKEN_RETRY) {
+            result = reserve_token_attempt(scratch, control, attempt);
+        }
     }
-    record_token_reservation_failure();
-    return false;
+    if (result != SB_SHARED_TOKEN_RESERVED) record_token_reservation_failure();
+    return result == SB_SHARED_TOKEN_RESERVED;
 }
 
 INLINE bool load_cached_token(struct sb_shared_scratch *scratch) {

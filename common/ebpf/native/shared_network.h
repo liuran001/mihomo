@@ -36,6 +36,8 @@
 #define SB_SHARED_FLAG_BYPASS_PRIVATE_ADDRESS (1U << 13)
 #define SB_SHARED_FLAG_BYPASS_FLOW_CACHE (1U << 14)
 #define SB_SHARED_FLAG_DNS_RESPECT_BYPASS (1U << 15)
+#define SB_SHARED_FLAG_FAKEIP_IPV4 (1U << 16)
+#define SB_SHARED_FLAG_FAKEIP_IPV6 (1U << 17)
 
 struct sb_shared_control {
     __u32 enabled;
@@ -48,6 +50,10 @@ struct sb_shared_control {
     __u8 reserved2[2];
     __u8 token_ipv6_prefix[16];
     __u32 udp_timeout_seconds;
+    __u8 fakeip_ipv4_prefix[4];
+    __u8 fakeip_ipv4_mask[4];
+    __u8 fakeip_ipv6_prefix[16];
+    __u8 fakeip_ipv6_mask[16];
 };
 
 struct sb_shared_original_key {
@@ -149,7 +155,7 @@ struct sb_shared_scratch {
     __u8 padding[20];
 };
 
-_Static_assert(sizeof(struct sb_shared_control) == 40U, "shared control ABI");
+_Static_assert(sizeof(struct sb_shared_control) == 80U, "shared control ABI");
 _Static_assert(sizeof(struct sb_shared_original_key) == 44U, "shared original key ABI");
 _Static_assert(sizeof(struct sb_shared_reply_key) == 44U, "shared reply key ABI");
 _Static_assert(sizeof(struct sb_shared_listener_key) == 40U, "shared listener key ABI");

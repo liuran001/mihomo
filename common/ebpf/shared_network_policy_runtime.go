@@ -179,7 +179,7 @@ func (b *SharedNetworkBackend) UpdateHostAddresses(addresses []netip.Addr) error
 	if b == nil {
 		return errBackendClosed
 	}
-	ipv4, ipv6 := compileSharedHostPrefixes(addresses)
+	ipv4, ipv6 := compileHostPrefixes(addresses)
 	if len(ipv4) > 256 || len(ipv6) > 256 {
 		return E.New("shared-network host address policy exceeds eBPF map capacity")
 	}

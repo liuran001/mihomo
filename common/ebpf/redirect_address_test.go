@@ -33,3 +33,18 @@ func TestValidateRedirectPrefixRejectsUnsafeRanges(t *testing.T) {
 		}
 	}
 }
+
+func TestPrefixMasks(t *testing.T) {
+	if mask := prefixMask4(15); mask != [4]byte{0xff, 0xfe, 0, 0} {
+		t.Fatalf("unexpected IPv4 prefix mask: %v", mask)
+	}
+	if mask := prefixMask16(18); mask != [16]byte{0xff, 0xff, 0xc0} {
+		t.Fatalf("unexpected IPv6 prefix mask: %v", mask)
+	}
+	if mask := prefixMask16(128); mask != [16]byte{
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+		0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+	} {
+		t.Fatalf("unexpected full IPv6 prefix mask: %v", mask)
+	}
+}

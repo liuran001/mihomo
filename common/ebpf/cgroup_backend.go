@@ -30,6 +30,13 @@ const (
 	cgroupProgramCount
 )
 
+const (
+	cgroupUDPCleanupDisabled      = "disabled"
+	cgroupUDPCleanupSocketRelease = "socket_release"
+	cgroupUDPCleanupLRUFallback   = "lru_fallback"
+	cgroupUDPCleanupInvalid       = "invalid"
+)
+
 type cgroupProgramDefinition struct {
 	name       string
 	attachType CiliumEBPF.AttachType
@@ -54,6 +61,7 @@ type cgroupRuntime struct {
 	stats_map_fd                int
 	tcp_redirect_map_fd         int
 	udp_redirect_map_fd         int
+	udp_recovery_map_fd         int
 	udp_token_map_fd            int
 	udp_peer_map_fd             int
 	udp_flow_map_fd             int
@@ -61,6 +69,8 @@ type cgroupRuntime struct {
 	uid_policy_map_fd           int
 	bypass_ipv4_cidr_map_fd     int
 	bypass_ipv6_cidr_map_fd     int
+	host_ipv4_map_fd            int
+	host_ipv6_map_fd            int
 	ipv6_available_map_fd       int
 	socket_release_supported    bool
 	self_bypass_tgid            bool
@@ -83,23 +93,31 @@ type CgroupBackend struct {
 	tcpRedirectUsage      atomic.Uint32
 	tcpRedirectUsageKnown atomic.Bool
 	lookupAndDeleteMode   atomic.Int32
+	statusCollector       runtimeStatusCollector
 	selfBypassTGID        atomic.Bool
 	runtime               *cgroupRuntime
 	statsMapFD            int
 	mapCapacity           CgroupMapCapacity
 	tcpRedirectMapFD      int
 	udpRedirectMapFD      int
+	udpRecoveryMapFD      int
 	udpFlowMapFD          int
 	socketBypassMapFD     int
 	pendingSocketCookies  map[uint64]struct{}
 	bypassIPv4CIDRMapFD   int
 	bypassIPv6CIDRMapFD   int
+	hostIPv4MapFD         int
+	hostIPv6MapFD         int
 	ipv6AvailableMapFD    int
 	bypassIPv4CIDR        []netip.Prefix
 	bypassIPv6CIDR        []netip.Prefix
+	hostIPv4              []netip.Prefix
+	hostIPv6              []netip.Prefix
 	cgroupPath            string
 	redirectIPv4          netip.Prefix
 	redirectIPv6          netip.Prefix
+	fakeIPIPv4            netip.Prefix
+	fakeIPIPv6            netip.Prefix
 	enableIPv6            bool
 	autoIPv6              bool
 	ipv6Available         bool
@@ -116,6 +134,14 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 	redirectIPv6 := config.RedirectIPv6
 	mapCapacity := config.MapCapacity
 	policy := config.Policy
+	fakeIPIPv4, err := normalizeAddressPrefix("IPv4 FakeIP range", config.FakeIPIPv4, true)
+	if err != nil {
+		return nil, err
+	}
+	fakeIPIPv6, err := normalizeAddressPrefix("IPv6 FakeIP range", config.FakeIPIPv6, false)
+	if err != nil {
+		return nil, err
+	}
 	if err := validateCgroupMapCapacity(mapCapacity); err != nil {
 		return nil, err
 	}
@@ -150,7 +176,6 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		return nil, E.New("eBPF cgroup backend has no enabled address family")
 	}
 	udpTimeoutSeconds := uint32(0)
-	var err error
 	if config.EnableUDP {
 		udpTimeoutSeconds, err = cgroupUDPTimeoutSeconds(config.UDPTimeout)
 		if err != nil {
@@ -177,11 +202,31 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		}
 		return nil, err
 	}
-	socketReleaseSupported, err := probeSocketReleaseSupport()
+	cgroupFile, err := os.Open(cgroupPath)
 	if err != nil {
-		return nil, eBPFOperationError("probe socket release", err)
+		return nil, eBPFOperationError("open cgroup", err)
+	}
+	if err = unix.Flock(int(cgroupFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		_ = cgroupFile.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			err = unix.EBUSY
+		}
+		return nil, eBPFOperationError("lock cgroup", err)
+	}
+	if err = detachOwnedCgroupPrograms(int(cgroupFile.Fd())); err != nil {
+		_ = cgroupFile.Close()
+		return nil, eBPFOperationError("detach stale cgroup programs", err)
+	}
+	socketReleaseSupported := false
+	if config.EnableUDP {
+		socketReleaseSupported, err = probeSocketReleaseSupport(int(cgroupFile.Fd()))
+		if err != nil {
+			_ = cgroupFile.Close()
+			return nil, eBPFOperationError("probe socket release attachment", err)
+		}
 	}
 	runtimeState := &cgroupRuntime{
+		cgroupFile:                  cgroupFile,
 		maps:                        make(map[string]*CiliumEBPF.Map),
 		programs:                    make([]*CiliumEBPF.Program, cgroupProgramCount),
 		enable_tcp:                  config.EnableTCP,
@@ -197,28 +242,11 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 	}
 	if err = prepareCgroupMaps(runtimeState, mapCapacity, len(uidPolicyEntries)); err != nil {
 		_ = closeMaps(runtimeState.maps)
+		_ = runtimeState.cgroupFile.Close()
 		if memlockErr != nil && (errors.Is(err, unix.ENOMEM) || errors.Is(err, unix.EPERM)) {
 			err = E.Errors(err, E.Cause(memlockErr, "remove memlock limit"))
 		}
 		return nil, err
-	}
-	runtimeState.cgroupFile, err = os.Open(cgroupPath)
-	if err != nil {
-		_ = closeMaps(runtimeState.maps)
-		return nil, eBPFOperationError("open cgroup", err)
-	}
-	if err = unix.Flock(int(runtimeState.cgroupFile.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
-		_ = runtimeState.cgroupFile.Close()
-		_ = closeMaps(runtimeState.maps)
-		if errors.Is(err, unix.EWOULDBLOCK) {
-			err = unix.EBUSY
-		}
-		return nil, eBPFOperationError("lock cgroup", err)
-	}
-	if err = detachOwnedCgroupPrograms(int(runtimeState.cgroupFile.Fd())); err != nil {
-		_ = runtimeState.cgroupFile.Close()
-		_ = closeMaps(runtimeState.maps)
-		return nil, eBPFOperationError("detach stale cgroup programs", err)
 	}
 	backend := &CgroupBackend{
 		mapCapacity:          mapCapacity,
@@ -226,14 +254,19 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		tcpRedirectMapFD:     runtimeState.tcp_redirect_map_fd,
 		statsMapFD:           runtimeState.stats_map_fd,
 		udpRedirectMapFD:     runtimeState.udp_redirect_map_fd,
+		udpRecoveryMapFD:     runtimeState.udp_recovery_map_fd,
 		udpFlowMapFD:         runtimeState.udp_flow_map_fd,
 		socketBypassMapFD:    -1,
 		bypassIPv4CIDRMapFD:  runtimeState.bypass_ipv4_cidr_map_fd,
 		bypassIPv6CIDRMapFD:  runtimeState.bypass_ipv6_cidr_map_fd,
+		hostIPv4MapFD:        runtimeState.host_ipv4_map_fd,
+		hostIPv6MapFD:        runtimeState.host_ipv6_map_fd,
 		ipv6AvailableMapFD:   runtimeState.ipv6_available_map_fd,
 		cgroupPath:           cgroupPath,
 		redirectIPv4:         redirectIPv4,
 		redirectIPv6:         redirectIPv6,
+		fakeIPIPv4:           fakeIPIPv4,
+		fakeIPIPv6:           fakeIPIPv6,
 		enableIPv6:           config.EnableIPv6,
 		autoIPv6:             config.AutoIPv6,
 		enableUDP:            config.EnableUDP,
@@ -256,12 +289,11 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 }
 
 func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, uidEntries int) error {
-	udpMapType := CiliumEBPF.Hash
-	udpMapFlags := uint32(bpfFlagNoPrealloc)
-	if runtimeState.enable_udp && !runtimeState.socket_release_supported {
-		udpMapType = CiliumEBPF.LRUHash
-		udpMapFlags = 0
-	}
+	udpMapType, udpMapFlags, flowCapacity := cgroupUDPMapConfiguration(
+		runtimeState.enable_udp,
+		runtimeState.socket_release_supported,
+		capacity.UDPRedirect,
+	)
 	tcpCapacity := uint32(1)
 	udpCapacity := uint32(1)
 	if runtimeState.enable_tcp {
@@ -270,10 +302,7 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, 
 	if runtimeState.enable_udp {
 		udpCapacity = capacity.UDPRedirect
 	}
-	flowCapacity := uint32(1)
-	if runtimeState.enable_udp && runtimeState.socket_release_supported {
-		flowCapacity = udpCapacity
-	}
+	recoveryCapacity := min(udpCapacity, uint32(UDPRecoveryMapCapacity))
 	uidCapacity := uint32(uidEntries)
 	if uidCapacity == 0 {
 		uidCapacity = 1
@@ -284,32 +313,76 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, 
 		"cgroup_stats":          {name: "sb_cg_stats", mapType: CiliumEBPF.Array, maxEntries: 2},
 		"cgroup_tcp_redirect":   {name: "sb_cg_tcp", mapType: CiliumEBPF.Hash, maxEntries: tcpCapacity, flags: bpfFlagNoPrealloc},
 		"cgroup_udp_redirect":   {name: "sb_cg_udp", mapType: udpMapType, maxEntries: udpCapacity, flags: udpMapFlags},
+		"cgroup_udp_recovery":   {name: "sb_cg_recover", mapType: CiliumEBPF.LRUHash, maxEntries: recoveryCapacity},
 		"cgroup_udp_token":      {name: "sb_cg_token", mapType: udpMapType, maxEntries: udpCapacity, flags: udpMapFlags},
 		"cgroup_udp_peer":       {name: "sb_cg_peer", mapType: CiliumEBPF.LRUHash, maxEntries: udpCapacity},
 		"cgroup_udp_flow":       {name: "sb_cg_flow", mapType: CiliumEBPF.LRUHash, maxEntries: flowCapacity},
 		"cgroup_uid_policy":     {name: "sb_cg_uid", mapType: CiliumEBPF.LPMTrie, maxEntries: uidCapacity, flags: bpfFlagNoPrealloc},
 		"cgroup_bypass_ipv4":    {name: "sb_cg_bypass4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
 		"cgroup_bypass_ipv6":    {name: "sb_cg_bypass6", mapType: CiliumEBPF.LPMTrie, maxEntries: maxBypassCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
+		"cgroup_host_ipv4":      {name: "sb_cg_host4", mapType: CiliumEBPF.Hash, maxEntries: 256},
+		"cgroup_host_ipv6":      {name: "sb_cg_host6", mapType: CiliumEBPF.Hash, maxEntries: 256},
 		"cgroup_ipv6_available": {name: "sb_cg_ipv6", mapType: CiliumEBPF.Array, maxEntries: 1},
 	})
 	if err != nil {
+		return err
+	}
+	if err = validateCgroupUDPCleanupMaps(runtimeState); err != nil {
 		return err
 	}
 	runtimeState.control_map_fd = runtimeState.maps["cgroup_control"].FD()
 	runtimeState.stats_map_fd = runtimeState.maps["cgroup_stats"].FD()
 	runtimeState.tcp_redirect_map_fd = runtimeState.maps["cgroup_tcp_redirect"].FD()
 	runtimeState.udp_redirect_map_fd = runtimeState.maps["cgroup_udp_redirect"].FD()
+	runtimeState.udp_recovery_map_fd = runtimeState.maps["cgroup_udp_recovery"].FD()
 	runtimeState.udp_token_map_fd = runtimeState.maps["cgroup_udp_token"].FD()
 	runtimeState.udp_peer_map_fd = runtimeState.maps["cgroup_udp_peer"].FD()
 	runtimeState.udp_flow_map_fd = runtimeState.maps["cgroup_udp_flow"].FD()
 	runtimeState.uid_policy_map_fd = runtimeState.maps["cgroup_uid_policy"].FD()
 	runtimeState.bypass_ipv4_cidr_map_fd = runtimeState.maps["cgroup_bypass_ipv4"].FD()
 	runtimeState.bypass_ipv6_cidr_map_fd = runtimeState.maps["cgroup_bypass_ipv6"].FD()
+	runtimeState.host_ipv4_map_fd = runtimeState.maps["cgroup_host_ipv4"].FD()
+	runtimeState.host_ipv6_map_fd = runtimeState.maps["cgroup_host_ipv6"].FD()
 	runtimeState.ipv6_available_map_fd = runtimeState.maps["cgroup_ipv6_available"].FD()
 	return nil
 }
 
-func probeSocketReleaseSupport() (bool, error) {
+func cgroupUDPMapConfiguration(enableUDP bool, socketReleaseSupported bool, capacity uint32) (CiliumEBPF.MapType, uint32, uint32) {
+	if enableUDP && !socketReleaseSupported {
+		return CiliumEBPF.LRUHash, 0, 1
+	}
+	flowCapacity := uint32(1)
+	if enableUDP {
+		flowCapacity = capacity
+	}
+	return CiliumEBPF.Hash, bpfFlagNoPrealloc, flowCapacity
+}
+
+func validateCgroupUDPCleanupMaps(runtimeState *cgroupRuntime) error {
+	if !runtimeState.enable_udp {
+		return nil
+	}
+	expectedType := CiliumEBPF.LRUHash
+	if runtimeState.socket_release_supported {
+		expectedType = CiliumEBPF.Hash
+	}
+	for _, name := range []string{"cgroup_udp_redirect", "cgroup_udp_token"} {
+		mapInstance := runtimeState.maps[name]
+		if mapInstance == nil {
+			return E.New("missing UDP cleanup map ", name)
+		}
+		info, err := mapInstance.Info()
+		if err != nil {
+			return E.Cause(err, "inspect UDP cleanup map ", name)
+		}
+		if info.Type != expectedType {
+			return E.New("invalid UDP cleanup map type for ", name, ": ", info.Type, ", expected ", expectedType)
+		}
+	}
+	return nil
+}
+
+func probeSocketReleaseSupport(cgroupFD int) (bool, error) {
 	program, err := CiliumEBPF.NewProgram(&CiliumEBPF.ProgramSpec{
 		Name:       "sb_rel_probe",
 		Type:       CiliumEBPF.CGroupSock,
@@ -320,21 +393,40 @@ func probeSocketReleaseSupport() (bool, error) {
 			asm.Return(),
 		},
 	})
-	if err == nil {
-		return true, program.Close()
+	if err != nil {
+		if socketReleaseUnavailable(err) {
+			return false, nil
+		}
+		return false, err
 	}
-	if errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP) {
-		return false, nil
+	if err = attachProgramRaw(cgroupFD, program, CiliumEBPF.AttachCgroupInetSockRelease); err != nil {
+		closeErr := program.Close()
+		if socketReleaseUnavailable(err) {
+			return false, closeErr
+		}
+		return false, E.Errors(err, closeErr)
 	}
-	return false, err
+	detachErr := rawDetachProgram(cgroupFD, program, CiliumEBPF.AttachCgroupInetSockRelease)
+	closeErr := program.Close()
+	if detachErr != nil {
+		return false, E.Errors(detachErr, closeErr)
+	}
+	if closeErr != nil {
+		return false, closeErr
+	}
+	return true, nil
+}
+
+func socketReleaseUnavailable(err error) bool {
+	return errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) ||
+		errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, linuxErrnoNotSupported)
 }
 
 func detachOwnedCgroupPrograms(cgroupFD int) error {
 	for _, definition := range cgroupProgramDefinitions {
 		first, err := queryCgroupProgramIDs(cgroupFD, definition.attachType)
 		if err != nil {
-			if definition.attachType == CiliumEBPF.AttachCgroupInetSockRelease &&
-				(errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) || errors.Is(err, unix.EOPNOTSUPP)) {
+			if definition.attachType == CiliumEBPF.AttachCgroupInetSockRelease && socketReleaseUnavailable(err) {
 				continue
 			}
 			return err
@@ -416,13 +508,82 @@ func (b *CgroupBackend) AttachedPrograms() []string {
 	return programs
 }
 
+func (b *CgroupBackend) RuntimeStatus() CgroupRuntimeStatus {
+	if b == nil {
+		return CgroupRuntimeStatus{}
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return CgroupRuntimeStatus{}
+	}
+	status := CgroupRuntimeStatus{
+		UDPCleanupMode: cgroupUDPCleanupModeLocked(b.runtime),
+		Maps:           b.statusCollector.collect(b.runtime.maps),
+	}
+	var statsErr error
+	status.TCPRedirectReservationFailures, statsErr = b.redirectReservationFailuresLocked(ProtocolTCP)
+	if statsErr == nil {
+		status.UDPRedirectReservationFailures, statsErr = b.redirectReservationFailuresLocked(ProtocolUDP)
+	}
+	if statsErr != nil {
+		status.StatsError = statsErr.Error()
+	}
+	cgroupFD := int(b.runtime.cgroupFile.Fd())
+	for slot, definition := range cgroupProgramDefinitions {
+		program := b.runtime.programs[slot]
+		if program == nil {
+			continue
+		}
+		programStatus := runtimeProgramStatus(program, definition.name, b.cgroupProgramSection(slot, b.runtime.self_bypass_tgid))
+		programStatus.AttachType = definition.attachType.String()
+		programIDs, err := queryCgroupProgramIDs(cgroupFD, definition.attachType)
+		if err != nil {
+			programStatus.Error = err.Error()
+		} else {
+			for _, programID := range programIDs {
+				if uint32(programID) == programStatus.ID {
+					programStatus.Attached = true
+					break
+				}
+			}
+		}
+		status.Programs = append(status.Programs, programStatus)
+	}
+	return status
+}
+
 func (b *CgroupBackend) UsesSocketRelease() bool {
 	if b == nil {
 		return false
 	}
 	b.access.RLock()
 	defer b.access.RUnlock()
-	return b.runtime != nil && b.runtime.programs[cgroupProgramSocketRelease] != nil
+	return b.runtime != nil && b.runtime.socket_release_supported &&
+		b.runtime.programs[cgroupProgramSocketRelease] != nil
+}
+
+func (b *CgroupBackend) UDPCleanupMode() string {
+	if b == nil {
+		return cgroupUDPCleanupDisabled
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	return cgroupUDPCleanupModeLocked(b.runtime)
+}
+
+func cgroupUDPCleanupModeLocked(runtimeState *cgroupRuntime) string {
+	if runtimeState == nil || !runtimeState.enable_udp {
+		return cgroupUDPCleanupDisabled
+	}
+	if !runtimeState.socket_release_supported {
+		return cgroupUDPCleanupLRUFallback
+	}
+	if len(runtimeState.programs) <= cgroupProgramSocketRelease ||
+		runtimeState.programs[cgroupProgramSocketRelease] == nil {
+		return cgroupUDPCleanupInvalid
+	}
+	return cgroupUDPCleanupSocketRelease
 }
 
 func (b *CgroupBackend) LoadPrograms(listenerPort uint16) error {
@@ -572,7 +733,28 @@ func (b *CgroupBackend) loadCgroupObjectPrograms(tgidMode bool) ([]*CiliumEBPF.P
 	for index, slot := range slots {
 		programs[slot] = loaded[index]
 	}
+	if err = b.validateCgroupProgramSet(programs); err != nil {
+		_ = closePrograms(programs)
+		return nil, err
+	}
 	return programs, nil
+}
+
+func (b *CgroupBackend) validateCgroupProgramSet(programs []*CiliumEBPF.Program) error {
+	if !b.runtime.enable_udp {
+		return nil
+	}
+	if len(programs) <= cgroupProgramSocketRelease {
+		return E.New("incomplete cgroup program set")
+	}
+	hasSocketRelease := programs[cgroupProgramSocketRelease] != nil
+	if hasSocketRelease != b.runtime.socket_release_supported {
+		return E.New(
+			"inconsistent UDP cleanup program set: socket_release_program=", hasSocketRelease,
+			", socket_release_probe=", b.runtime.socket_release_supported,
+		)
+	}
+	return nil
 }
 
 func (b *CgroupBackend) cgroupProgramEnabled(slot int) bool {
@@ -628,7 +810,7 @@ func (b *CgroupBackend) cgroupProgramSection(slot int, tgidMode bool) string {
 		}
 		return "cgroup/recvmsg6"
 	case cgroupProgramSocketRelease:
-		return "cgroup/release_" + mode
+		return "cgroup/sock_release_" + mode
 	default:
 		return ""
 	}
@@ -669,11 +851,23 @@ func (b *CgroupBackend) updateCgroupControl(listenerPort uint16, selfTGID uint32
 	if b.runtime.bypass_ipv6_policy {
 		flags |= cgroupFlagBypassIPv6
 	}
+	if b.fakeIPIPv4.IsValid() {
+		flags |= cgroupFlagHostIPv4
+	}
+	if b.enableIPv6 && b.fakeIPIPv6.IsValid() {
+		flags |= cgroupFlagHostIPv6
+	}
 	if b.runtime.auto_ipv6 {
 		flags |= cgroupFlagAutoIPv6
 	}
 	if b.runtime.enable_udp && b.runtime.socket_release_supported {
 		flags |= cgroupFlagUDPFlow
+	}
+	if b.fakeIPIPv4.IsValid() {
+		flags |= cgroupFlagFakeIPIPv4
+	}
+	if b.fakeIPIPv6.IsValid() {
+		flags |= cgroupFlagFakeIPIPv6
 	}
 	ipv4Prefix, ipv4HostMask := cgroupIPv4Redirect(b.redirectIPv4)
 	control := cgroupControl{
@@ -687,6 +881,14 @@ func (b *CgroupBackend) updateCgroupControl(listenerPort uint16, selfTGID uint32
 	if b.redirectIPv6.IsValid() {
 		address := b.redirectIPv6.Addr().As16()
 		copy(control.RedirectIPv6Prefix[:], address[:8])
+	}
+	if b.fakeIPIPv4.IsValid() {
+		control.FakeIPIPv4Prefix = b.fakeIPIPv4.Addr().As4()
+		control.FakeIPIPv4Mask = prefixMask4(b.fakeIPIPv4.Bits())
+	}
+	if b.fakeIPIPv6.IsValid() {
+		control.FakeIPIPv6Prefix = b.fakeIPIPv6.Addr().As16()
+		control.FakeIPIPv6Mask = prefixMask16(b.fakeIPIPv6.Bits())
 	}
 	key := uint32(0)
 	return updateMap(b.runtime.control_map_fd, unsafe.Pointer(&key), unsafe.Pointer(&control))
@@ -748,7 +950,17 @@ func (b *CgroupBackend) Attach() error {
 		return err
 	}
 	cgroupFD := int(b.runtime.cgroupFile.Fd())
-	for slot, program := range b.runtime.programs {
+	attachOrder := make([]int, 0, cgroupProgramCount)
+	if b.runtime.programs[cgroupProgramSocketRelease] != nil {
+		attachOrder = append(attachOrder, cgroupProgramSocketRelease)
+	}
+	for slot := range b.runtime.programs {
+		if slot != cgroupProgramSocketRelease {
+			attachOrder = append(attachOrder, slot)
+		}
+	}
+	for _, slot := range attachOrder {
+		program := b.runtime.programs[slot]
 		if program == nil {
 			continue
 		}
@@ -757,6 +969,11 @@ func (b *CgroupBackend) Attach() error {
 			return eBPFBackendOperationError("attach eBPF inbound", cgroupProgramDefinitions[slot].name, err)
 		}
 		b.runtime.attached[slot] = true
+	}
+	if b.runtime.enable_udp && b.runtime.socket_release_supported &&
+		!b.runtime.attached[cgroupProgramSocketRelease] {
+		_ = b.detachProgramsLocked()
+		return eBPFOperationError("attach eBPF inbound UDP cleanup", unix.EINVAL)
 	}
 	return nil
 }
@@ -801,14 +1018,19 @@ func (b *CgroupBackend) Close() error {
 	b.runtime = nil
 	b.tcpRedirectMapFD = -1
 	b.udpRedirectMapFD = -1
+	b.udpRecoveryMapFD = -1
 	b.udpFlowMapFD = -1
 	b.socketBypassMapFD = -1
 	b.pendingSocketCookies = nil
 	b.bypassIPv4CIDRMapFD = -1
 	b.bypassIPv6CIDRMapFD = -1
+	b.hostIPv4MapFD = -1
+	b.hostIPv6MapFD = -1
 	b.ipv6AvailableMapFD = -1
 	b.bypassIPv4CIDR = nil
 	b.bypassIPv6CIDR = nil
+	b.hostIPv4 = nil
+	b.hostIPv6 = nil
 	return closeErr
 }
 

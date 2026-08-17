@@ -114,6 +114,40 @@ func (b *CgroupBackend) BypassCIDRCount() (int, int) {
 	return len(b.bypassIPv4CIDR), len(b.bypassIPv6CIDR)
 }
 
+func (b *CgroupBackend) UpdateHostAddresses(addresses []netip.Addr) error {
+	if b == nil {
+		return errBackendClosed
+	}
+	ipv4, ipv6 := compileHostPrefixes(addresses)
+	if len(ipv4) > 256 || len(ipv6) > 256 {
+		return E.New("local cgroup host address policy exceeds eBPF map capacity")
+	}
+	b.access.Lock()
+	defer b.access.Unlock()
+	if err := b.health.requireUsable(b.runtime != nil); err != nil {
+		return err
+	}
+	oldPrefixes := dualStackCIDRPrefixes{b.hostIPv4, b.hostIPv6}
+	newPrefixes := dualStackCIDRPrefixes{ipv4, ipv6}
+	_, err := replaceDualStackCIDRPolicy(
+		b.hostIPv4MapFD,
+		b.hostIPv6MapFD,
+		oldPrefixes,
+		newPrefixes,
+		"local cgroup ",
+		"host address",
+	)
+	if err != nil {
+		if policyRollbackFailed(err) {
+			return E.Errors(err, b.health.invalidate("cgroup", "host address policy"))
+		}
+		return err
+	}
+	b.hostIPv4 = slices.Clone(ipv4)
+	b.hostIPv6 = slices.Clone(ipv6)
+	return nil
+}
+
 type dualStackCIDRPrefixes struct {
 	ipv4 []netip.Prefix
 	ipv6 []netip.Prefix

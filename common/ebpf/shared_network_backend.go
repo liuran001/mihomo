@@ -56,6 +56,7 @@ type SharedNetworkBackend struct {
 	flowSweepCandidates []sharedNetworkFlowEntry
 	proxyUsage          atomic.Uint32
 	proxyUsageKnown     atomic.Bool
+	statusCollector     runtimeStatusCollector
 	runtime             *sharedNetworkRuntime
 	statsMapFD          int
 	mapCapacity         SharedNetworkMapCapacities
@@ -77,6 +78,14 @@ type SharedNetworkBackend struct {
 func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConfig) (*SharedNetworkBackend, error) {
 	redirectIPv4 := config.RedirectIPv4
 	redirectIPv6 := config.RedirectIPv6
+	fakeIPIPv4, err := normalizeAddressPrefix("IPv4 FakeIP range", config.FakeIPIPv4, true)
+	if err != nil {
+		return nil, err
+	}
+	fakeIPIPv6, err := normalizeAddressPrefix("IPv6 FakeIP range", config.FakeIPIPv6, false)
+	if err != nil {
+		return nil, err
+	}
 	for name, capacity := range map[string]uint32{
 		"shared-network proxy":    config.MapCapacity.Proxy,
 		"shared-network bypass":   config.MapCapacity.Bypass,
@@ -194,6 +203,16 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		backend.control.Flags |= sharedNetworkFlagIPv6
 		backend.control.TokenIPv6Prefix = redirectIPv6.Addr().As16()
 		backend.control.TokenIPv6PrefixBits = uint8(redirectIPv6.Bits())
+	}
+	if fakeIPIPv4.IsValid() {
+		backend.control.Flags |= sharedNetworkFlagFakeIPIPv4
+		backend.control.FakeIPIPv4Prefix = fakeIPIPv4.Addr().As4()
+		backend.control.FakeIPIPv4Mask = prefixMask4(fakeIPIPv4.Bits())
+	}
+	if fakeIPIPv6.IsValid() {
+		backend.control.Flags |= sharedNetworkFlagFakeIPIPv6
+		backend.control.FakeIPIPv6Prefix = fakeIPIPv6.Addr().As16()
+		backend.control.FakeIPIPv6Mask = prefixMask16(fakeIPIPv6.Bits())
 	}
 	if err = backend.initializeSourceCIDRPolicy(config.IncludeSourceCIDR, config.ExcludeSourceCIDR); err != nil {
 		_ = backend.Close()
@@ -386,6 +405,30 @@ func (b *SharedNetworkBackend) EgressProgramFD() int {
 		return -1
 	}
 	return b.runtime.egress_prog_fd
+}
+
+func (b *SharedNetworkBackend) RuntimeStatus() SharedNetworkRuntimeStatus {
+	if b == nil {
+		return SharedNetworkRuntimeStatus{}
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return SharedNetworkRuntimeStatus{}
+	}
+	status := SharedNetworkRuntimeStatus{
+		Maps: b.statusCollector.collect(b.runtime.maps),
+	}
+	for slot, program := range b.runtime.programs {
+		name := "sb_share_in"
+		section := "classifier/ingress"
+		if slot == sharedNetworkProgramEgress {
+			name = "sb_share_out"
+			section = "classifier/egress"
+		}
+		status.Programs = append(status.Programs, runtimeProgramStatus(program, name, section))
+	}
+	return status
 }
 
 func (b *SharedNetworkBackend) Close() error {

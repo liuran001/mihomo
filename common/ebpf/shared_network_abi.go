@@ -30,6 +30,8 @@ type SharedNetworkConfig struct {
 	BypassPrivateAddress bool
 	RedirectIPv4         netip.Prefix
 	RedirectIPv6         netip.Prefix
+	FakeIPIPv4           netip.Prefix
+	FakeIPIPv6           netip.Prefix
 	IncludeSourceCIDR    []netip.Prefix
 	ExcludeSourceCIDR    []netip.Prefix
 	IncludeSourceMAC     []MACAddress
@@ -56,6 +58,10 @@ type sharedNetworkControl struct {
 	Reserved2           [2]byte
 	TokenIPv6Prefix     [16]byte
 	UDPTimeoutSeconds   uint32
+	FakeIPIPv4Prefix    [4]byte
+	FakeIPIPv4Mask      [4]byte
+	FakeIPIPv6Prefix    [16]byte
+	FakeIPIPv6Mask      [16]byte
 }
 
 func sharedNetworkUDPTimeoutSeconds(timeout time.Duration) (uint32, error) {
@@ -160,6 +166,8 @@ const (
 	sharedNetworkFlagBypassPrivateAddress
 	sharedNetworkFlagBypassFlowCache
 	sharedNetworkFlagDNSRespectBypass
+	sharedNetworkFlagFakeIPIPv4
+	sharedNetworkFlagFakeIPIPv6
 )
 
 const sharedNetworkPolicyFlags = sharedNetworkFlagHostIPv4 |

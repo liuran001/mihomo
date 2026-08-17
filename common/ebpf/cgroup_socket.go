@@ -116,19 +116,40 @@ func (b *CgroupBackend) lookupOriginal(
 	if err != nil {
 		return OriginalDestination{}, E.Cause(err, "lookup original destination")
 	}
-	var address netip.Addr
-	switch original.Family {
-	case addressFamilyIPv4:
-		address = netip.AddrFrom4([4]byte(original.Addr[:4]))
-	case addressFamilyIPv6:
-		address = netip.AddrFrom16(original.Addr)
-	default:
-		return OriginalDestination{}, E.New("invalid original destination family: ", original.Family)
+	return originalDestinationFromValue(original)
+}
+
+func (b *CgroupBackend) RecoverUDPOriginal(listenerDestination netip.AddrPort) (OriginalDestination, error) {
+	if b == nil {
+		return OriginalDestination{}, errBackendClosed
 	}
-	return OriginalDestination{
-		Destination:  netip.AddrPortFrom(address.Unmap(), original.Port),
-		ConnectedUDP: original.Flags&1 != 0,
-	}, nil
+	key, err := makeListenerLookupKey(ProtocolUDP, listenerDestination)
+	if err != nil {
+		return OriginalDestination{}, err
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return OriginalDestination{}, errBackendClosed
+	}
+	var original originalDestinationValue
+	if err = lookupMap(b.udpRecoveryMapFD, unsafe.Pointer(&key), unsafe.Pointer(&original)); err != nil {
+		return OriginalDestination{}, E.Cause(err, "lookup recoverable UDP original destination")
+	}
+	if err = updateMapWithFlags(
+		b.udpRedirectMapFD,
+		unsafe.Pointer(&key),
+		unsafe.Pointer(&original),
+		bpfNoExist,
+	); err != nil {
+		if !errors.Is(err, unix.EEXIST) {
+			return OriginalDestination{}, E.Cause(err, "restore UDP original destination")
+		}
+		if err = lookupMap(b.udpRedirectMapFD, unsafe.Pointer(&key), unsafe.Pointer(&original)); err != nil {
+			return OriginalDestination{}, E.Cause(err, "lookup concurrently restored UDP original destination")
+		}
+	}
+	return originalDestinationFromValue(original)
 }
 
 func (b *CgroupBackend) takeMapElement(mapFD int, key unsafe.Pointer, value unsafe.Pointer) error {
@@ -299,6 +320,15 @@ func (b *CgroupBackend) DeleteRedirect(protocol uint8, listenerDestination netip
 	if protocol == ProtocolUDP && b.udpFlowMapFD >= 0 {
 		var original originalDestinationValue
 		lookupErr := lookupMap(redirectMap, unsafe.Pointer(&key), unsafe.Pointer(&original))
+		if lookupErr == nil {
+			if recoveryErr := updateMap(
+				b.udpRecoveryMapFD,
+				unsafe.Pointer(&key),
+				unsafe.Pointer(&original),
+			); recoveryErr != nil {
+				return E.Cause(recoveryErr, "retain recoverable UDP original destination")
+			}
+		}
 		if lookupErr == nil && original.SocketCookie != 0 {
 			flowKey := makeUDPFlowKey(original)
 			flowErr := deleteMap(b.udpFlowMapFD, unsafe.Pointer(&flowKey))
@@ -334,6 +364,15 @@ func (b *CgroupBackend) RedirectReservationFailures(protocol uint8) (uint64, err
 	if b == nil {
 		return 0, errBackendClosed
 	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return 0, errBackendClosed
+	}
+	return b.redirectReservationFailuresLocked(protocol)
+}
+
+func (b *CgroupBackend) redirectReservationFailuresLocked(protocol uint8) (uint64, error) {
 	var key uint32
 	switch protocol {
 	case ProtocolTCP:
@@ -342,11 +381,6 @@ func (b *CgroupBackend) RedirectReservationFailures(protocol uint8) (uint64, err
 		key = cgroupStatUDPRedirectFailure
 	default:
 		return 0, unix.EPROTONOSUPPORT
-	}
-	b.access.RLock()
-	defer b.access.RUnlock()
-	if b.runtime == nil {
-		return 0, errBackendClosed
 	}
 	var failures uint64
 	if err := lookupMap(b.statsMapFD, unsafe.Pointer(&key), unsafe.Pointer(&failures)); err != nil {

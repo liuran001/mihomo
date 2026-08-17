@@ -482,50 +482,60 @@ NOINLINE __u64 ipv6_transport_offset(
     if ((void *)(ip + 1) > data_end) return IPV6_TRANSPORT_DROP;
     __u8 protocol = ip->next_header;
     __u32 offset = l3_offset + sizeof(*ip);
+    __u64 result = 0U;
 #pragma clang loop unroll(full)
     for (__u32 depth = 0U; depth < 4U; ++depth) {
+        if (result != 0U) continue;
         if (protocol == IPPROTO_TCP_VALUE || protocol == IPPROTO_UDP_VALUE) {
             *protocol_out = protocol;
-            return offset;
-        }
-        if (protocol == 44U) {
+            result = offset;
+        } else if (protocol == 44U) {
             struct ipv6_fragment_header *fragment = data + offset;
-            if ((void *)(fragment + 1) > data_end) return IPV6_TRANSPORT_DROP;
+            if ((void *)(fragment + 1) > data_end) {
+                result = IPV6_TRANSPORT_DROP;
+                continue;
+            }
             protocol = fragment->next_header;
             if (protocol != IPPROTO_TCP_VALUE && protocol != IPPROTO_UDP_VALUE) {
                 if (protocol == 0U || protocol == 43U || protocol == 60U ||
                     protocol == 51U || protocol == 44U) {
-                    return IPV6_TRANSPORT_DROP;
+                    result = IPV6_TRANSPORT_DROP;
+                } else {
+                    result = IPV6_TRANSPORT_BYPASS;
                 }
-                return IPV6_TRANSPORT_BYPASS;
+                continue;
             }
             __u16 fragment_offset = swap16(fragment->fragment_offset);
             offset += sizeof(*fragment);
             if ((fragment_offset & (IPV6_FRAGMENT_OFFSET_MASK | IPV6_FRAGMENT_MORE)) == 0U) {
                 *protocol_out = protocol;
-                return offset;
+                result = offset;
+                continue;
             }
             *protocol_out = protocol;
             __u64 fragment_state = (fragment_offset & IPV6_FRAGMENT_OFFSET_MASK) == 0U
                 ? SB_SHARED_FRAGMENT_FIRST
                 : SB_SHARED_FRAGMENT_LATER;
-            return ((__u64)fragment->identification << 32U) |
+            result = ((__u64)fragment->identification << 32U) |
                 (fragment_state << IPV6_FRAGMENT_STATE_SHIFT) |
                 (__u64)offset;
+        } else if (protocol != 0U && protocol != 43U && protocol != 60U && protocol != 51U) {
+            result = IPV6_TRANSPORT_BYPASS;
+        } else {
+            struct ipv6_extension_header *extension = data + offset;
+            if ((void *)(extension + 1) > data_end) {
+                result = IPV6_TRANSPORT_DROP;
+                continue;
+            }
+            __u8 current = protocol;
+            protocol = extension->next_header;
+            offset += current == 51U
+                ? ((__u32)extension->length + 2U) * 4U
+                : ((__u32)extension->length + 1U) * 8U;
+            if (data + offset > data_end) result = IPV6_TRANSPORT_DROP;
         }
-        if (protocol != 0U && protocol != 43U && protocol != 60U && protocol != 51U) {
-            return IPV6_TRANSPORT_BYPASS;
-        }
-        struct ipv6_extension_header *extension = data + offset;
-        if ((void *)(extension + 1) > data_end) return IPV6_TRANSPORT_DROP;
-        __u8 current = protocol;
-        protocol = extension->next_header;
-        offset += current == 51U
-            ? ((__u32)extension->length + 2U) * 4U
-            : ((__u32)extension->length + 1U) * 8U;
-        if (data + offset > data_end) return IPV6_TRANSPORT_DROP;
     }
-    return IPV6_TRANSPORT_DROP;
+    return result == 0U ? IPV6_TRANSPORT_DROP : result;
 }
 
 NOINLINE int ingress_ipv6(
@@ -825,7 +835,7 @@ NOINLINE int egress_ipv6(
         protocol);
 }
 
-NOINLINE int classify(struct __sk_buff *skb, bool ingress) {
+NOINLINE int classify_ingress(struct __sk_buff *skb) {
     __u32 zero = 0U;
     struct sb_shared_control *control = map_lookup(&shared_control, &zero);
     if (control == 0 || control->enabled == 0U) return TC_ACT_PIPE;
@@ -843,15 +853,6 @@ NOINLINE int classify(struct __sk_buff *skb, bool ingress) {
         protocol = swap16(vlan->protocol);
         l3_offset += sizeof(*vlan);
     }
-    if (!ingress) {
-        if (protocol == ETH_P_IP_VALUE && (control->flags & SB_SHARED_FLAG_IPV4) != 0U) {
-            return egress_ipv4(skb, l3_offset, control);
-        }
-        if (protocol == ETH_P_IPV6_VALUE && (control->flags & SB_SHARED_FLAG_IPV6) != 0U) {
-            return egress_ipv6(skb, l3_offset, control);
-        }
-        return TC_ACT_PIPE;
-    }
     __u32 source_mac_first;
     __u16 source_mac_last;
     __builtin_memcpy(&source_mac_first, ethernet->source, 4U);
@@ -865,14 +866,41 @@ NOINLINE int classify(struct __sk_buff *skb, bool ingress) {
     return TC_ACT_PIPE;
 }
 
+NOINLINE int classify_egress(struct __sk_buff *skb) {
+    __u32 zero = 0U;
+    struct sb_shared_control *control = map_lookup(&shared_control, &zero);
+    if (control == 0 || control->enabled == 0U) return TC_ACT_PIPE;
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    struct ethernet_header *ethernet = data;
+    if ((void *)(ethernet + 1) > data_end) return TC_ACT_PIPE;
+    __u16 protocol = swap16(ethernet->protocol);
+    __u32 l3_offset = sizeof(*ethernet);
+#pragma clang loop unroll(full)
+    for (__u32 depth = 0U; depth < 2U; ++depth) {
+        if (protocol != ETH_P_8021Q_VALUE && protocol != ETH_P_8021AD_VALUE) break;
+        struct vlan_header *vlan = data + l3_offset;
+        if ((void *)(vlan + 1) > data_end) return TC_ACT_PIPE;
+        protocol = swap16(vlan->protocol);
+        l3_offset += sizeof(*vlan);
+    }
+    if (protocol == ETH_P_IP_VALUE && (control->flags & SB_SHARED_FLAG_IPV4) != 0U) {
+        return egress_ipv4(skb, l3_offset, control);
+    }
+    if (protocol == ETH_P_IPV6_VALUE && (control->flags & SB_SHARED_FLAG_IPV6) != 0U) {
+        return egress_ipv6(skb, l3_offset, control);
+    }
+    return TC_ACT_PIPE;
+}
+
 SEC("classifier/ingress")
 int singbox_shared_ingress(struct __sk_buff *skb) {
-    return classify(skb, true);
+    return classify_ingress(skb);
 }
 
 SEC("classifier/egress")
 int singbox_shared_egress(struct __sk_buff *skb) {
-    return classify(skb, false);
+    return classify_egress(skb);
 }
 
 char _license[] SEC("license") = "GPL";

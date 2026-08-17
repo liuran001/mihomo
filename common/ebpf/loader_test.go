@@ -15,10 +15,11 @@ type objectMapLayout struct {
 
 func TestEmbeddedCgroupObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadCgroup, map[string]objectMapLayout{
-		"cgroup_control":        {4, 32},
+		"cgroup_control":        {4, 72},
 		"cgroup_stats":          {4, 8},
 		"cgroup_tcp_redirect":   {20, 40},
 		"cgroup_udp_redirect":   {20, 40},
+		"cgroup_udp_recovery":   {20, 40},
 		"cgroup_udp_token":      {8, 20},
 		"cgroup_udp_peer":       {8, 20},
 		"cgroup_udp_flow":       {32, 32},
@@ -26,6 +27,8 @@ func TestEmbeddedCgroupObjectLayout(t *testing.T) {
 		"cgroup_uid_policy":     {8, 1},
 		"cgroup_bypass_ipv4":    {8, 1},
 		"cgroup_bypass_ipv6":    {20, 1},
+		"cgroup_host_ipv4":      {8, 1},
+		"cgroup_host_ipv6":      {20, 1},
 		"cgroup_ipv6_available": {4, 4},
 	}, []string{
 		"cgroup/connect4_tgid",
@@ -55,14 +58,21 @@ func TestEmbeddedCgroupObjectLayout(t *testing.T) {
 		"cgroup/sendmsg6_mapped_cookie",
 		"cgroup/recvmsg6",
 		"cgroup/recvmsg6_mapped",
-		"cgroup/release_tgid",
-		"cgroup/release_cookie",
+		"cgroup/sock_release_tgid",
+		"cgroup/sock_release_cookie",
 	})
+	assertEmbeddedProgramType(
+		t,
+		loadCgroup,
+		[]string{"cgroup/sock_release_tgid", "cgroup/sock_release_cookie"},
+		CiliumEBPF.CGroupSock,
+		CiliumEBPF.AttachCgroupInetSockRelease,
+	)
 }
 
 func TestEmbeddedSharedNetworkObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadSharedNetwork, map[string]objectMapLayout{
-		"shared_control":             {4, 40},
+		"shared_control":             {4, 80},
 		"shared_stats":               {4, 8},
 		"shared_original_to_token":   {44, 40},
 		"shared_bypass_flow":         {44, 16},
@@ -120,6 +130,45 @@ func testEmbeddedObjectLayout(
 	}
 	for _, section := range sections {
 		if !availableSections[section] {
+			t.Errorf("missing program section %q", section)
+		}
+	}
+}
+
+func assertEmbeddedProgramType(
+	t *testing.T,
+	loadSpec func() (*CiliumEBPF.CollectionSpec, error),
+	sections []string,
+	programType CiliumEBPF.ProgramType,
+	attachType CiliumEBPF.AttachType,
+) {
+	t.Helper()
+	spec, err := loadSpec()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected := make(map[string]bool, len(sections))
+	for _, section := range sections {
+		expected[section] = false
+	}
+	for _, program := range spec.Programs {
+		if _, selected := expected[program.SectionName]; !selected {
+			continue
+		}
+		expected[program.SectionName] = true
+		if program.Type != programType || program.AttachType != attachType {
+			t.Errorf(
+				"program section %q has type/attach %v/%v, want %v/%v",
+				program.SectionName,
+				program.Type,
+				program.AttachType,
+				programType,
+				attachType,
+			)
+		}
+	}
+	for section, found := range expected {
+		if !found {
 			t.Errorf("missing program section %q", section)
 		}
 	}

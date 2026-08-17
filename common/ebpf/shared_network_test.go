@@ -10,7 +10,7 @@ import (
 )
 
 func TestSharedNetworkABI(t *testing.T) {
-	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 40 {
+	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 80 {
 		t.Fatalf("unexpected shared-network control size: %d", size)
 	}
 	if size := unsafe.Sizeof(sharedNetworkListenerKey{}); size != 40 {
@@ -42,6 +42,13 @@ func TestSharedNetworkABI(t *testing.T) {
 	}
 	if sharedNetworkFlagDNSRespectBypass != 1<<15 {
 		t.Fatalf("unexpected shared-network DNS respect-bypass flag: %#x", sharedNetworkFlagDNSRespectBypass)
+	}
+	if sharedNetworkFlagFakeIPIPv4 != 1<<16 || sharedNetworkFlagFakeIPIPv6 != 1<<17 {
+		t.Fatalf(
+			"unexpected shared-network FakeIP flags: IPv4=%#x IPv6=%#x",
+			sharedNetworkFlagFakeIPIPv4,
+			sharedNetworkFlagFakeIPIPv6,
+		)
 	}
 	if sharedNetworkPolicyFlags != 0x5fe0 {
 		t.Fatalf("unexpected shared-network policy flags: %#x", sharedNetworkPolicyFlags)
@@ -162,7 +169,7 @@ func TestMakeSharedNetworkListenerKey(t *testing.T) {
 }
 
 func TestCompileSharedHostPrefixes(t *testing.T) {
-	ipv4, ipv6 := compileSharedHostPrefixes([]netip.Addr{
+	ipv4, ipv6 := compileHostPrefixes([]netip.Addr{
 		netip.MustParseAddr("192.0.2.2"),
 		netip.MustParseAddr("192.0.2.1"),
 		netip.MustParseAddr("192.0.2.2"),

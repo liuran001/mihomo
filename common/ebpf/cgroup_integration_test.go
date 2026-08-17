@@ -244,6 +244,18 @@ func testCgroupBackendProgramLoad(t *testing.T, options cgroupProgramLoadOptions
 			t.Fatal(err)
 		}
 	}
+	runtimeStatus := backend.RuntimeStatus()
+	if len(runtimeStatus.Maps) == 0 || len(runtimeStatus.Programs) == 0 {
+		t.Fatalf("incomplete cgroup runtime status: %+v", runtimeStatus)
+	}
+	for _, program := range runtimeStatus.Programs {
+		if !program.Loaded || program.ID == 0 || program.Error != "" {
+			t.Fatalf("invalid cgroup program runtime status: %+v", program)
+		}
+		if os.Getenv("SING_BOX_EBPF_INTEGRATION_ATTACH") == "1" && !program.Attached {
+			t.Fatalf("attached cgroup program was not reported: %+v", program)
+		}
+	}
 }
 
 func TestSharedNetworkSharedMapProgramLoadIntegration(t *testing.T) {
@@ -649,6 +661,21 @@ func TestCgroupBackendTrafficIntegration(t *testing.T) {
 		if err = lookupMap(backend.udpFlowMapFD, unsafe.Pointer(&flowKey), unsafe.Pointer(&cachedFlow)); !errors.Is(err, unix.ENOENT) {
 			t.Fatalf("UDP flow cache survived redirect cleanup: %v", err)
 		}
+	}
+	if _, err = backend.LookupOriginal(ProtocolUDP, udpRedirectDestination); !errors.Is(err, unix.ENOENT) {
+		t.Fatalf("UDP redirect survived cleanup: %v", err)
+	}
+	recoveredOriginal, err := backend.RecoverUDPOriginal(udpRedirectDestination)
+	if err != nil {
+		t.Fatal("recover cleaned UDP redirect: ", err)
+	}
+	if recoveredOriginal.Destination != udpOriginal.Destination ||
+		recoveredOriginal.ConnectedUDP != udpOriginal.ConnectedUDP ||
+		!bytes.Equal(recoveredOriginal.SourceMAC, udpOriginal.SourceMAC) {
+		t.Fatalf("unexpected recovered UDP original: %+v", recoveredOriginal)
+	}
+	if _, err = backend.LookupOriginal(ProtocolUDP, udpRedirectDestination); err != nil {
+		t.Fatal("recovered UDP redirect was not restored: ", err)
 	}
 
 	if err = helper.Wait(); err != nil {

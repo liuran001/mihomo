@@ -19,12 +19,15 @@ const (
 	CgroupMapCgroupBypassIpv4            = "cgroup_bypass_ipv4"
 	CgroupMapCgroupBypassIpv6            = "cgroup_bypass_ipv6"
 	CgroupMapCgroupControl               = "cgroup_control"
+	CgroupMapCgroupHostIpv4              = "cgroup_host_ipv4"
+	CgroupMapCgroupHostIpv6              = "cgroup_host_ipv6"
 	CgroupMapCgroupIpv6Available         = "cgroup_ipv6_available"
 	CgroupMapCgroupSocketBypass          = "cgroup_socket_bypass"
 	CgroupMapCgroupStats                 = "cgroup_stats"
 	CgroupMapCgroupTcpRedirect           = "cgroup_tcp_redirect"
 	CgroupMapCgroupUdpFlow               = "cgroup_udp_flow"
 	CgroupMapCgroupUdpPeer               = "cgroup_udp_peer"
+	CgroupMapCgroupUdpRecovery           = "cgroup_udp_recovery"
 	CgroupMapCgroupUdpRedirect           = "cgroup_udp_redirect"
 	CgroupMapCgroupUdpToken              = "cgroup_udp_token"
 	CgroupMapCgroupUidPolicy             = "cgroup_uid_policy"
@@ -139,12 +142,15 @@ type CgroupMapSpecs struct {
 	CgroupBypassIpv4    *ebpf.MapSpec `ebpf:"cgroup_bypass_ipv4"`
 	CgroupBypassIpv6    *ebpf.MapSpec `ebpf:"cgroup_bypass_ipv6"`
 	CgroupControl       *ebpf.MapSpec `ebpf:"cgroup_control"`
+	CgroupHostIpv4      *ebpf.MapSpec `ebpf:"cgroup_host_ipv4"`
+	CgroupHostIpv6      *ebpf.MapSpec `ebpf:"cgroup_host_ipv6"`
 	CgroupIpv6Available *ebpf.MapSpec `ebpf:"cgroup_ipv6_available"`
 	CgroupSocketBypass  *ebpf.MapSpec `ebpf:"cgroup_socket_bypass"`
 	CgroupStats         *ebpf.MapSpec `ebpf:"cgroup_stats"`
 	CgroupTcpRedirect   *ebpf.MapSpec `ebpf:"cgroup_tcp_redirect"`
 	CgroupUdpFlow       *ebpf.MapSpec `ebpf:"cgroup_udp_flow"`
 	CgroupUdpPeer       *ebpf.MapSpec `ebpf:"cgroup_udp_peer"`
+	CgroupUdpRecovery   *ebpf.MapSpec `ebpf:"cgroup_udp_recovery"`
 	CgroupUdpRedirect   *ebpf.MapSpec `ebpf:"cgroup_udp_redirect"`
 	CgroupUdpToken      *ebpf.MapSpec `ebpf:"cgroup_udp_token"`
 	CgroupUidPolicy     *ebpf.MapSpec `ebpf:"cgroup_uid_policy"`
@@ -179,12 +185,15 @@ type CgroupMaps struct {
 	CgroupBypassIpv4    *ebpf.Map `ebpf:"cgroup_bypass_ipv4"`
 	CgroupBypassIpv6    *ebpf.Map `ebpf:"cgroup_bypass_ipv6"`
 	CgroupControl       *ebpf.Map `ebpf:"cgroup_control"`
+	CgroupHostIpv4      *ebpf.Map `ebpf:"cgroup_host_ipv4"`
+	CgroupHostIpv6      *ebpf.Map `ebpf:"cgroup_host_ipv6"`
 	CgroupIpv6Available *ebpf.Map `ebpf:"cgroup_ipv6_available"`
 	CgroupSocketBypass  *ebpf.Map `ebpf:"cgroup_socket_bypass"`
 	CgroupStats         *ebpf.Map `ebpf:"cgroup_stats"`
 	CgroupTcpRedirect   *ebpf.Map `ebpf:"cgroup_tcp_redirect"`
 	CgroupUdpFlow       *ebpf.Map `ebpf:"cgroup_udp_flow"`
 	CgroupUdpPeer       *ebpf.Map `ebpf:"cgroup_udp_peer"`
+	CgroupUdpRecovery   *ebpf.Map `ebpf:"cgroup_udp_recovery"`
 	CgroupUdpRedirect   *ebpf.Map `ebpf:"cgroup_udp_redirect"`
 	CgroupUdpToken      *ebpf.Map `ebpf:"cgroup_udp_token"`
 	CgroupUidPolicy     *ebpf.Map `ebpf:"cgroup_uid_policy"`
@@ -195,12 +204,15 @@ func (m *CgroupMaps) Close() error {
 		m.CgroupBypassIpv4,
 		m.CgroupBypassIpv6,
 		m.CgroupControl,
+		m.CgroupHostIpv4,
+		m.CgroupHostIpv6,
 		m.CgroupIpv6Available,
 		m.CgroupSocketBypass,
 		m.CgroupStats,
 		m.CgroupTcpRedirect,
 		m.CgroupUdpFlow,
 		m.CgroupUdpPeer,
+		m.CgroupUdpRecovery,
 		m.CgroupUdpRedirect,
 		m.CgroupUdpToken,
 		m.CgroupUidPolicy,

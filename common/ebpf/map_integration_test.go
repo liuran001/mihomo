@@ -125,3 +125,31 @@ func TestMapBatchIntegration(t *testing.T) {
 		})
 	}
 }
+
+func TestLRUFallbackBoundedIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "test bounded LRU fallback")
+	const maxEntries = 8
+	mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+		Type:       CiliumEBPF.LRUHash,
+		KeySize:    uint32(unsafe.Sizeof(uint64(0))),
+		ValueSize:  uint32(unsafe.Sizeof(uint64(0))),
+		MaxEntries: maxEntries,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mapInstance.Close() })
+	for key := uint64(0); key < 256; key++ {
+		value := key + 1
+		if err = updateMap(mapInstance.FD(), unsafe.Pointer(&key), unsafe.Pointer(&value)); err != nil {
+			t.Fatalf("update LRU fallback at key %d: %v", key, err)
+		}
+	}
+	entries, err := countMapEntries(mapInstance.FD(), unsafe.Sizeof(uint64(0)), maxEntries)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entries != maxEntries {
+		t.Fatalf("unexpected bounded LRU entry count: %d", entries)
+	}
+}

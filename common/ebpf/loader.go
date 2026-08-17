@@ -118,6 +118,9 @@ func loadObjectPrograms(
 			delete(spec.Programs, symbol)
 			continue
 		}
+		if program.Type == CiliumEBPF.UnspecifiedProgram {
+			return nil, E.New("eBPF program section has unknown type: ", program.SectionName)
+		}
 		program.Name = selections[index].name
 		programSymbols[index] = symbol
 	}
@@ -158,8 +161,12 @@ func loadObjectPrograms(
 	}
 	programs := make([]*CiliumEBPF.Program, len(selections))
 	for index, symbol := range programSymbols {
-		programs[index] = collection.Programs[symbol]
-		delete(collection.Programs, symbol)
+		programs[index] = collection.DetachProgram(symbol)
+		if programs[index] == nil {
+			_ = closePrograms(programs)
+			collection.Close()
+			return nil, E.New("loaded eBPF collection is missing program ", symbol)
+		}
 	}
 	collection.Close()
 	return programs, nil
