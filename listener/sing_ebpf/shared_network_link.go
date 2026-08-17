@@ -26,6 +26,24 @@ func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, en
 			return nil, err
 		}
 	}
+	// Prefer the TCX link attachment when available; fall back to clsact.
+	if priority == defaultSharedNetworkTCPriority {
+		tcx, supported, tcxErr := backend.TryAttachTCX(link.Attrs().Index)
+		if tcxErr != nil {
+			if restoreRouteLocalnet {
+				_ = restoreSharedRouteLocalnet(link.Attrs().Name)
+			}
+			return nil, tcxErr
+		}
+		if supported {
+			return &sharedTCAttachment{
+				interfaceName:        link.Attrs().Name,
+				interfaceIndex:       link.Attrs().Index,
+				tcx:                  tcx,
+				restoreRouteLocalnet: restoreRouteLocalnet,
+			}, nil
+		}
+	}
 	if err := ensureClsact(link); err != nil {
 		if restoreRouteLocalnet {
 			_ = restoreSharedRouteLocalnet(link.Attrs().Name)

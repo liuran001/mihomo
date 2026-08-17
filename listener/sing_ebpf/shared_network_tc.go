@@ -49,6 +49,7 @@ type sharedTCManager struct {
 type sharedTCAttachment struct {
 	interfaceName        string
 	interfaceIndex       int
+	tcx                  *ECommon.SharedNetworkTCXAttachment
 	ingress              *netlink.BpfFilter
 	egress               *netlink.BpfFilter
 	restoreRouteLocalnet bool
@@ -197,10 +198,15 @@ func (m *sharedTCManager) updateEnabledLocked(enabled bool) error {
 }
 
 func (m *sharedTCManager) detachLocked(attachment *sharedTCAttachment) error {
-	detachErr := E.Errors(
-		detachSharedTCFilter(attachment.ingress),
-		detachSharedTCFilter(attachment.egress),
-	)
+	var detachErr error
+	if attachment.tcx != nil {
+		detachErr = attachment.tcx.Close()
+	} else {
+		detachErr = E.Errors(
+			detachSharedTCFilter(attachment.ingress),
+			detachSharedTCFilter(attachment.egress),
+		)
+	}
 	if detachErr != nil {
 		return detachErr
 	}
