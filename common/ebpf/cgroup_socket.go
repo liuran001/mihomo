@@ -152,6 +152,117 @@ func (b *CgroupBackend) RecoverUDPOriginal(listenerDestination netip.AddrPort) (
 	return originalDestinationFromValue(original)
 }
 
+func (b *CgroupBackend) RecoverConnectedUDPOriginal(listenerDestination netip.AddrPort) (OriginalDestination, error) {
+	if b == nil {
+		return OriginalDestination{}, errBackendClosed
+	}
+	listener, err := makeListenerLookupKey(ProtocolUDP, listenerDestination)
+	if err != nil {
+		return OriginalDestination{}, err
+	}
+	b.udpRecoveryAccess.Lock()
+	defer b.udpRecoveryAccess.Unlock()
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return OriginalDestination{}, errBackendClosed
+	}
+	if b.runtime.socket_release_supported {
+		return OriginalDestination{}, E.Cause(unix.ENOENT, "connected UDP LRU recovery is disabled")
+	}
+	tokenMap := b.runtime.maps["cgroup_udp_token"]
+	if tokenMap == nil {
+		return OriginalDestination{}, E.New("connected UDP token map is unavailable")
+	}
+	var (
+		cookie       uint64
+		currentToken listenerLookupKey
+		found        bool
+		scanned      uint32
+	)
+	iterator := tokenMap.Iterate()
+	for iterator.Next(&cookie, &currentToken) {
+		scanned++
+		if currentToken == listener {
+			found = true
+			break
+		}
+		if scanned >= b.mapCapacity.UDPRedirect {
+			break
+		}
+	}
+	if err = iterator.Err(); err != nil {
+		return OriginalDestination{}, E.Cause(err, "scan connected UDP token state")
+	}
+	if !found || cookie == 0 {
+		return OriginalDestination{}, E.Cause(unix.ENOENT, "find connected UDP token state")
+	}
+	var verifiedToken listenerLookupKey
+	if err = lookupMap(
+		b.runtime.udp_token_map_fd,
+		unsafe.Pointer(&cookie),
+		unsafe.Pointer(&verifiedToken),
+	); err != nil {
+		return OriginalDestination{}, E.Cause(err, "verify connected UDP token state")
+	}
+	if verifiedToken != listener {
+		return OriginalDestination{}, E.Cause(unix.ENOENT, "connected UDP token changed during recovery")
+	}
+	peerKey := udpPeerKey{SocketCookie: cookie}
+	var peer udpPeerValue
+	if err = lookupMap(
+		b.runtime.udp_peer_map_fd,
+		unsafe.Pointer(&peerKey),
+		unsafe.Pointer(&peer),
+	); err != nil {
+		return OriginalDestination{}, E.Cause(err, "lookup connected UDP peer state")
+	}
+	original, err := originalDestinationFromUDPPeer(cookie, peer)
+	if err != nil {
+		return OriginalDestination{}, E.Cause(err, "validate connected UDP peer state")
+	}
+	if original.Family != listener.Family {
+		return OriginalDestination{}, E.New(
+			"connected UDP token and peer family mismatch: token=", listener.Family,
+			", peer=", original.Family,
+		)
+	}
+	if err = lookupMap(
+		b.runtime.udp_token_map_fd,
+		unsafe.Pointer(&cookie),
+		unsafe.Pointer(&verifiedToken),
+	); err != nil {
+		return OriginalDestination{}, E.Cause(err, "revalidate connected UDP token state")
+	}
+	if verifiedToken != listener {
+		return OriginalDestination{}, E.Cause(unix.ENOENT, "connected UDP token changed during recovery")
+	}
+	err = updateMapWithFlags(
+		b.udpRedirectMapFD,
+		unsafe.Pointer(&listener),
+		unsafe.Pointer(&original),
+		bpfNoExist,
+	)
+	if errors.Is(err, unix.EEXIST) {
+		var existing originalDestinationValue
+		if lookupErr := lookupMap(
+			b.udpRedirectMapFD,
+			unsafe.Pointer(&listener),
+			unsafe.Pointer(&existing),
+		); lookupErr != nil {
+			return OriginalDestination{}, E.Cause(lookupErr, "verify concurrently restored connected UDP redirect")
+		}
+		if existing != original {
+			return OriginalDestination{}, E.New("connected UDP redirect token was concurrently claimed")
+		}
+		err = nil
+	}
+	if err != nil {
+		return OriginalDestination{}, E.Cause(err, "restore connected UDP redirect state")
+	}
+	return originalDestinationFromValue(original)
+}
+
 func (b *CgroupBackend) takeMapElement(mapFD int, key unsafe.Pointer, value unsafe.Pointer) error {
 	if b.lookupAndDeleteMode.Load() != mapLookupAndDeleteUnsupported {
 		err := lookupAndDeleteMap(mapFD, key, value)

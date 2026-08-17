@@ -97,6 +97,77 @@ func TestCgroupBackendProgramLoadIntegration(t *testing.T) {
 	})
 }
 
+func TestCgroupConnectedUDPRecoveryIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "recover connected UDP redirect state")
+	backend, err := PrepareCgroup(CgroupConfig{
+		Path:         os.Getenv("SING_BOX_EBPF_INTEGRATION_CGROUP"),
+		EnableUDP:    true,
+		RedirectIPv4: netip.MustParsePrefix("127.128.0.0/9"),
+		MapCapacity:  DefaultCgroupMapCapacity(),
+		UDPTimeout:   5 * time.Minute,
+		Policy:       CgroupPolicy{HijackDNS: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := backend.Close(); err != nil {
+			t.Errorf("close eBPF backend: %v", err)
+		}
+	})
+
+	// Exercise the fallback recovery independently of host sock-release support.
+	backend.access.Lock()
+	backend.runtime.socket_release_supported = false
+	backend.access.Unlock()
+	listenerDestination := netip.MustParseAddrPort("127.128.10.20:5300")
+	listener, err := makeListenerLookupKey(ProtocolUDP, listenerDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cookie := uint64(0x1020304050607080)
+	peer := udpPeerValue{
+		Family:   addressFamilyIPv4,
+		Protocol: ProtocolUDP,
+		Port:     53,
+	}
+	copy(peer.Addr[:4], netip.MustParseAddr("192.0.2.53").AsSlice())
+	peerKey := udpPeerKey{SocketCookie: cookie}
+	if err = updateMap(
+		backend.runtime.udp_token_map_fd,
+		unsafe.Pointer(&cookie),
+		unsafe.Pointer(&listener),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err = updateMap(
+		backend.runtime.udp_peer_map_fd,
+		unsafe.Pointer(&peerKey),
+		unsafe.Pointer(&peer),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = backend.LookupOriginal(ProtocolUDP, listenerDestination); !errors.Is(err, unix.ENOENT) {
+		t.Fatalf("unexpected redirect before recovery: %v", err)
+	}
+	recovered, err := backend.RecoverConnectedUDPOriginal(listenerDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if recovered.Destination != netip.MustParseAddrPort("192.0.2.53:53") || !recovered.ConnectedUDP {
+		t.Fatalf("unexpected recovered destination: %+v", recovered)
+	}
+	loaded, err := backend.LookupOriginal(ProtocolUDP, listenerDestination)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Destination != recovered.Destination ||
+		loaded.ConnectedUDP != recovered.ConnectedUDP ||
+		!bytes.Equal(loaded.SourceMAC, recovered.SourceMAC) {
+		t.Fatalf("restored redirect mismatch: loaded=%+v recovered=%+v", loaded, recovered)
+	}
+}
+
 type cgroupProgramLoadOptions struct {
 	enableTCP            bool
 	enableUDP            bool

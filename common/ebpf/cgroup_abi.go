@@ -22,8 +22,9 @@ const (
 	MaxConfigurableMapCapacity   = 1 << 20
 	cgroupStatTCPRedirectFailure = 0
 	cgroupStatUDPRedirectFailure
-	udpFlowActionProxy  = 1
-	udpFlowActionBypass = 2
+	originalDestinationFlagConnectedUDP = 1
+	udpFlowActionProxy                  = 1
+	udpFlowActionBypass                 = 2
 
 	addressFamilyIPv4 = 2
 	addressFamilyIPv6 = 10
@@ -201,8 +202,33 @@ func originalDestinationFromValue(original originalDestinationValue) (OriginalDe
 	}
 	return OriginalDestination{
 		Destination:  netip.AddrPortFrom(address.Unmap(), original.Port),
-		ConnectedUDP: original.Flags&1 != 0,
+		ConnectedUDP: original.Flags&originalDestinationFlagConnectedUDP != 0,
 	}, nil
+}
+
+func originalDestinationFromUDPPeer(cookie uint64, peer udpPeerValue) (originalDestinationValue, error) {
+	if cookie == 0 {
+		return originalDestinationValue{}, E.New("invalid connected UDP socket cookie")
+	}
+	if peer.Protocol != ProtocolUDP {
+		return originalDestinationValue{}, E.New("invalid connected UDP peer protocol: ", peer.Protocol)
+	}
+	value := originalDestinationValue{
+		Family:       peer.Family,
+		Protocol:     ProtocolUDP,
+		Port:         peer.Port,
+		Addr:         peer.Addr,
+		Flags:        originalDestinationFlagConnectedUDP,
+		SocketCookie: cookie,
+	}
+	original, err := originalDestinationFromValue(value)
+	if err != nil {
+		return originalDestinationValue{}, err
+	}
+	if !original.Destination.IsValid() || original.Destination.Port() == 0 || original.Destination.Addr().IsUnspecified() {
+		return originalDestinationValue{}, E.New("invalid connected UDP peer destination: ", original.Destination)
+	}
+	return value, nil
 }
 
 func makeListenerLookupKey(protocol uint8, listenerDestination netip.AddrPort) (listenerLookupKey, error) {

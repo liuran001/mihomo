@@ -103,3 +103,40 @@ func TestOriginalDestinationFromValue(t *testing.T) {
 		})
 	}
 }
+
+func TestOriginalDestinationFromUDPPeer(t *testing.T) {
+	peer := udpPeerValue{
+		Family:   addressFamilyIPv4,
+		Protocol: ProtocolUDP,
+		Port:     53,
+	}
+	copy(peer.Addr[:4], netip.MustParseAddr("192.0.2.53").AsSlice())
+	value, err := originalDestinationFromUDPPeer(42, peer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original, err := originalDestinationFromValue(value)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if original.Destination != netip.MustParseAddrPort("192.0.2.53:53") ||
+		!original.ConnectedUDP || value.SocketCookie != 42 {
+		t.Fatalf("unexpected connected UDP original destination: %+v", value)
+	}
+
+	invalid := []udpPeerValue{
+		{},
+		{Family: addressFamilyIPv4, Protocol: ProtocolTCP, Port: 53, Addr: peer.Addr},
+		{Family: addressFamilyIPv4, Protocol: ProtocolUDP, Addr: peer.Addr},
+		{Family: addressFamilyIPv4, Protocol: ProtocolUDP, Port: 53},
+		{Family: 255, Protocol: ProtocolUDP, Port: 53, Addr: peer.Addr},
+	}
+	for _, invalidPeer := range invalid {
+		if _, err = originalDestinationFromUDPPeer(42, invalidPeer); err == nil {
+			t.Fatalf("accepted invalid connected UDP peer: %+v", invalidPeer)
+		}
+	}
+	if _, err = originalDestinationFromUDPPeer(0, peer); err == nil {
+		t.Fatal("accepted an empty connected UDP socket cookie")
+	}
+}
