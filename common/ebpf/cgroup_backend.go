@@ -91,6 +91,7 @@ type CgroupBackend struct {
 	udpRecoveryAccess     sync.Mutex
 	tcpSweepScratch       mapScanScratch[listenerLookupKey, originalDestinationValue]
 	tcpSweepCandidates    []tcpRedirectEntry
+	tcpSweepRemoved       uint32
 	tcpRedirectUsage      atomic.Uint32
 	tcpRedirectUsageKnown atomic.Bool
 	lookupAndDeleteMode   atomic.Int32
@@ -852,12 +853,7 @@ func (b *CgroupBackend) updateCgroupControl(listenerPort uint16, selfTGID uint32
 	if b.runtime.bypass_ipv6_policy {
 		flags |= cgroupFlagBypassIPv6
 	}
-	if b.fakeIPIPv4.IsValid() {
-		flags |= cgroupFlagHostIPv4
-	}
-	if b.enableIPv6 && b.fakeIPIPv6.IsValid() {
-		flags |= cgroupFlagHostIPv6
-	}
+	flags |= b.hostAddressFlags()
 	if b.runtime.auto_ipv6 {
 		flags |= cgroupFlagAutoIPv6
 	}
@@ -893,6 +889,17 @@ func (b *CgroupBackend) updateCgroupControl(listenerPort uint16, selfTGID uint32
 	}
 	key := uint32(0)
 	return updateMap(b.runtime.control_map_fd, unsafe.Pointer(&key), unsafe.Pointer(&control))
+}
+
+func (b *CgroupBackend) hostAddressFlags() uint32 {
+	var flags uint32
+	if len(b.hostIPv4) > 0 {
+		flags |= cgroupFlagHostIPv4
+	}
+	if b.enableIPv6 && len(b.hostIPv6) > 0 {
+		flags |= cgroupFlagHostIPv6
+	}
+	return flags
 }
 
 func (b *CgroupBackend) UpdateIPv6Available(available bool) (bool, error) {

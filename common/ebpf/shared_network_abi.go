@@ -147,6 +147,7 @@ type SharedNetworkFlowSweepResult struct {
 	Removed  uint32
 	Retained uint32
 	Usage    MapUsage
+	Complete bool
 }
 
 const (

@@ -54,6 +54,7 @@ type SharedNetworkBackend struct {
 	flowSweepAccess     sync.Mutex
 	flowSweepScratch    mapScanScratch[sharedNetworkOriginalKey, sharedNetworkTokenValue]
 	flowSweepCandidates []sharedNetworkFlowEntry
+	flowSweepRemoved    uint32
 	proxyUsage          atomic.Uint32
 	proxyUsageKnown     atomic.Bool
 	statusCollector     runtimeStatusCollector

@@ -297,11 +297,14 @@ type tcpRedirectEntry struct {
 	value originalDestinationValue
 }
 
-func (b *CgroupBackend) SweepStaleTCPRedirects(maxAge time.Duration) (CgroupTCPRedirectSweepResult, error) {
+func (b *CgroupBackend) SweepStaleTCPRedirects(
+	maxAge time.Duration,
+	fallbackBudget uint32,
+) (CgroupTCPRedirectSweepResult, error) {
 	if b == nil {
 		return CgroupTCPRedirectSweepResult{}, errBackendClosed
 	}
-	if maxAge <= 0 {
+	if maxAge <= 0 || fallbackBudget == 0 {
 		return CgroupTCPRedirectSweepResult{}, unix.EINVAL
 	}
 	b.tcpSweepAccess.Lock()
@@ -314,7 +317,10 @@ func (b *CgroupBackend) SweepStaleTCPRedirects(maxAge time.Duration) (CgroupTCPR
 	nowNS := uint64(now.Sec)*uint64(time.Second) + uint64(now.Nsec)
 	maxAgeNS := uint64(maxAge)
 	if nowNS <= maxAgeNS {
-		return CgroupTCPRedirectSweepResult{Usage: MapUsage{Capacity: b.mapCapacity.TCPRedirect}}, nil
+		return CgroupTCPRedirectSweepResult{
+			Usage:    MapUsage{Capacity: b.mapCapacity.TCPRedirect},
+			Complete: true,
+		}, nil
 	}
 	staleBefore := nowNS - maxAgeNS
 
@@ -324,9 +330,10 @@ func (b *CgroupBackend) SweepStaleTCPRedirects(maxAge time.Duration) (CgroupTCPR
 		return CgroupTCPRedirectSweepResult{}, errBackendClosed
 	}
 	b.tcpSweepCandidates = b.tcpSweepCandidates[:0]
-	scanned, err := b.tcpSweepScratch.scan(
+	scan, err := b.tcpSweepScratch.scan(
 		b.tcpRedirectMapFD,
 		b.mapCapacity.TCPRedirect,
+		fallbackBudget,
 		func(key listenerLookupKey, value originalDestinationValue) {
 			if value.CreatedAtNS != 0 && value.CreatedAtNS <= staleBefore {
 				b.tcpSweepCandidates = append(b.tcpSweepCandidates, tcpRedirectEntry{key: key, value: value})
@@ -337,8 +344,12 @@ func (b *CgroupBackend) SweepStaleTCPRedirects(maxAge time.Duration) (CgroupTCPR
 		return CgroupTCPRedirectSweepResult{}, err
 	}
 	result := CgroupTCPRedirectSweepResult{
-		Scanned: scanned,
-		Usage:   MapUsage{Entries: scanned, Capacity: b.mapCapacity.TCPRedirect},
+		Scanned:  scan.Scanned,
+		Usage:    MapUsage{Capacity: b.mapCapacity.TCPRedirect},
+		Complete: scan.Complete,
+	}
+	if b.tcpRedirectUsageKnown.Load() {
+		result.Usage.Entries = b.tcpRedirectUsage.Load()
 	}
 	var sweepErr error
 	for _, entry := range b.tcpSweepCandidates {
@@ -360,9 +371,18 @@ func (b *CgroupBackend) SweepStaleTCPRedirects(maxAge time.Duration) (CgroupTCPR
 		}
 		result.Removed++
 	}
-	result.Usage.Entries -= result.Removed
-	b.tcpRedirectUsage.Store(result.Usage.Entries)
-	b.tcpRedirectUsageKnown.Store(true)
+	b.tcpSweepRemoved += result.Removed
+	if result.Complete {
+		result.Usage.Entries = scan.Entries
+		if b.tcpSweepRemoved >= result.Usage.Entries {
+			result.Usage.Entries = 0
+		} else {
+			result.Usage.Entries -= b.tcpSweepRemoved
+		}
+		b.tcpSweepRemoved = 0
+		b.tcpRedirectUsage.Store(result.Usage.Entries)
+		b.tcpRedirectUsageKnown.Store(true)
+	}
 	return result, sweepErr
 }
 

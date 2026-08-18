@@ -214,7 +214,7 @@ func testCgroupBackendProgramLoad(t *testing.T, options cgroupProgramLoadOptions
 		if usage.Entries != 0 || usage.Capacity != backend.mapCapacity.TCPRedirect {
 			t.Fatalf("unexpected TCP usage before first sweep: %+v", usage)
 		}
-		sweep, sweepErr := backend.SweepStaleTCPRedirects(time.Nanosecond)
+		sweep, sweepErr := backend.SweepStaleTCPRedirects(time.Nanosecond, mapBatchMaxEntries)
 		if sweepErr != nil {
 			t.Fatal(sweepErr)
 		}
@@ -405,7 +405,7 @@ func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend,
 	if usage.Entries != 0 || usage.Capacity != sharedBackend.mapCapacity.Proxy {
 		t.Fatalf("unexpected proxy usage before first sweep: %+v", usage)
 	}
-	sweep, sweepErr := sharedBackend.SweepOrphanedFlows(time.Nanosecond)
+	sweep, sweepErr := sharedBackend.SweepOrphanedFlows(time.Nanosecond, mapBatchMaxEntries)
 	if sweepErr != nil {
 		t.Fatal(sweepErr)
 	}
@@ -1088,7 +1088,7 @@ func TestSharedNetworkStandaloneProgramLoadIntegration(t *testing.T) {
 	}
 }
 
-func requireEBPFIntegration(t *testing.T, action string) {
+func requireEBPFIntegration(t testing.TB, action string) {
 	t.Helper()
 	if os.Getenv(integrationTestEnv) != "1" {
 		t.Skip("set " + integrationTestEnv + "=1 to " + action)

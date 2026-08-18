@@ -152,9 +152,6 @@ func loadObjectPrograms(
 	}
 	collection, err := CiliumEBPF.NewCollectionWithOptions(spec, CiliumEBPF.CollectionOptions{
 		MapReplacements: maps,
-		Programs: CiliumEBPF.ProgramOptions{
-			LogLevel: CiliumEBPF.LogLevelBranch,
-		},
 	})
 	if err != nil {
 		return nil, E.Cause(err, "load eBPF programs")

@@ -10,7 +10,11 @@ import (
 )
 
 func TestBPFObjectsFitLinux419Verifier(t *testing.T) {
-	const legacyInstructionLimit = 4096
+	const (
+		legacyInstructionLimit    = 4096
+		legacyInstructionHeadroom = 128
+		legacyInstructionBudget   = legacyInstructionLimit - legacyInstructionHeadroom
+	)
 	objects := []struct {
 		name string
 		file string
@@ -36,6 +40,9 @@ func TestBPFObjectsFitLinux419Verifier(t *testing.T) {
 			if rawInstructionCount > legacyInstructionLimit {
 				t.Errorf("%s/%s has %d raw instructions; Linux 4.19 permits at most %d",
 					object.name, programName, rawInstructionCount, legacyInstructionLimit)
+			} else if rawInstructionCount > legacyInstructionBudget {
+				t.Errorf("%s/%s has %d raw instructions; keep at least %d instructions below the Linux 4.19 limit",
+					object.name, programName, rawInstructionCount, legacyInstructionHeadroom)
 			}
 			symbols, err := program.Instructions.SymbolOffsets()
 			if err != nil {

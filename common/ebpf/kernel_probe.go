@@ -122,6 +122,7 @@ func ProbeKernel(options KernelProbeOptions) (*KernelProbeReport, error) {
 	if err != nil {
 		return nil, err
 	}
+	memlockErr := raiseMemlockLimit()
 
 	report := &KernelProbeReport{
 		Platform:      kernelProbePlatform(),
@@ -130,7 +131,7 @@ func ProbeKernel(options KernelProbeOptions) (*KernelProbeReport, error) {
 		Mode:          options.Mode,
 		Network:       network,
 	}
-	probeCommonCapabilities(report)
+	probeCommonCapabilities(report, memlockErr)
 	if options.Mode == KernelProbeModeAll || options.Mode == KernelProbeModeLocal {
 		probeLocalCapabilities(report, options.CgroupPath, enableTCP, enableUDP)
 	}
@@ -141,7 +142,7 @@ func ProbeKernel(options KernelProbeOptions) (*KernelProbeReport, error) {
 	return report, nil
 }
 
-func probeCommonCapabilities(report *KernelProbeReport) {
+func probeCommonCapabilities(report *KernelProbeReport, memlockErr error) {
 	if os.Geteuid() == 0 {
 		report.Add(KernelProbePass, "common", KernelProbeRequired, "privileged process",
 			"The process has UID 0. Direct probes below still detect capability, LSM, or seccomp restrictions.")
@@ -171,18 +172,38 @@ func probeCommonCapabilities(report *KernelProbeReport) {
 	probeMapType(report, "common", KernelProbeRequired, CiliumEBPF.LPMTrie,
 		"Stores UID and CIDR policies. Linux 6.6.0-6.6.46 policy updates remain blocked separately unless the upstream fix is detected.")
 
-	var limit unix.Rlimit
-	if err := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &limit); err != nil {
-		report.Add(KernelProbeUnknown, "common", KernelProbeRequired, "locked-memory limit",
-			"The process limit could not be read: "+shortProbeError(err))
-	} else if limit.Cur == unix.RLIM_INFINITY {
-		report.Add(KernelProbePass, "common", KernelProbeRequired, "locked-memory limit",
-			"RLIMIT_MEMLOCK is unlimited.")
-	} else {
-		report.Add(KernelProbeWarn, "common", KernelProbeRequired, "locked-memory limit",
-			fmt.Sprintf("Current soft limit is %d bytes. sing-box raises it at startup; Linux 4.19-era kernels charge BPF maps against this limit.", limit.Cur))
-	}
+	probeMemlockLimit(report, memlockErr)
 	probeBPFJIT(report)
+}
+
+func probeMemlockLimit(report *KernelProbeReport, raiseErr error) {
+	var limit unix.Rlimit
+	readErr := unix.Getrlimit(unix.RLIMIT_MEMLOCK, &limit)
+	status, detail := memlockProbeResult(limit, readErr, raiseErr)
+	report.Add(status, "common", KernelProbeRequired, "locked-memory limit", detail)
+}
+
+func memlockProbeResult(limit unix.Rlimit, readErr error, raiseErr error) (KernelProbeStatus, string) {
+	if readErr != nil {
+		detail := "The process limit could not be read: " + shortProbeError(readErr)
+		if raiseErr != nil {
+			detail += "; automatic adjustment also failed: " + shortProbeError(raiseErr)
+		}
+		return KernelProbeUnknown, detail
+	}
+	if limit.Cur == unix.RLIM_INFINITY {
+		return KernelProbePass, "RLIMIT_MEMLOCK is unlimited after automatic adjustment."
+	}
+	detail := fmt.Sprintf(
+		"Automatic adjustment left RLIMIT_MEMLOCK at soft=%d, hard=%d bytes.",
+		limit.Cur,
+		limit.Max,
+	)
+	if raiseErr != nil {
+		detail += " Adjustment failed: " + shortProbeError(raiseErr) + "."
+	}
+	detail += " EPERM from subsequent BPF probes may be inconclusive on kernels that charge BPF objects against this limit."
+	return KernelProbeWarn, detail
 }
 
 func probeLocalCapabilities(report *KernelProbeReport, configuredPath string, enableTCP bool, enableUDP bool) {

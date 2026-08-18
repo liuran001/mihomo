@@ -99,6 +99,15 @@ sudo -E SING_BOX_EBPF_SHARED_INTEGRATION=1 \
   -run TestSharedNetworkDataPathIntegration ./protocol/ebpf
 ```
 
+The maintenance benchmark compares a full batch scan with one bounded legacy
+fallback janitor tick over a populated 65536-entry hash map:
+
+```sh
+sudo -E SING_BOX_EBPF_INTEGRATION=1 \
+  go test -run '^$' -bench BenchmarkMapScanMaintenance -benchmem \
+  -tags with_ebpf,ebpf_integration ./common/ebpf
+```
+
 Use an empty, dedicated cgroup when testing attachment. On a target device,
 capture the non-disruptive capability report before debugging traffic:
 

@@ -12,15 +12,16 @@ import (
 )
 
 const (
-	ProtocolTCP                  = 6
-	ProtocolUDP                  = 17
-	TCPRedirectMapCapacity       = 65536
-	UDPRedirectMapCapacity       = 65536
-	SocketBypassMapCapacity      = 65536
-	SharedNetworkMapCapacity     = 65536
-	UDPRecoveryMapCapacity       = 4096
-	MaxConfigurableMapCapacity   = 1 << 20
-	cgroupStatTCPRedirectFailure = 0
+	ProtocolTCP                   = 6
+	ProtocolUDP                   = 17
+	TCPRedirectMapCapacity        = 65536
+	UDPRedirectMapCapacity        = 65536
+	SocketBypassMapCapacity       = 65536
+	SharedNetworkMapCapacity      = 65536
+	SharedNetworkFragmentCapacity = 8192
+	UDPRecoveryMapCapacity        = 4096
+	MaxConfigurableMapCapacity    = 1 << 20
+	cgroupStatTCPRedirectFailure  = 0
 	cgroupStatUDPRedirectFailure
 	originalDestinationFlagConnectedUDP = 1
 	udpFlowActionProxy                  = 1
@@ -96,9 +97,10 @@ type MapUsage struct {
 }
 
 type CgroupTCPRedirectSweepResult struct {
-	Scanned uint32
-	Removed uint32
-	Usage   MapUsage
+	Scanned  uint32
+	Removed  uint32
+	Usage    MapUsage
+	Complete bool
 }
 
 type SharedNetworkMapCapacities struct {
@@ -111,7 +113,7 @@ func DefaultSharedNetworkMapCapacities() SharedNetworkMapCapacities {
 	return SharedNetworkMapCapacities{
 		Proxy:    SharedNetworkMapCapacity,
 		Bypass:   SharedNetworkMapCapacity,
-		Fragment: SharedNetworkMapCapacity,
+		Fragment: SharedNetworkFragmentCapacity,
 	}
 }
 

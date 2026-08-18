@@ -4,11 +4,31 @@ package ebpf
 
 import (
 	"errors"
+	"net/netip"
 	"testing"
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
+
+func TestCgroupHostAddressFlags(t *testing.T) {
+	backend := &CgroupBackend{
+		hostIPv4:   []netip.Prefix{netip.MustParsePrefix("192.0.2.1/32")},
+		hostIPv6:   []netip.Prefix{netip.MustParsePrefix("2001:db8::1/128")},
+		enableIPv6: true,
+	}
+	if flags := backend.hostAddressFlags(); flags != cgroupFlagHostIPv4|cgroupFlagHostIPv6 {
+		t.Fatalf("unexpected dual-stack host address flags: %d", flags)
+	}
+	backend.enableIPv6 = false
+	if flags := backend.hostAddressFlags(); flags != cgroupFlagHostIPv4 {
+		t.Fatalf("unexpected IPv4-only host address flags: %d", flags)
+	}
+	backend.hostIPv4 = nil
+	if flags := backend.hostAddressFlags(); flags != 0 {
+		t.Fatalf("unexpected empty host address flags: %d", flags)
+	}
+}
 
 func TestCgroupUDPMapConfiguration(t *testing.T) {
 	const capacity = 128

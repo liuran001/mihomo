@@ -120,11 +120,14 @@ type sharedNetworkFlowEntry struct {
 	value sharedNetworkTokenValue
 }
 
-func (b *SharedNetworkBackend) SweepOrphanedFlows(maxIdle time.Duration) (SharedNetworkFlowSweepResult, error) {
+func (b *SharedNetworkBackend) SweepOrphanedFlows(
+	maxIdle time.Duration,
+	fallbackBudget uint32,
+) (SharedNetworkFlowSweepResult, error) {
 	if b == nil {
 		return SharedNetworkFlowSweepResult{}, errBackendClosed
 	}
-	if maxIdle <= 0 {
+	if maxIdle <= 0 || fallbackBudget == 0 {
 		return SharedNetworkFlowSweepResult{}, unix.EINVAL
 	}
 	b.flowSweepAccess.Lock()
@@ -137,7 +140,10 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(maxIdle time.Duration) (Shared
 	nowNS := uint64(now.Sec)*uint64(time.Second) + uint64(now.Nsec)
 	maxIdleNS := uint64(maxIdle)
 	if nowNS <= maxIdleNS {
-		return SharedNetworkFlowSweepResult{Usage: MapUsage{Capacity: b.mapCapacity.Proxy}}, nil
+		return SharedNetworkFlowSweepResult{
+			Usage:    MapUsage{Capacity: b.mapCapacity.Proxy},
+			Complete: true,
+		}, nil
 	}
 	staleBefore := nowNS - maxIdleNS
 
@@ -148,9 +154,10 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(maxIdle time.Duration) (Shared
 	}
 	mapFD := int(b.runtime.original_to_token_map_fd)
 	b.flowSweepCandidates = b.flowSweepCandidates[:0]
-	scanned, err := b.flowSweepScratch.scan(
+	scan, err := b.flowSweepScratch.scan(
 		mapFD,
 		b.mapCapacity.Proxy,
+		fallbackBudget,
 		func(key sharedNetworkOriginalKey, value sharedNetworkTokenValue) {
 			if value.LastSeenNS != 0 && value.LastSeenNS <= staleBefore {
 				b.flowSweepCandidates = append(
@@ -164,8 +171,12 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(maxIdle time.Duration) (Shared
 		return SharedNetworkFlowSweepResult{}, err
 	}
 	result := SharedNetworkFlowSweepResult{
-		Scanned: scanned,
-		Usage:   MapUsage{Entries: scanned, Capacity: b.mapCapacity.Proxy},
+		Scanned:  scan.Scanned,
+		Usage:    MapUsage{Capacity: b.mapCapacity.Proxy},
+		Complete: scan.Complete,
+	}
+	if b.proxyUsageKnown.Load() {
+		result.Usage.Entries = b.proxyUsage.Load()
 	}
 	var sweepErr error
 	for _, entry := range b.flowSweepCandidates {
@@ -181,9 +192,18 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(maxIdle time.Duration) (Shared
 			result.Removed++
 		}
 	}
-	result.Usage.Entries -= result.Removed
-	b.proxyUsage.Store(result.Usage.Entries)
-	b.proxyUsageKnown.Store(true)
+	b.flowSweepRemoved += result.Removed
+	if result.Complete {
+		result.Usage.Entries = scan.Entries
+		if b.flowSweepRemoved >= result.Usage.Entries {
+			result.Usage.Entries = 0
+		} else {
+			result.Usage.Entries -= b.flowSweepRemoved
+		}
+		b.flowSweepRemoved = 0
+		b.proxyUsage.Store(result.Usage.Entries)
+		b.proxyUsageKnown.Store(true)
+	}
 	return result, sweepErr
 }
 

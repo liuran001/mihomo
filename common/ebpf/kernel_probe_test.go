@@ -48,6 +48,30 @@ func TestKernelProbeReportCounts(t *testing.T) {
 	}
 }
 
+func TestMemlockProbeResult(t *testing.T) {
+	status, detail := memlockProbeResult(
+		unix.Rlimit{Cur: 8 << 20, Max: 8 << 20},
+		nil,
+		unix.EPERM,
+	)
+	if status != KernelProbeWarn || !strings.Contains(detail, "soft=8388608, hard=8388608") ||
+		!strings.Contains(detail, "operation not permitted") || !strings.Contains(detail, "may be inconclusive") {
+		t.Fatalf("unexpected limited memlock result: status=%s detail=%q", status, detail)
+	}
+	status, detail = memlockProbeResult(
+		unix.Rlimit{Cur: unix.RLIM_INFINITY, Max: unix.RLIM_INFINITY},
+		nil,
+		nil,
+	)
+	if status != KernelProbePass || !strings.Contains(detail, "after automatic adjustment") {
+		t.Fatalf("unexpected unlimited memlock result: status=%s detail=%q", status, detail)
+	}
+	status, detail = memlockProbeResult(unix.Rlimit{}, unix.EIO, unix.EPERM)
+	if status != KernelProbeUnknown || !strings.Contains(detail, "automatic adjustment also failed") {
+		t.Fatalf("unexpected unreadable memlock result: status=%s detail=%q", status, detail)
+	}
+}
+
 func TestWriteKernelProbeReport(t *testing.T) {
 	report := &KernelProbeReport{
 		Platform:      "Linux",
