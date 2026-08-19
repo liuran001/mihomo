@@ -121,12 +121,14 @@ it does not attach programs or change routes, qdiscs, sysctls, cgroups, or
 traffic.
 
 For a temporary diagnostic build, add the `ebpf_debug` tag together with
-`with_ebpf`. It adds one-minute runtime snapshots with Go heap, RSS, GC,
-goroutine, and maintenance-task timing counters. It does not add probes to the
-packet hot path. Set `SING_BOX_EBPF_PPROF_PORT` to a TCP port to expose Go
-pprof on `127.0.0.1` only; the endpoint is disabled when the variable is
-unset. See the [troubleshooting guide](../../docs/manual/misc/ebpf-troubleshooting.md)
-for collection commands and scope limitations.
+`with_ebpf`. It adds runtime snapshots with Go heap, RSS, GC, goroutine, and
+maintenance-task timing counters, and temporarily enables kernel
+`BPF_STATS_RUN_TIME` for per-program run counts and runtime. The latter has
+system-wide measurement overhead, so keep it out of release builds. It does
+not add probes to the packet hot path. Use sing-box's
+`experimental.debug.listen` option for Go pprof. See the
+[troubleshooting guide](../../docs/manual/misc/ebpf-troubleshooting.md) for
+collection commands and scope limitations.
 
 ## Credits
 

@@ -263,6 +263,65 @@ func (b *CgroupBackend) RecoverConnectedUDPOriginal(listenerDestination netip.Ad
 	return originalDestinationFromValue(original)
 }
 
+func (b *CgroupBackend) ReserveUDPReplyRedirect(
+	destination netip.AddrPort,
+	listenerPort uint16,
+) (netip.Addr, error) {
+	if b == nil {
+		return netip.Addr{}, errBackendClosed
+	}
+	if !destination.IsValid() || destination.Port() == 0 || destination.Addr().IsUnspecified() {
+		return netip.Addr{}, E.New("invalid UDP reply source: ", destination)
+	}
+	if listenerPort == 0 {
+		return netip.Addr{}, E.New("invalid UDP redirect listener port")
+	}
+	var original originalDestinationValue
+	original.Protocol = ProtocolUDP
+	original.Port = destination.Port()
+	if err := encodeAddress(&original.Family, &original.Addr, destination.Addr()); err != nil {
+		return netip.Addr{}, E.Cause(err, "encode UDP reply source")
+	}
+
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return netip.Addr{}, errBackendClosed
+	}
+	prefix := b.redirectIPv4
+	if destination.Addr().Is6() {
+		prefix = b.redirectIPv6
+	}
+	if !prefix.IsValid() {
+		return netip.Addr{}, E.New("UDP reply source address family is not enabled: ", destination)
+	}
+	for attempt := 0; attempt < userspaceReplyTokenAttempts; {
+		sequence := b.udpReplyTokenSequence.Add(1)
+		token, valid := userspaceReplyToken(prefix, sequence)
+		if !valid {
+			continue
+		}
+		attempt++
+		key, err := makeListenerLookupKey(ProtocolUDP, netip.AddrPortFrom(token, listenerPort))
+		if err != nil {
+			return netip.Addr{}, err
+		}
+		err = updateMapWithFlags(
+			b.udpRedirectMapFD,
+			unsafe.Pointer(&key),
+			unsafe.Pointer(&original),
+			bpfNoExist,
+		)
+		if err == nil {
+			return token, nil
+		}
+		if !errors.Is(err, unix.EEXIST) {
+			return netip.Addr{}, E.Cause(err, "reserve UDP reply redirect")
+		}
+	}
+	return netip.Addr{}, E.New("reserve UDP reply redirect: token attempts exhausted")
+}
+
 func (b *CgroupBackend) takeMapElement(mapFD int, key unsafe.Pointer, value unsafe.Pointer) error {
 	if b.lookupAndDeleteMode.Load() != mapLookupAndDeleteUnsupported {
 		err := lookupAndDeleteMap(mapFD, key, value)
@@ -331,7 +390,7 @@ func (b *CgroupBackend) SweepStaleTCPRedirects(
 	}
 	b.tcpSweepCandidates = b.tcpSweepCandidates[:0]
 	scan, err := b.tcpSweepScratch.scan(
-		b.tcpRedirectMapFD,
+		b.runtime.maps["cgroup_tcp_redirect"],
 		b.mapCapacity.TCPRedirect,
 		fallbackBudget,
 		func(key listenerLookupKey, value originalDestinationValue) {

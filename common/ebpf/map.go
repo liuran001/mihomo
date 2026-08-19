@@ -11,6 +11,7 @@ import (
 
 	E "github.com/metacubex/sing/common/exceptions"
 
+	CiliumEBPF "github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -20,9 +21,6 @@ const (
 	bpfMapDeleteElem          = 3
 	bpfMapGetNextKey          = 4
 	bpfMapLookupAndDeleteElem = 21
-	bpfMapLookupBatch         = 24
-	bpfMapUpdateBatch         = 26
-	bpfMapDeleteBatch         = 27
 	bpfNoExist                = 1
 
 	mapBatchUnknown int32 = iota
@@ -41,17 +39,6 @@ type mapElementAttr struct {
 	Key   uint64
 	Value uint64
 	Flags uint64
-}
-
-type mapBatchAttr struct {
-	InBatch   uint64
-	OutBatch  uint64
-	Keys      uint64
-	Values    uint64
-	Count     uint32
-	MapFD     uint32
-	ElemFlags uint64
-	Flags     uint64
 }
 
 type mapBatchSupport struct {
@@ -117,16 +104,19 @@ func countMapEntries(mapFD int, keySize uintptr, capacity uint32) (uint32, error
 }
 
 func (s *mapScanScratch[K, V]) scan(
-	mapFD int,
+	mapInstance *CiliumEBPF.Map,
 	capacity uint32,
 	fallbackBudget uint32,
 	visit func(K, V),
 ) (mapScanResult, error) {
+	if mapInstance == nil {
+		return mapScanResult{}, errBackendClosed
+	}
 	if capacity == 0 || fallbackBudget == 0 {
 		return mapScanResult{}, unix.EINVAL
 	}
 	if s.lookupSupport.mode.Load() != mapBatchUnsupported {
-		count, err := s.scanBatch(mapFD, capacity, visit)
+		count, err := s.scanBatch(mapInstance, capacity, visit)
 		if err == nil {
 			return mapScanResult{Scanned: count, Entries: count, Complete: true}, nil
 		}
@@ -136,11 +126,11 @@ func (s *mapScanScratch[K, V]) scan(
 		s.lookupSupport.mode.Store(mapBatchUnsupported)
 		s.resetFallbackScan()
 	}
-	return s.scanFallback(mapFD, capacity, fallbackBudget, visit)
+	return s.scanFallback(mapInstance.FD(), capacity, fallbackBudget, visit)
 }
 
 func (s *mapScanScratch[K, V]) scanBatch(
-	mapFD int,
+	mapInstance *CiliumEBPF.Map,
 	capacity uint32,
 	visit func(K, V),
 ) (uint32, error) {
@@ -151,24 +141,22 @@ func (s *mapScanScratch[K, V]) scanBatch(
 		s.keys = s.keys[:mapBatchMaxEntries]
 		s.values = s.values[:mapBatchMaxEntries]
 	}
-	var cursor K
-	var cursorPointer unsafe.Pointer
+	var cursor CiliumEBPF.MapBatchCursor
 	var scanned uint32
 	for scanned < capacity {
 		batchSize := min(uint32(mapBatchMaxEntries), capacity-scanned)
-		count, err := lookupMapBatch(
-			mapFD,
-			cursorPointer,
-			unsafe.Pointer(&cursor),
-			unsafe.Pointer(&s.keys[0]),
-			unsafe.Pointer(&s.values[0]),
-			batchSize,
+		countValue, err := mapInstance.BatchLookup(
+			&cursor,
+			s.keys[:batchSize],
+			s.values[:batchSize],
+			nil,
 		)
+		count := uint32(countValue)
 		for index := range count {
 			visit(s.keys[index], s.values[index])
 		}
 		scanned += count
-		if errors.Is(err, unix.ENOENT) {
+		if errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
 			s.lookupSupport.mode.CompareAndSwap(mapBatchUnknown, mapBatchSupported)
 			return scanned, nil
 		}
@@ -179,7 +167,6 @@ func (s *mapScanScratch[K, V]) scanBatch(
 			return scanned, unix.EIO
 		}
 		s.lookupSupport.mode.CompareAndSwap(mapBatchUnknown, mapBatchSupported)
-		cursorPointer = unsafe.Pointer(&cursor)
 	}
 	return scanned, nil
 }
@@ -253,64 +240,27 @@ func (s *mapScanScratch[K, V]) resetFallbackScan() {
 	}
 }
 
-func lookupMapBatch(
-	mapFD int,
-	inBatch unsafe.Pointer,
-	outBatch unsafe.Pointer,
-	keys unsafe.Pointer,
-	values unsafe.Pointer,
-	count uint32,
-) (uint32, error) {
-	if mapFD < 0 {
-		return 0, errBackendClosed
-	}
-	attribute := mapBatchAttr{
-		InBatch:  uint64(uintptr(inBatch)),
-		OutBatch: uint64(uintptr(outBatch)),
-		Keys:     uint64(uintptr(keys)),
-		Values:   uint64(uintptr(values)),
-		Count:    count,
-		MapFD:    uint32(mapFD),
-	}
-	_, _, errno := unix.Syscall(
-		unix.SYS_BPF,
-		bpfMapLookupBatch,
-		uintptr(unsafe.Pointer(&attribute)),
-		unsafe.Sizeof(attribute),
-	)
-	runtime.KeepAlive(inBatch)
-	runtime.KeepAlive(outBatch)
-	runtime.KeepAlive(keys)
-	runtime.KeepAlive(values)
-	if errno != 0 {
-		return attribute.Count, errno
-	}
-	return attribute.Count, nil
-}
-
-func updateMapBatch(
-	mapFD int,
-	keys unsafe.Pointer,
-	values unsafe.Pointer,
-	count uint32,
-	keySize uintptr,
-	valueSize uintptr,
+func updateMapBatch[K any, V any](
+	mapInstance *CiliumEBPF.Map,
+	keys []K,
+	values []V,
 	flags uint64,
 	support *mapBatchSupport,
 ) (uint32, error) {
-	if count == 0 {
-		return 0, nil
+	if mapInstance == nil {
+		return 0, errBackendClosed
+	}
+	if len(keys) != len(values) {
+		return 0, unix.EINVAL
 	}
 	var total uint32
-	for total < count {
-		batchCount := min(count-total, mapBatchMaxEntries)
+	for total < uint32(len(keys)) {
+		batchCount := min(uint32(len(keys))-total, mapBatchMaxEntries)
+		end := total + batchCount
 		processed, err := updateMapBatchChunk(
-			mapFD,
-			unsafe.Add(keys, uintptr(total)*keySize),
-			unsafe.Add(values, uintptr(total)*valueSize),
-			batchCount,
-			keySize,
-			valueSize,
+			mapInstance,
+			keys[total:end],
+			values[total:end],
 			flags,
 			support,
 		)
@@ -322,20 +272,22 @@ func updateMapBatch(
 	return total, nil
 }
 
-func updateMapBatchChunk(
-	mapFD int,
-	keys unsafe.Pointer,
-	values unsafe.Pointer,
-	count uint32,
-	keySize uintptr,
-	valueSize uintptr,
+func updateMapBatchChunk[K any, V any](
+	mapInstance *CiliumEBPF.Map,
+	keys []K,
+	values []V,
 	flags uint64,
 	support *mapBatchSupport,
 ) (uint32, error) {
 	if support.mode.Load() != mapBatchUnsupported {
-		processed, err := mapBatchOperation(bpfMapUpdateBatch, mapFD, keys, values, count, flags)
+		processedValue, err := mapInstance.BatchUpdate(
+			keys,
+			values,
+			&CiliumEBPF.BatchOptions{ElemFlags: flags},
+		)
+		processed := uint32(processedValue)
 		if err == nil {
-			if processed != count {
+			if processed != uint32(len(keys)) {
 				return processed, unix.EIO
 			}
 			support.mode.CompareAndSwap(mapBatchUnknown, mapBatchSupported)
@@ -346,39 +298,33 @@ func updateMapBatchChunk(
 		}
 		support.mode.Store(mapBatchUnsupported)
 	}
-	for index := uint32(0); index < count; index++ {
+	mapFD := mapInstance.FD()
+	for index := range keys {
 		if err := updateMapWithFlags(
 			mapFD,
-			unsafe.Add(keys, uintptr(index)*keySize),
-			unsafe.Add(values, uintptr(index)*valueSize),
+			unsafe.Pointer(&keys[index]),
+			unsafe.Pointer(&values[index]),
 			flags,
 		); err != nil {
-			return index, err
+			return uint32(index), err
 		}
 	}
-	return count, nil
+	return uint32(len(keys)), nil
 }
 
-func deleteMapBatch(
-	mapFD int,
-	keys unsafe.Pointer,
-	count uint32,
-	keySize uintptr,
+func deleteMapBatch[K any](
+	mapInstance *CiliumEBPF.Map,
+	keys []K,
 	support *mapBatchSupport,
 ) (uint32, error) {
-	if count == 0 {
-		return 0, nil
+	if mapInstance == nil {
+		return 0, errBackendClosed
 	}
 	var total uint32
-	for total < count {
-		batchCount := min(count-total, mapBatchMaxEntries)
-		processed, err := deleteMapBatchChunk(
-			mapFD,
-			unsafe.Add(keys, uintptr(total)*keySize),
-			batchCount,
-			keySize,
-			support,
-		)
+	for total < uint32(len(keys)) {
+		batchCount := min(uint32(len(keys))-total, mapBatchMaxEntries)
+		end := total + batchCount
+		processed, err := deleteMapBatchChunk(mapInstance, keys[total:end], support)
 		total += processed
 		if err != nil {
 			return total, err
@@ -387,17 +333,16 @@ func deleteMapBatch(
 	return total, nil
 }
 
-func deleteMapBatchChunk(
-	mapFD int,
-	keys unsafe.Pointer,
-	count uint32,
-	keySize uintptr,
+func deleteMapBatchChunk[K any](
+	mapInstance *CiliumEBPF.Map,
+	keys []K,
 	support *mapBatchSupport,
 ) (uint32, error) {
 	if support.mode.Load() != mapBatchUnsupported {
-		processed, err := mapBatchOperation(bpfMapDeleteBatch, mapFD, keys, nil, count, 0)
+		processedValue, err := mapInstance.BatchDelete(keys, nil)
+		processed := uint32(processedValue)
 		if err == nil {
-			if processed != count {
+			if processed != uint32(len(keys)) {
 				return processed, unix.EIO
 			}
 			support.mode.CompareAndSwap(mapBatchUnknown, mapBatchSupported)
@@ -408,48 +353,18 @@ func deleteMapBatchChunk(
 		}
 		support.mode.Store(mapBatchUnsupported)
 	}
-	for index := uint32(0); index < count; index++ {
-		if err := deleteMap(mapFD, unsafe.Add(keys, uintptr(index)*keySize)); err != nil {
-			return index, err
+	mapFD := mapInstance.FD()
+	for index := range keys {
+		if err := deleteMap(mapFD, unsafe.Pointer(&keys[index])); err != nil {
+			return uint32(index), err
 		}
 	}
-	return count, nil
-}
-
-func mapBatchOperation(
-	command uintptr,
-	mapFD int,
-	keys unsafe.Pointer,
-	values unsafe.Pointer,
-	count uint32,
-	elemFlags uint64,
-) (uint32, error) {
-	if mapFD < 0 {
-		return 0, errBackendClosed
-	}
-	attribute := mapBatchAttr{
-		Keys:      uint64(uintptr(keys)),
-		Values:    uint64(uintptr(values)),
-		Count:     count,
-		MapFD:     uint32(mapFD),
-		ElemFlags: elemFlags,
-	}
-	_, _, errno := unix.Syscall(
-		unix.SYS_BPF,
-		command,
-		uintptr(unsafe.Pointer(&attribute)),
-		unsafe.Sizeof(attribute),
-	)
-	runtime.KeepAlive(keys)
-	runtime.KeepAlive(values)
-	if errno != 0 {
-		return attribute.Count, errno
-	}
-	return attribute.Count, nil
+	return uint32(len(keys)), nil
 }
 
 func mapBatchUnsupportedError(err error) bool {
-	return errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) ||
+	return errors.Is(err, CiliumEBPF.ErrNotSupported) ||
+		errors.Is(err, unix.ENOSYS) || errors.Is(err, unix.EINVAL) ||
 		errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, linuxErrnoNotSupported)
 }
 

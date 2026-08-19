@@ -4,6 +4,7 @@ package ebpf
 
 import (
 	"errors"
+	"net"
 	"net/netip"
 	"time"
 	"unsafe"
@@ -72,6 +73,185 @@ func (b *SharedNetworkBackend) lookupFlow(
 		Destination: netip.AddrPortFrom(address, value.Port),
 		SourceMAC:   sharedNetworkOriginalMAC(value),
 	}, &flow, nil
+}
+
+func (b *SharedNetworkBackend) ReserveUDPReplyFlow(
+	base *SharedNetworkFlowHandle,
+	destination netip.AddrPort,
+	sourceMAC net.HardwareAddr,
+) (netip.Addr, *SharedNetworkFlowHandle, error) {
+	if b == nil {
+		return netip.Addr{}, nil, errBackendClosed
+	}
+	if base == nil || base.originalKey.Protocol != ProtocolUDP {
+		return netip.Addr{}, nil, E.New("missing shared-network UDP base flow")
+	}
+	if !destination.IsValid() || destination.Port() == 0 || destination.Addr().IsUnspecified() {
+		return netip.Addr{}, nil, E.New("invalid shared-network UDP reply source: ", destination)
+	}
+	originalKey := base.originalKey
+	originalKey.OriginalPort = destination.Port()
+	var destinationFamily uint8
+	if err := encodeAddress(&destinationFamily, &originalKey.OriginalAddr, destination.Addr()); err != nil {
+		return netip.Addr{}, nil, E.Cause(err, "encode shared-network UDP reply source")
+	}
+	if destinationFamily != originalKey.Family {
+		return netip.Addr{}, nil, E.New("shared-network UDP reply source family changed: ", destination)
+	}
+
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return netip.Addr{}, nil, errBackendClosed
+	}
+	b.flowAccess.Lock()
+	defer b.flowAccess.Unlock()
+	if token, flow, loaded, err := b.lookupUDPReplyFlowLocked(originalKey); loaded || err != nil {
+		return token, flow, err
+	}
+
+	prefix, err := b.udpReplyTokenPrefix(originalKey.Family)
+	if err != nil {
+		return netip.Addr{}, nil, err
+	}
+	var now unix.Timespec
+	if err = unix.ClockGettime(unix.CLOCK_MONOTONIC, &now); err != nil {
+		return netip.Addr{}, nil, E.Cause(err, "read monotonic clock for shared-network UDP reply")
+	}
+	nowNS := uint64(now.Sec)*uint64(time.Second) + uint64(now.Nsec)
+	originalValue := sharedNetworkOriginalValue{
+		Family:         originalKey.Family,
+		Protocol:       ProtocolUDP,
+		Port:           destination.Port(),
+		Addr:           originalKey.OriginalAddr,
+		InterfaceIndex: originalKey.InterfaceIndex,
+	}
+	copy(originalValue.SourceMAC[:], sourceMAC)
+	replyValue := sharedNetworkReplyValue{
+		OriginalPort: destination.Port(),
+		OriginalAddr: originalKey.OriginalAddr,
+	}
+
+	for attempt := 0; attempt < userspaceReplyTokenAttempts; {
+		sequence := b.replyTokenSequence.Add(1)
+		token, valid := userspaceReplyToken(prefix, sequence)
+		if !valid {
+			continue
+		}
+		attempt++
+		var tokenAddress [16]byte
+		var tokenFamily uint8
+		if err = encodeAddress(&tokenFamily, &tokenAddress, token); err != nil {
+			return netip.Addr{}, nil, err
+		}
+		if tokenFamily != originalKey.Family {
+			return netip.Addr{}, nil, E.New("shared-network UDP reply token family mismatch")
+		}
+		flow := makeSharedNetworkFlowHandleFromOriginal(originalKey, tokenAddress, b.control.ListenerPort)
+		err = updateMapWithFlags(
+			int(b.runtime.listener_map_fd),
+			unsafe.Pointer(&flow.listenerKey),
+			unsafe.Pointer(&originalValue),
+			bpfNoExist,
+		)
+		if errors.Is(err, unix.EEXIST) {
+			continue
+		}
+		if err != nil {
+			return netip.Addr{}, nil, E.Cause(err, "reserve shared-network UDP reply listener token")
+		}
+		if err = updateMap(
+			int(b.runtime.reply_map_fd),
+			unsafe.Pointer(&flow.replyKey),
+			unsafe.Pointer(&replyValue),
+		); err != nil {
+			cleanupErr := deleteMapIfExists(int(b.runtime.listener_map_fd), unsafe.Pointer(&flow.listenerKey))
+			return netip.Addr{}, nil, E.Errors(E.Cause(err, "reserve shared-network UDP reply state"), cleanupErr)
+		}
+		tokenValue := sharedNetworkTokenValue{
+			TokenAddr:   tokenAddress,
+			Generation:  nowNS ^ sequence,
+			CreatedAtNS: nowNS,
+			LastSeenNS:  nowNS,
+		}
+		err = updateMapWithFlags(
+			int(b.runtime.original_to_token_map_fd),
+			unsafe.Pointer(&flow.originalKey),
+			unsafe.Pointer(&tokenValue),
+			bpfNoExist,
+		)
+		if err != nil {
+			cleanupErr := E.Errors(
+				deleteMapIfExists(int(b.runtime.reply_map_fd), unsafe.Pointer(&flow.replyKey)),
+				deleteMapIfExists(int(b.runtime.listener_map_fd), unsafe.Pointer(&flow.listenerKey)),
+			)
+			if errors.Is(err, unix.EEXIST) {
+				existingToken, existingFlow, loaded, lookupErr := b.lookupUDPReplyFlowLocked(originalKey)
+				if lookupErr != nil {
+					return netip.Addr{}, nil, E.Errors(lookupErr, cleanupErr)
+				}
+				if cleanupErr != nil {
+					if loaded {
+						b.releaseFlowReferenceLocked(*existingFlow)
+					}
+					return netip.Addr{}, nil, cleanupErr
+				}
+				if loaded {
+					return existingToken, existingFlow, nil
+				}
+				continue
+			}
+			return netip.Addr{}, nil, E.Errors(E.Cause(err, "reserve shared-network UDP reply flow"), cleanupErr)
+		}
+		b.retainFlowLocked(flow)
+		return token, &flow, nil
+	}
+	return netip.Addr{}, nil, E.New("reserve shared-network UDP reply flow: token attempts exhausted")
+}
+
+func (b *SharedNetworkBackend) lookupUDPReplyFlowLocked(
+	originalKey sharedNetworkOriginalKey,
+) (netip.Addr, *SharedNetworkFlowHandle, bool, error) {
+	var value sharedNetworkTokenValue
+	if err := lookupMap(
+		int(b.runtime.original_to_token_map_fd),
+		unsafe.Pointer(&originalKey),
+		unsafe.Pointer(&value),
+	); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return netip.Addr{}, nil, false, nil
+		}
+		return netip.Addr{}, nil, false, E.Cause(err, "lookup shared-network UDP reply flow")
+	}
+	token, err := sharedNetworkAddress(originalKey.Family, value.TokenAddr)
+	if err != nil {
+		return netip.Addr{}, nil, false, err
+	}
+	flow := makeSharedNetworkFlowHandleFromOriginal(originalKey, value.TokenAddr, b.control.ListenerPort)
+	b.retainFlowLocked(flow)
+	return token, &flow, true, nil
+}
+
+func (b *SharedNetworkBackend) udpReplyTokenPrefix(family uint8) (netip.Prefix, error) {
+	switch family {
+	case addressFamilyIPv4:
+		if b.control.Flags&sharedNetworkFlagIPv4 == 0 {
+			break
+		}
+		return netip.PrefixFrom(
+			netip.AddrFrom4(b.control.TokenIPv4Prefix),
+			int(b.control.TokenIPv4PrefixBits),
+		).Masked(), nil
+	case addressFamilyIPv6:
+		if b.control.Flags&sharedNetworkFlagIPv6 == 0 {
+			break
+		}
+		return netip.PrefixFrom(
+			netip.AddrFrom16(b.control.TokenIPv6Prefix),
+			int(b.control.TokenIPv6PrefixBits),
+		).Masked(), nil
+	}
+	return netip.Prefix{}, E.New("shared-network UDP reply address family is not enabled: ", family)
 }
 
 func (b *SharedNetworkBackend) ReleaseFlow(flow *SharedNetworkFlowHandle) error {
@@ -155,7 +335,7 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(
 	mapFD := int(b.runtime.original_to_token_map_fd)
 	b.flowSweepCandidates = b.flowSweepCandidates[:0]
 	scan, err := b.flowSweepScratch.scan(
-		mapFD,
+		b.runtime.maps["shared_original_to_token"],
 		b.mapCapacity.Proxy,
 		fallbackBudget,
 		func(key sharedNetworkOriginalKey, value sharedNetworkTokenValue) {

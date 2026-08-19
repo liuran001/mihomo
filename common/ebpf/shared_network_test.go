@@ -25,6 +25,9 @@ func TestSharedNetworkABI(t *testing.T) {
 	if size := unsafe.Sizeof(sharedNetworkReplyKey{}); size != 44 {
 		t.Fatalf("unexpected shared-network reply key size: %d", size)
 	}
+	if size := unsafe.Sizeof(sharedNetworkReplyValue{}); size != sharedNetworkReplyValueSize {
+		t.Fatalf("unexpected shared-network reply value size: %d", size)
+	}
 	if size := unsafe.Sizeof(sharedNetworkOriginalValue{}); size != 36 {
 		t.Fatalf("unexpected shared-network original value size: %d", size)
 	}
@@ -52,6 +55,18 @@ func TestSharedNetworkABI(t *testing.T) {
 	}
 	if sharedNetworkPolicyFlags != 0x5fe0 {
 		t.Fatalf("unexpected shared-network policy flags: %#x", sharedNetworkPolicyFlags)
+	}
+}
+
+func TestSharedSourceMACMapCapacity(t *testing.T) {
+	for entries, expected := range map[int]uint32{
+		0: 1,
+		1: 1,
+		8: 8,
+	} {
+		if capacity := sharedSourceMACMapCapacity(entries); capacity != expected {
+			t.Fatalf("unexpected source MAC map capacity for %d entries: %d", entries, capacity)
+		}
 	}
 }
 

@@ -168,6 +168,53 @@ func TestCgroupConnectedUDPRecoveryIntegration(t *testing.T) {
 	}
 }
 
+func TestCgroupUDPReplyRedirectIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "reserve userspace UDP reply redirects")
+	backend, err := PrepareCgroup(CgroupConfig{
+		Path:         os.Getenv("SING_BOX_EBPF_INTEGRATION_CGROUP"),
+		EnableUDP:    true,
+		EnableIPv6:   true,
+		RedirectIPv4: netip.MustParsePrefix("127.128.0.0/9"),
+		RedirectIPv6: netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
+		MapCapacity:  DefaultCgroupMapCapacity(),
+		UDPTimeout:   5 * time.Minute,
+		Policy:       CgroupPolicy{HijackDNS: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := backend.Close(); err != nil {
+			t.Errorf("close eBPF backend: %v", err)
+		}
+	})
+	for _, destination := range []netip.AddrPort{
+		netip.MustParseAddrPort("192.0.2.53:5000"),
+		netip.MustParseAddrPort("[2001:db8::53]:5000"),
+	} {
+		t.Run(destination.String(), func(t *testing.T) {
+			token, reserveErr := backend.ReserveUDPReplyRedirect(destination, 5300)
+			if reserveErr != nil {
+				t.Fatal(reserveErr)
+			}
+			listener := netip.AddrPortFrom(token, 5300)
+			original, lookupErr := backend.LookupOriginal(ProtocolUDP, listener)
+			if lookupErr != nil {
+				t.Fatal(lookupErr)
+			}
+			if original.Destination != destination || original.ConnectedUDP {
+				t.Fatalf("unexpected UDP reply redirect: %+v", original)
+			}
+			if deleteErr := backend.DeleteRedirect(ProtocolUDP, listener); deleteErr != nil {
+				t.Fatal(deleteErr)
+			}
+			if _, lookupErr = backend.LookupOriginal(ProtocolUDP, listener); !errors.Is(lookupErr, unix.ENOENT) {
+				t.Fatalf("UDP reply redirect survived deletion: %v", lookupErr)
+			}
+		})
+	}
+}
+
 type cgroupProgramLoadOptions struct {
 	enableTCP            bool
 	enableUDP            bool
@@ -326,6 +373,10 @@ func testCgroupBackendProgramLoad(t *testing.T, options cgroupProgramLoadOptions
 		if os.Getenv("SING_BOX_EBPF_INTEGRATION_ATTACH") == "1" && !program.Attached {
 			t.Fatalf("attached cgroup program was not reported: %+v", program)
 		}
+		if os.Getenv("SING_BOX_EBPF_INTEGRATION_ATTACH") == "1" &&
+			program.AttachmentMode != "bpf_link" && program.AttachmentMode != "prog_attach" {
+			t.Fatalf("cgroup attachment mechanism was not reported: %+v", program)
+		}
 	}
 }
 
@@ -379,12 +430,8 @@ func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend,
 		RedirectIPv6:         netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
 		IncludeSourceMAC:     []MACAddress{{0x02, 0x00, 0x00, 0x00, 0x00, 0x01}},
 		ExcludeSourceMAC:     []MACAddress{{0x02, 0x00, 0x00, 0x00, 0x00, 0x02}},
-		MapCapacity: SharedNetworkMapCapacities{
-			Proxy:    SharedNetworkMapCapacity,
-			Bypass:   SharedNetworkMapCapacity,
-			Fragment: SharedNetworkMapCapacity,
-		},
-		UDPTimeout: 5 * time.Minute,
+		MapCapacity:          DefaultSharedNetworkMapCapacities(),
+		UDPTimeout:           5 * time.Minute,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -466,9 +513,7 @@ func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend,
 		}); err != nil {
 			t.Fatal(err)
 		}
-	} else if err = sharedBackend.SetBypassCIDRState([]netip.Prefix{
-		netip.MustParsePrefix("198.51.100.0/24"),
-	}); err != nil {
+	} else if err = sharedBackend.SetBypassCIDRState(1, 0); err != nil {
 		t.Fatal(err)
 	}
 	if sharedBackend.control.Flags&sharedNetworkFlagBypassIPv4 == 0 {

@@ -4,9 +4,9 @@ package ebpf
 
 import (
 	"errors"
+	"reflect"
 	"sort"
 	"sync"
-	"unsafe"
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
@@ -26,14 +26,22 @@ type RuntimeMapStatus struct {
 }
 
 type RuntimeProgramStatus struct {
-	Name         string `json:"name"`
-	Section      string `json:"section"`
-	ID           uint32 `json:"id,omitempty"`
-	MemlockBytes uint64 `json:"memlock_bytes,omitempty"`
-	Loaded       bool   `json:"loaded"`
-	Attached     bool   `json:"attached"`
-	AttachType   string `json:"attach_type,omitempty"`
-	Error        string `json:"error,omitempty"`
+	Name            string `json:"name"`
+	Section         string `json:"section"`
+	ID              uint32 `json:"id,omitempty"`
+	MemlockBytes    uint64 `json:"memlock_bytes,omitempty"`
+	RunCount        uint64 `json:"run_count,omitempty"`
+	RuntimeNanos    uint64 `json:"runtime_ns,omitempty"`
+	AverageNanos    uint64 `json:"average_ns_per_run,omitempty"`
+	RecursionMisses uint64 `json:"recursion_misses,omitempty"`
+	Loaded          bool   `json:"loaded"`
+	Attached        bool   `json:"attached"`
+	StatsKnown      bool   `json:"stats_known,omitempty"`
+	AttachType      string `json:"attach_type,omitempty"`
+	AttachmentMode  string `json:"attachment_mode,omitempty"`
+	LinkID          uint32 `json:"link_id,omitempty"`
+	Error           string `json:"error,omitempty"`
+	StatsError      string `json:"stats_error,omitempty"`
 }
 
 type CgroupRuntimeStatus struct {
@@ -97,6 +105,10 @@ func (c *runtimeStatusCollector) collect(maps map[string]*CiliumEBPF.Map) []Runt
 			status = append(status, entry)
 			continue
 		}
+		if !collectRuntimeMapEntries {
+			status = append(status, entry)
+			continue
+		}
 		if info.Type == CiliumEBPF.Hash || info.Type == CiliumEBPF.LPMTrie {
 			support := c.batchSupport[info.Type]
 			if support == nil {
@@ -104,7 +116,7 @@ func (c *runtimeStatusCollector) collect(maps map[string]*CiliumEBPF.Map) []Runt
 				c.batchSupport[info.Type] = support
 			}
 			entry.Entries, err = countMapEntriesEfficient(
-				mapInstance.FD(),
+				mapInstance,
 				uintptr(info.KeySize),
 				uintptr(info.ValueSize),
 				info.MaxEntries,
@@ -130,7 +142,7 @@ func (c *runtimeStatusCollector) collect(maps map[string]*CiliumEBPF.Map) []Runt
 }
 
 func countMapEntriesEfficient(
-	mapFD int,
+	mapInstance *CiliumEBPF.Map,
 	keySize uintptr,
 	valueSize uintptr,
 	capacity uint32,
@@ -140,7 +152,7 @@ func countMapEntriesEfficient(
 		return 0, unix.EINVAL
 	}
 	if support.mode.Load() != mapBatchUnsupported {
-		count, err := countMapEntriesBatch(mapFD, keySize, valueSize, capacity)
+		count, err := countMapEntriesBatch(mapInstance, keySize, valueSize, capacity)
 		if err == nil {
 			support.mode.CompareAndSwap(mapBatchUnknown, mapBatchSupported)
 			return count, nil
@@ -150,28 +162,34 @@ func countMapEntriesEfficient(
 		}
 		support.mode.Store(mapBatchUnsupported)
 	}
-	return countMapEntries(mapFD, keySize, capacity)
+	if mapInstance == nil {
+		return 0, errBackendClosed
+	}
+	return countMapEntries(mapInstance.FD(), keySize, capacity)
 }
 
-func countMapEntriesBatch(mapFD int, keySize uintptr, valueSize uintptr, capacity uint32) (uint32, error) {
+func countMapEntriesBatch(mapInstance *CiliumEBPF.Map, keySize uintptr, valueSize uintptr, capacity uint32) (uint32, error) {
+	if mapInstance == nil {
+		return 0, errBackendClosed
+	}
 	batchCapacity := min(uint32(mapBatchMaxEntries), capacity)
-	keys := make([]byte, uintptr(batchCapacity)*keySize)
-	values := make([]byte, uintptr(batchCapacity)*valueSize)
-	cursor := make([]byte, keySize)
-	var cursorPointer unsafe.Pointer
+	keyType := reflect.ArrayOf(int(keySize), reflect.TypeFor[byte]())
+	valueType := reflect.ArrayOf(int(valueSize), reflect.TypeFor[byte]())
+	keys := reflect.MakeSlice(reflect.SliceOf(keyType), int(batchCapacity), int(batchCapacity))
+	values := reflect.MakeSlice(reflect.SliceOf(valueType), int(batchCapacity), int(batchCapacity))
+	var cursor CiliumEBPF.MapBatchCursor
 	var count uint32
 	for count < capacity {
 		batchSize := min(batchCapacity, capacity-count)
-		batchCount, err := lookupMapBatch(
-			mapFD,
-			cursorPointer,
-			unsafe.Pointer(&cursor[0]),
-			unsafe.Pointer(&keys[0]),
-			unsafe.Pointer(&values[0]),
-			batchSize,
+		batchCountValue, err := mapInstance.BatchLookup(
+			&cursor,
+			keys.Slice(0, int(batchSize)).Interface(),
+			values.Slice(0, int(batchSize)).Interface(),
+			nil,
 		)
+		batchCount := uint32(batchCountValue)
 		count += batchCount
-		if errors.Is(err, unix.ENOENT) {
+		if errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
 			return count, nil
 		}
 		if err != nil {
@@ -180,7 +198,6 @@ func countMapEntriesBatch(mapFD int, keySize uintptr, valueSize uintptr, capacit
 		if batchCount == 0 {
 			return count, unix.EIO
 		}
-		cursorPointer = unsafe.Pointer(&cursor[0])
 	}
 	return count, nil
 }
@@ -201,5 +218,6 @@ func runtimeProgramStatus(program *CiliumEBPF.Program, name string, section stri
 	if memlock, available := info.Memlock(); available {
 		status.MemlockBytes = memlock
 	}
+	populateProgramRuntimeStats(program, &status)
 	return status
 }

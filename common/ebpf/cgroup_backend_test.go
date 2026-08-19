@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	CiliumEBPF "github.com/cilium/ebpf"
+	"github.com/cilium/ebpf/link"
 	"golang.org/x/sys/unix"
 )
 
@@ -31,32 +32,37 @@ func TestCgroupHostAddressFlags(t *testing.T) {
 }
 
 func TestCgroupUDPMapConfiguration(t *testing.T) {
-	const capacity = 128
+	capacity := CgroupMapCapacity{UDPRedirect: 128, UDPPeer: 32, UDPFlow: 64}
 	for _, testCase := range []struct {
 		name                   string
 		enableUDP              bool
 		socketReleaseSupported bool
-		mapType                CiliumEBPF.MapType
-		flags                  uint32
-		flowCapacity           uint32
+		layout                 cgroupUDPMapLayout
 	}{
-		{"disabled", false, false, CiliumEBPF.Hash, bpfFlagNoPrealloc, 1},
-		{"socket_release", true, true, CiliumEBPF.Hash, bpfFlagNoPrealloc, capacity},
-		{"lru_fallback", true, false, CiliumEBPF.LRUHash, 0, 1},
+		{"disabled", false, false, cgroupUDPMapLayout{
+			cleanupType: CiliumEBPF.Hash, cleanupFlags: bpfFlagNoPrealloc,
+			peerType: CiliumEBPF.Hash, peerFlags: bpfFlagNoPrealloc,
+			peerCapacity: 1, flowCapacity: 1,
+		}},
+		{"socket_release", true, true, cgroupUDPMapLayout{
+			cleanupType: CiliumEBPF.Hash, cleanupFlags: bpfFlagNoPrealloc,
+			peerType: CiliumEBPF.Hash, peerFlags: bpfFlagNoPrealloc,
+			peerCapacity: capacity.UDPPeer, flowCapacity: capacity.UDPFlow,
+		}},
+		{"lru_fallback", true, false, cgroupUDPMapLayout{
+			cleanupType:  CiliumEBPF.LRUHash,
+			peerType:     CiliumEBPF.LRUHash,
+			peerCapacity: capacity.UDPPeer, flowCapacity: 1,
+		}},
 	} {
 		t.Run(testCase.name, func(t *testing.T) {
-			mapType, flags, flowCapacity := cgroupUDPMapConfiguration(
+			layout := cgroupUDPMapConfiguration(
 				testCase.enableUDP,
 				testCase.socketReleaseSupported,
 				capacity,
 			)
-			if mapType != testCase.mapType || flags != testCase.flags || flowCapacity != testCase.flowCapacity {
-				t.Fatalf(
-					"unexpected UDP map configuration: type=%v flags=%d flow_capacity=%d",
-					mapType,
-					flags,
-					flowCapacity,
-				)
+			if layout != testCase.layout {
+				t.Fatalf("unexpected UDP map configuration: %+v", layout)
 			}
 		})
 	}
@@ -76,6 +82,27 @@ func TestSocketReleaseUnavailable(t *testing.T) {
 	}
 	if socketReleaseUnavailable(unix.EPERM) {
 		t.Fatal("permission error must not be treated as an unavailable attach type")
+	}
+}
+
+func TestCgroupLinkUnavailable(t *testing.T) {
+	for _, err := range []error{
+		link.ErrNotSupported,
+		unix.EINVAL,
+		unix.ENOSYS,
+		unix.ENOTSUP,
+		unix.EOPNOTSUPP,
+		unix.EPERM,
+		unix.EACCES,
+		linuxErrnoNotSupported,
+		errors.Join(errors.New("create cgroup link"), unix.EPERM),
+	} {
+		if !cgroupLinkUnavailable(err) {
+			t.Fatalf("expected cgroup link fallback error: %v", err)
+		}
+	}
+	if cgroupLinkUnavailable(unix.ENOMEM) {
+		t.Fatal("resource exhaustion must not trigger legacy attachment fallback")
 	}
 }
 

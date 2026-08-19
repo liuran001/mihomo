@@ -125,6 +125,12 @@ type sharedNetworkReplyKey struct {
 	TokenAddr      [16]byte
 }
 
+type sharedNetworkReplyValue struct {
+	OriginalPort uint16
+	Reserved     uint16
+	OriginalAddr [16]byte
+}
+
 type sharedNetworkOriginalValue struct {
 	Family         uint8
 	Protocol       uint8
@@ -215,13 +221,17 @@ func makeSharedNetworkListenerKey(
 }
 
 func sharedNetworkOriginalAddress(value sharedNetworkOriginalValue) (netip.Addr, error) {
-	switch value.Family {
+	return sharedNetworkAddress(value.Family, value.Addr)
+}
+
+func sharedNetworkAddress(family uint8, address [16]byte) (netip.Addr, error) {
+	switch family {
 	case addressFamilyIPv4:
-		return netip.AddrFrom4([4]byte(value.Addr[:4])), nil
+		return netip.AddrFrom4([4]byte(address[:4])), nil
 	case addressFamilyIPv6:
-		return netip.AddrFrom16(value.Addr), nil
+		return netip.AddrFrom16(address), nil
 	default:
-		return netip.Addr{}, E.New("invalid original destination family: ", value.Family)
+		return netip.Addr{}, E.New("invalid shared-network address family: ", family)
 	}
 }
 

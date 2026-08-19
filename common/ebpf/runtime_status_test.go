@@ -5,6 +5,7 @@ package ebpf
 import (
 	"testing"
 
+	CiliumEBPF "github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -17,7 +18,7 @@ func TestRuntimeProgramStatusUnavailable(t *testing.T) {
 
 func TestCountMapEntriesEfficientRejectsInvalidLayout(t *testing.T) {
 	var support mapBatchSupport
-	if _, err := countMapEntriesEfficient(-1, 0, 4, 1, &support); err != unix.EINVAL {
+	if _, err := countMapEntriesEfficient((*CiliumEBPF.Map)(nil), 0, 4, 1, &support); err != unix.EINVAL {
 		t.Fatalf("unexpected invalid layout error: %v", err)
 	}
 }

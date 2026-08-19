@@ -10,6 +10,7 @@ import (
 
 	E "github.com/metacubex/sing/common/exceptions"
 
+	CiliumEBPF "github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 
@@ -26,6 +27,8 @@ func validateCgroupMapCapacity(capacity CgroupMapCapacity) error {
 	}{
 		{"tcp_redirect", capacity.TCPRedirect},
 		{"udp_redirect", capacity.UDPRedirect},
+		{"udp_peer", capacity.UDPPeer},
+		{"udp_flow", capacity.UDPFlow},
 		{"socket_bypass", capacity.SocketBypass},
 	} {
 		if err := validateMapCapacity("eBPF "+entry.name, entry.value); err != nil {
@@ -35,7 +38,7 @@ func validateCgroupMapCapacity(capacity CgroupMapCapacity) error {
 	return nil
 }
 
-func populateUIDPolicyMap(mapFD int, entries []uidLPMKey) error {
+func populateUIDPolicyMap(mapInstance *CiliumEBPF.Map, entries []uidLPMKey) error {
 	if len(entries) == 0 {
 		return nil
 	}
@@ -44,12 +47,9 @@ func populateUIDPolicyMap(mapFD int, entries []uidLPMKey) error {
 		values[index] = 1
 	}
 	_, err := updateMapBatch(
-		mapFD,
-		unsafe.Pointer(&entries[0]),
-		unsafe.Pointer(&values[0]),
-		uint32(len(entries)),
-		unsafe.Sizeof(entries[0]),
-		unsafe.Sizeof(values[0]),
+		mapInstance,
+		entries,
+		values,
 		0,
 		&uidPolicyUpdateBatchSupport,
 	)
@@ -57,11 +57,18 @@ func populateUIDPolicyMap(mapFD int, entries []uidLPMKey) error {
 }
 
 func (b *CgroupBackend) UpdateBypassCIDR(prefixes []netip.Prefix) (bool, error) {
-	ipv4Prefixes, ipv6Prefixes, err := compileBypassCIDRPolicy(prefixes)
+	policy, err := CompileBypassCIDRPolicy(prefixes)
 	if err != nil {
 		return false, E.Cause(err, "compile bypass CIDR policy")
 	}
-	if err = checkLPMTriePolicyCompatibility("bypass CIDR", len(ipv4Prefixes)+len(ipv6Prefixes)); err != nil {
+	return b.UpdateCompiledBypassCIDR(policy)
+}
+
+func (b *CgroupBackend) UpdateCompiledBypassCIDR(policy BypassCIDRPolicy) (bool, error) {
+	ipv4Prefixes := policy.ipv4
+	ipv6Prefixes := policy.ipv6
+	err := checkLPMTriePolicyCompatibility("bypass CIDR", len(ipv4Prefixes)+len(ipv6Prefixes))
+	if err != nil {
 		return false, err
 	}
 	if len(ipv4Prefixes) > maxBypassCIDRPolicyEntries {
@@ -87,8 +94,8 @@ func (b *CgroupBackend) UpdateBypassCIDR(prefixes []netip.Prefix) (bool, error) 
 		ipv6Prefixes = nil
 	}
 	changed, err := replaceDualStackCIDRPolicy(
-		b.bypassIPv4CIDRMapFD,
-		b.bypassIPv6CIDRMapFD,
+		b.runtime.maps["cgroup_bypass_ipv4"],
+		b.runtime.maps["cgroup_bypass_ipv6"],
 		dualStackCIDRPrefixes{b.bypassIPv4CIDR, b.bypassIPv6CIDR},
 		dualStackCIDRPrefixes{ipv4Prefixes, ipv6Prefixes},
 		"",
@@ -119,7 +126,7 @@ func (b *CgroupBackend) UpdateHostAddresses(addresses []netip.Addr) error {
 		return errBackendClosed
 	}
 	ipv4, ipv6 := compileHostPrefixes(addresses)
-	if len(ipv4) > 256 || len(ipv6) > 256 {
+	if len(ipv4) > maxHostAddressPolicyEntries || len(ipv6) > maxHostAddressPolicyEntries {
 		return E.New("local cgroup host address policy exceeds eBPF map capacity")
 	}
 	b.access.Lock()
@@ -130,8 +137,8 @@ func (b *CgroupBackend) UpdateHostAddresses(addresses []netip.Addr) error {
 	oldPrefixes := dualStackCIDRPrefixes{b.hostIPv4, b.hostIPv6}
 	newPrefixes := dualStackCIDRPrefixes{ipv4, ipv6}
 	_, err := replaceDualStackCIDRPolicy(
-		b.hostIPv4MapFD,
-		b.hostIPv6MapFD,
+		b.runtime.maps["cgroup_host_ipv4"],
+		b.runtime.maps["cgroup_host_ipv6"],
 		oldPrefixes,
 		newPrefixes,
 		"local cgroup ",
@@ -154,8 +161,8 @@ type dualStackCIDRPrefixes struct {
 }
 
 func replaceDualStackCIDRPolicy(
-	ipv4MapFD int,
-	ipv6MapFD int,
+	ipv4Map *CiliumEBPF.Map,
+	ipv6Map *CiliumEBPF.Map,
 	current dualStackCIDRPrefixes,
 	next dualStackCIDRPrefixes,
 	scope string,
@@ -167,17 +174,17 @@ func replaceDualStackCIDRPolicy(
 		return false, nil
 	}
 	if ipv6Changed {
-		if err := replaceBypassCIDRPolicyMap(ipv6MapFD, current.ipv6, next.ipv6); err != nil {
+		if err := replaceBypassCIDRPolicyMap(ipv6Map, current.ipv6, next.ipv6); err != nil {
 			return false, E.Cause(err, "update ", scope, "IPv6 ", policyName, " map")
 		}
 	}
 	if !ipv4Changed {
 		return true, nil
 	}
-	if err := replaceBypassCIDRPolicyMap(ipv4MapFD, current.ipv4, next.ipv4); err != nil {
+	if err := replaceBypassCIDRPolicyMap(ipv4Map, current.ipv4, next.ipv4); err != nil {
 		updateErr := E.Cause(err, "update ", scope, "IPv4 ", policyName, " map")
 		if ipv6Changed {
-			rollbackErr := replaceBypassCIDRPolicyMap(ipv6MapFD, next.ipv6, current.ipv6)
+			rollbackErr := replaceBypassCIDRPolicyMap(ipv6Map, next.ipv6, current.ipv6)
 			if rollbackErr != nil {
 				updateErr = policyUpdateError(
 					updateErr,
@@ -191,7 +198,7 @@ func replaceDualStackCIDRPolicy(
 }
 
 func replaceBypassCIDRPolicyMap(
-	mapFD int,
+	mapInstance *CiliumEBPF.Map,
 	currentPrefixes []netip.Prefix,
 	nextPrefixes []netip.Prefix,
 ) error {
@@ -199,48 +206,48 @@ func replaceBypassCIDRPolicyMap(
 	if len(additions) == 0 && len(removals) == 0 {
 		return nil
 	}
-	if mapFD < 0 {
+	if mapInstance == nil {
 		return errBackendClosed
 	}
 	value := uint8(1)
 	added := make([]netip.Prefix, 0, len(additions))
-	processed, err := updateBypassCIDRMapEntries(mapFD, additions, bpfNoExist)
+	processed, err := updateBypassCIDRMapEntries(mapInstance, additions, bpfNoExist)
 	if processed > uint32(len(additions)) {
 		return E.New("invalid eBPF batch update count: ", processed)
 	}
 	added = append(added, additions[:processed]...)
 	if err != nil {
-		if !errors.Is(err, unix.EEXIST) {
-			return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapFD, added, nil))
+		if !errors.Is(err, unix.EEXIST) && !errors.Is(err, CiliumEBPF.ErrKeyExist) {
+			return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapInstance, added, nil))
 		}
 		for _, prefix := range additions[processed:] {
-			err = updateBypassCIDRMapEntry(mapFD, prefix, &value, bpfNoExist)
-			if errors.Is(err, unix.EEXIST) {
+			err = updateBypassCIDRMapEntry(mapInstance, prefix, &value, bpfNoExist)
+			if errors.Is(err, unix.EEXIST) || errors.Is(err, CiliumEBPF.ErrKeyExist) {
 				continue
 			}
 			if err != nil {
-				return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapFD, added, nil))
+				return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapInstance, added, nil))
 			}
 			added = append(added, prefix)
 		}
 	}
 	removed := make([]netip.Prefix, 0, len(removals))
-	processed, err = deleteBypassCIDRMapEntries(mapFD, removals)
+	processed, err = deleteBypassCIDRMapEntries(mapInstance, removals)
 	if processed > uint32(len(removals)) {
 		return E.New("invalid eBPF batch delete count: ", processed)
 	}
 	removed = append(removed, removals[:processed]...)
 	if err != nil {
-		if !errors.Is(err, unix.ENOENT) {
-			return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapFD, added, removed))
+		if !errors.Is(err, unix.ENOENT) && !errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
+			return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapInstance, added, removed))
 		}
 		for _, prefix := range removals[processed:] {
-			err = deleteBypassCIDRMapEntry(mapFD, prefix)
-			if errors.Is(err, unix.ENOENT) {
+			err = deleteBypassCIDRMapEntry(mapInstance, prefix)
+			if errors.Is(err, unix.ENOENT) || errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
 				continue
 			}
 			if err != nil {
-				return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapFD, added, removed))
+				return policyUpdateError(err, rollbackBypassCIDRPolicyMap(mapInstance, added, removed))
 			}
 			removed = append(removed, prefix)
 		}
@@ -248,7 +255,7 @@ func replaceBypassCIDRPolicyMap(
 	return nil
 }
 
-func updateBypassCIDRMapEntries(mapFD int, prefixes []netip.Prefix, flags uint64) (uint32, error) {
+func updateBypassCIDRMapEntries(mapInstance *CiliumEBPF.Map, prefixes []netip.Prefix, flags uint64) (uint32, error) {
 	if len(prefixes) == 0 {
 		return 0, nil
 	}
@@ -262,12 +269,9 @@ func updateBypassCIDRMapEntries(mapFD int, prefixes []netip.Prefix, flags uint64
 			keys[index] = ipv4CIDRLPMKey{PrefixLength: uint32(prefix.Bits()), Address: prefix.Addr().As4()}
 		}
 		return updateMapBatch(
-			mapFD,
-			unsafe.Pointer(&keys[0]),
-			unsafe.Pointer(&values[0]),
-			uint32(len(keys)),
-			unsafe.Sizeof(keys[0]),
-			unsafe.Sizeof(values[0]),
+			mapInstance,
+			keys,
+			values,
 			flags,
 			&bypassCIDRUpdateBatchSupport,
 		)
@@ -277,18 +281,15 @@ func updateBypassCIDRMapEntries(mapFD int, prefixes []netip.Prefix, flags uint64
 		keys[index] = ipv6CIDRLPMKey{PrefixLength: uint32(prefix.Bits()), Address: prefix.Addr().As16()}
 	}
 	return updateMapBatch(
-		mapFD,
-		unsafe.Pointer(&keys[0]),
-		unsafe.Pointer(&values[0]),
-		uint32(len(keys)),
-		unsafe.Sizeof(keys[0]),
-		unsafe.Sizeof(values[0]),
+		mapInstance,
+		keys,
+		values,
 		flags,
 		&bypassCIDRUpdateBatchSupport,
 	)
 }
 
-func deleteBypassCIDRMapEntries(mapFD int, prefixes []netip.Prefix) (uint32, error) {
+func deleteBypassCIDRMapEntries(mapInstance *CiliumEBPF.Map, prefixes []netip.Prefix) (uint32, error) {
 	if len(prefixes) == 0 {
 		return 0, nil
 	}
@@ -298,10 +299,8 @@ func deleteBypassCIDRMapEntries(mapFD int, prefixes []netip.Prefix) (uint32, err
 			keys[index] = ipv4CIDRLPMKey{PrefixLength: uint32(prefix.Bits()), Address: prefix.Addr().As4()}
 		}
 		return deleteMapBatch(
-			mapFD,
-			unsafe.Pointer(&keys[0]),
-			uint32(len(keys)),
-			unsafe.Sizeof(keys[0]),
+			mapInstance,
+			keys,
 			&bypassCIDRDeleteBatchSupport,
 		)
 	}
@@ -310,31 +309,31 @@ func deleteBypassCIDRMapEntries(mapFD int, prefixes []netip.Prefix) (uint32, err
 		keys[index] = ipv6CIDRLPMKey{PrefixLength: uint32(prefix.Bits()), Address: prefix.Addr().As16()}
 	}
 	return deleteMapBatch(
-		mapFD,
-		unsafe.Pointer(&keys[0]),
-		uint32(len(keys)),
-		unsafe.Sizeof(keys[0]),
+		mapInstance,
+		keys,
 		&bypassCIDRDeleteBatchSupport,
 	)
 }
 
-func rollbackBypassCIDRPolicyMap(mapFD int, added []netip.Prefix, removed []netip.Prefix) error {
+func rollbackBypassCIDRPolicyMap(mapInstance *CiliumEBPF.Map, added []netip.Prefix, removed []netip.Prefix) error {
 	var rollbackErr error
 	value := uint8(1)
 	for _, prefix := range removed {
-		if err := updateBypassCIDRMapEntry(mapFD, prefix, &value, 0); err != nil {
+		if err := updateBypassCIDRMapEntry(mapInstance, prefix, &value, 0); err != nil {
 			rollbackErr = E.Errors(rollbackErr, err)
 		}
 	}
 	for _, prefix := range added {
-		if err := deleteBypassCIDRMapEntry(mapFD, prefix); err != nil && !errors.Is(err, unix.ENOENT) {
+		if err := deleteBypassCIDRMapEntry(mapInstance, prefix); err != nil &&
+			!errors.Is(err, unix.ENOENT) && !errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
 			rollbackErr = E.Errors(rollbackErr, err)
 		}
 	}
 	return rollbackErr
 }
 
-func updateBypassCIDRMapEntry(mapFD int, prefix netip.Prefix, value *uint8, flags uint64) error {
+func updateBypassCIDRMapEntry(mapInstance *CiliumEBPF.Map, prefix netip.Prefix, value *uint8, flags uint64) error {
+	mapFD := mapInstance.FD()
 	if prefix.Addr().Is4() {
 		key := ipv4CIDRLPMKey{PrefixLength: uint32(prefix.Bits()), Address: prefix.Addr().As4()}
 		return updateMapWithFlags(mapFD, unsafe.Pointer(&key), unsafe.Pointer(value), flags)
@@ -343,7 +342,8 @@ func updateBypassCIDRMapEntry(mapFD int, prefix netip.Prefix, value *uint8, flag
 	return updateMapWithFlags(mapFD, unsafe.Pointer(&key), unsafe.Pointer(value), flags)
 }
 
-func deleteBypassCIDRMapEntry(mapFD int, prefix netip.Prefix) error {
+func deleteBypassCIDRMapEntry(mapInstance *CiliumEBPF.Map, prefix netip.Prefix) error {
+	mapFD := mapInstance.FD()
 	if prefix.Addr().Is4() {
 		key := ipv4CIDRLPMKey{PrefixLength: uint32(prefix.Bits()), Address: prefix.Addr().As4()}
 		return deleteMap(mapFD, unsafe.Pointer(&key))
