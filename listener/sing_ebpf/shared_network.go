@@ -75,8 +75,11 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		if _, err = backend.UpdateBypassCIDR(s.inbound.currentBypassCIDR()); err != nil {
 			return E.Errors(err, s.Close())
 		}
-	} else if err = backend.SetBypassCIDRState(s.inbound.currentBypassCIDR()); err != nil {
-		return E.Errors(err, s.Close())
+	} else {
+		ipv4Count, ipv6Count := cgroupBackend.BypassCIDRCount()
+		if err = backend.SetBypassCIDRState(ipv4Count, ipv6Count); err != nil {
+			return E.Errors(err, s.Close())
+		}
 	}
 	s.tcManager = &sharedTCManager{
 		backend:     backend,

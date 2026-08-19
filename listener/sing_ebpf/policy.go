@@ -111,7 +111,8 @@ func (i *Inbound) refreshBypassCIDRsLocked() (bool, error) {
 	// follow the effective CIDR set (including runtime bypass_rule_set changes).
 	if i.sharedNetwork != nil {
 		if sharedBackend := i.sharedNetwork.sharedBackendInstance(); sharedBackend != nil && !sharedBackend.IsClosed() {
-			if stateErr := sharedBackend.SetBypassCIDRState(prefixes); stateErr != nil {
+			ipv4Count, ipv6Count := backend.BypassCIDRCount()
+			if stateErr := sharedBackend.SetBypassCIDRState(ipv4Count, ipv6Count); stateErr != nil {
 				log.Errorln("[EBPF] refresh shared-network bypass CIDR state: %s", stateErr.Error())
 			}
 		}
