@@ -91,6 +91,8 @@ type Inbound struct {
 	bypassRuleSetCallback io.Closer
 	bypassRuleSetStarted  bool
 	bypassCIDR            []netip.Prefix
+	bypassRuleSetPolicy   ECommon.BypassCIDRPolicy
+	bypassRuleSetDirty    bool
 
 	udpPeriodicStop chan struct{}
 	udpPeriodicDone chan struct{}
@@ -433,8 +435,16 @@ func (i *Inbound) unregisterSocketProtect() {
 }
 
 // InterfaceUpdated notifies the shared-network TC manager that interfaces may
-// have changed, so it can attach/detach downstream interfaces.
+// have changed, so it can attach/detach downstream interfaces. It also refreshes
+// the local host-address maps (the bypass rule-set policy is untouched).
 func (i *Inbound) InterfaceUpdated() {
+	i.bypassRuleSetAccess.Lock()
+	if i.bypassRuleSetStarted {
+		if _, err := i.applyBypassCIDRLocked(); err != nil {
+			log.Warnln("[EBPF] refresh local interface host addresses: %s", err.Error())
+		}
+	}
+	i.bypassRuleSetAccess.Unlock()
 	if err := i.refreshCgroupIPv6Availability(false); err != nil {
 		log.Warnln("[EBPF] refresh local cgroup IPv6 availability: %s", err.Error())
 	}

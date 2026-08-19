@@ -7,6 +7,7 @@ import (
 	"slices"
 
 	"github.com/metacubex/mihomo/component/resolver"
+	ECommon "github.com/metacubex/mihomo/common/ebpf"
 	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
 
@@ -83,8 +84,28 @@ func (i *Inbound) currentBypassCIDR() []netip.Prefix {
 	return slices.Clone(i.bypassCIDR)
 }
 
-func (i *Inbound) refreshBypassCIDRsLocked() (bool, error) {
+func (i *Inbound) localInterfaceAddresses() []netip.Addr {
 	prefixes := localInterfacePrefixes()
+	addresses := make([]netip.Addr, 0, len(prefixes))
+	for _, prefix := range prefixes {
+		addresses = append(addresses, prefix.Addr())
+	}
+	return addresses
+}
+
+func (i *Inbound) refreshHostAddresses(backend *ECommon.CgroupBackend) error {
+	if err := backend.UpdateHostAddresses(i.localInterfaceAddresses()); err != nil {
+		return E.Cause(err, "update eBPF local interface host addresses")
+	}
+	return nil
+}
+
+// refreshBypassCIDRsLocked applies the effective bypass CIDR policy. Host
+// interface addresses go to the dedicated host maps, while the bypass_rule_set
+// prefixes go to the bypass CIDR maps; the two are intentionally separated so
+// the LPM trie matches exactly the configured rules.
+func (i *Inbound) refreshBypassCIDRsLocked() (bool, error) {
+	var ruleSetPrefixes []netip.Prefix
 	for _, ruleSet := range i.bypassRuleSet {
 		strategy := ruleSet.Strategy()
 		ipCidrStrategy, ok := strategy.(toIpCidr)
@@ -95,17 +116,36 @@ func (i *Inbound) refreshBypassCIDRsLocked() (bool, error) {
 		if ipSet == nil {
 			continue
 		}
-		prefixes = append(prefixes, ipSet.Prefixes()...)
+		ruleSetPrefixes = append(ruleSetPrefixes, ipSet.Prefixes()...)
 	}
+	policy, err := ECommon.CompileBypassCIDRPolicy(ruleSetPrefixes)
+	if err != nil {
+		return false, E.Cause(err, "compile eBPF bypass CIDR policy")
+	}
+	i.bypassRuleSetPolicy = policy
+	i.bypassRuleSetDirty = true
+	return i.applyBypassCIDRLocked()
+}
+
+// applyBypassCIDRLocked pushes host addresses and, when the bypass rule-set
+// policy changed, the compiled bypass CIDR policy to the backends.
+func (i *Inbound) applyBypassCIDRLocked() (bool, error) {
 	backend := i.backendInstance()
 	if backend == nil {
 		return false, E.New("eBPF backend is not initialized")
 	}
-	updated, err := backend.UpdateBypassCIDR(prefixes)
+	if err := i.refreshHostAddresses(backend); err != nil {
+		return false, err
+	}
+	if !i.bypassRuleSetDirty {
+		return false, nil
+	}
+	updated, err := backend.UpdateCompiledBypassCIDR(i.bypassRuleSetPolicy)
 	if err != nil {
 		return false, err
 	}
-	i.bypassCIDR = prefixes
+	i.bypassRuleSetDirty = false
+	i.bypassCIDR = i.bypassRuleSetPolicy.Prefixes()
 	// Keep the shared-network backend's bypass flags in sync. It reuses the
 	// cgroup backend's bypass maps, so only the control presence flags need to
 	// follow the effective CIDR set (including runtime bypass_rule_set changes).
@@ -122,7 +162,7 @@ func (i *Inbound) refreshBypassCIDRsLocked() (bool, error) {
 	// kernel eBPF bypass can engage. Only publish when bypass_rule_set is used.
 	if len(i.bypassRuleSet) > 0 {
 		var builder netipx.IPSetBuilder
-		for _, prefix := range prefixes {
+		for _, prefix := range i.bypassCIDR {
 			builder.AddPrefix(prefix)
 		}
 		bypassSet, buildErr := builder.IPSet()

@@ -58,6 +58,13 @@ func (p BypassCIDRPolicy) Count() (int, int) {
 	return len(p.ipv4), len(p.ipv6)
 }
 
+func (p BypassCIDRPolicy) Prefixes() []netip.Prefix {
+	prefixes := make([]netip.Prefix, 0, len(p.ipv4)+len(p.ipv6))
+	prefixes = append(prefixes, p.ipv4...)
+	prefixes = append(prefixes, p.ipv6...)
+	return prefixes
+}
+
 func CompileBypassCIDRPolicy(prefixes []netip.Prefix) (BypassCIDRPolicy, error) {
 	ipv4, ipv6, err := compileBypassCIDRPolicy(prefixes)
 	return BypassCIDRPolicy{ipv4: ipv4, ipv6: ipv6}, err
