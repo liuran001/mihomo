@@ -533,19 +533,11 @@ func localInterfacePrefixes() []netip.Prefix {
 			if !prefix.IsValid() {
 				continue
 			}
-			prefix = prefix.Masked()
 			address := prefix.Addr().Unmap()
-			prefixBits := prefix.Bits()
-			if prefix.Addr().Is4In6() {
-				if prefixBits < 96 {
-					continue
-				}
-				prefixBits -= 96
-			}
 			if address.IsUnspecified() || address.IsLoopback() {
 				continue
 			}
-			prefixes = append(prefixes, netip.PrefixFrom(address, prefixBits).Masked())
+			prefixes = append(prefixes, netip.PrefixFrom(address, address.BitLen()))
 		}
 	}
 	return prefixes
