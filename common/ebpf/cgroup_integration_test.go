@@ -120,52 +120,150 @@ func TestCgroupConnectedUDPRecoveryIntegration(t *testing.T) {
 	backend.access.Lock()
 	backend.runtime.socket_release_supported = false
 	backend.access.Unlock()
+	installState := func(listenerDestination netip.AddrPort, cookie uint64, peerAddress netip.Addr) listenerLookupKey {
+		t.Helper()
+		listener, installErr := makeListenerLookupKey(ProtocolUDP, listenerDestination)
+		if installErr != nil {
+			t.Fatal(installErr)
+		}
+		peer := udpPeerValue{Family: addressFamilyIPv4, Protocol: ProtocolUDP, Port: 53}
+		copy(peer.Addr[:4], peerAddress.AsSlice())
+		peerKey := udpPeerKey{SocketCookie: cookie}
+		if installErr = updateMap(
+			backend.runtime.udp_token_map_fd,
+			unsafe.Pointer(&cookie),
+			unsafe.Pointer(&listener),
+		); installErr != nil {
+			t.Fatal(installErr)
+		}
+		if installErr = updateMap(
+			backend.runtime.udp_peer_map_fd,
+			unsafe.Pointer(&peerKey),
+			unsafe.Pointer(&peer),
+		); installErr != nil {
+			t.Fatal(installErr)
+		}
+		return listener
+	}
+	recoverState := func(listenerDestination netip.AddrPort, expected netip.AddrPort) {
+		t.Helper()
+		if _, recoverErr := backend.LookupOriginal(ProtocolUDP, listenerDestination); !errors.Is(recoverErr, unix.ENOENT) {
+			t.Fatalf("unexpected redirect before recovery: %v", recoverErr)
+		}
+		recovered, recoverErr := backend.RecoverConnectedUDPOriginal(listenerDestination)
+		if recoverErr != nil {
+			t.Fatal(recoverErr)
+		}
+		if recovered.Destination != expected || !recovered.ConnectedUDP {
+			t.Fatalf("unexpected recovered destination: %+v", recovered)
+		}
+		loaded, recoverErr := backend.LookupOriginal(ProtocolUDP, listenerDestination)
+		if recoverErr != nil {
+			t.Fatal(recoverErr)
+		}
+		if loaded.Destination != recovered.Destination ||
+			loaded.ConnectedUDP != recovered.ConnectedUDP ||
+			!bytes.Equal(loaded.SourceMAC, recovered.SourceMAC) {
+			t.Fatalf("restored redirect mismatch: loaded=%+v recovered=%+v", loaded, recovered)
+		}
+	}
 	listenerDestination := netip.MustParseAddrPort("127.128.10.20:5300")
-	listener, err := makeListenerLookupKey(ProtocolUDP, listenerDestination)
+	installState(listenerDestination, 0x1020304050607080, netip.MustParseAddr("192.0.2.53"))
+	recoverState(listenerDestination, netip.MustParseAddrPort("192.0.2.53:53"))
+
+	// Force the legacy iterator after the automatic probe so both paths stay
+	// covered on kernels that implement BPF_MAP_LOOKUP_BATCH.
+	backend.access.Lock()
+	backend.connectedUDPTokenLookupSupport.mode.Store(mapBatchUnsupported)
+	backend.access.Unlock()
+	legacyListenerDestination := netip.MustParseAddrPort("127.128.10.21:5301")
+	installState(legacyListenerDestination, 0x1020304050607081, netip.MustParseAddr("192.0.2.54"))
+	recoverState(legacyListenerDestination, netip.MustParseAddrPort("192.0.2.54:53"))
+}
+
+func TestCgroupUDPRecoveryConsumptionIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "consume recovered UDP redirect state")
+	backend, err := PrepareCgroup(CgroupConfig{
+		Path:         os.Getenv("SING_BOX_EBPF_INTEGRATION_CGROUP"),
+		EnableUDP:    true,
+		RedirectIPv4: netip.MustParsePrefix("127.128.0.0/9"),
+		MapCapacity:  DefaultCgroupMapCapacity(),
+		UDPTimeout:   5 * time.Minute,
+		Policy:       CgroupPolicy{HijackDNS: true},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	cookie := uint64(0x1020304050607080)
-	peer := udpPeerValue{
+	t.Cleanup(func() {
+		if err := backend.Close(); err != nil {
+			t.Errorf("close eBPF backend: %v", err)
+		}
+	})
+	original := originalDestinationValue{
 		Family:   addressFamilyIPv4,
 		Protocol: ProtocolUDP,
-		Port:     53,
+		Port:     5353,
 	}
-	copy(peer.Addr[:4], netip.MustParseAddr("192.0.2.53").AsSlice())
-	peerKey := udpPeerKey{SocketCookie: cookie}
-	if err = updateMap(
-		backend.runtime.udp_token_map_fd,
-		unsafe.Pointer(&cookie),
-		unsafe.Pointer(&listener),
-	); err != nil {
-		t.Fatal(err)
+	copy(original.Addr[:4], netip.MustParseAddr("192.0.2.53").AsSlice())
+	installRecovery := func(destination netip.AddrPort) listenerLookupKey {
+		t.Helper()
+		key, keyErr := makeListenerLookupKey(ProtocolUDP, destination)
+		if keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		if keyErr = updateMap(
+			backend.udpRecoveryMapFD,
+			unsafe.Pointer(&key),
+			unsafe.Pointer(&original),
+		); keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		return key
 	}
-	if err = updateMap(
-		backend.runtime.udp_peer_map_fd,
-		unsafe.Pointer(&peerKey),
-		unsafe.Pointer(&peer),
-	); err != nil {
-		t.Fatal(err)
+	assertRecovery := func(key listenerLookupKey, expected bool) {
+		t.Helper()
+		var loaded originalDestinationValue
+		lookupErr := lookupMap(
+			backend.udpRecoveryMapFD,
+			unsafe.Pointer(&key),
+			unsafe.Pointer(&loaded),
+		)
+		if expected {
+			if lookupErr != nil || loaded != original {
+				t.Fatalf("UDP recovery state was not preserved: value=%+v err=%v", loaded, lookupErr)
+			}
+		} else if !errors.Is(lookupErr, unix.ENOENT) {
+			t.Fatalf("consumed UDP recovery state remains: %v", lookupErr)
+		}
 	}
-	if _, err = backend.LookupOriginal(ProtocolUDP, listenerDestination); !errors.Is(err, unix.ENOENT) {
-		t.Fatalf("unexpected redirect before recovery: %v", err)
+
+	destination := netip.MustParseAddrPort("127.128.10.30:5300")
+	key := installRecovery(destination)
+	redirectMapFD := backend.udpRedirectMapFD
+	backend.udpRedirectMapFD = -1
+	_, recoverErr := backend.RecoverUDPOriginal(destination)
+	backend.udpRedirectMapFD = redirectMapFD
+	if recoverErr == nil {
+		t.Fatal("UDP recovery unexpectedly succeeded with unavailable redirect map")
 	}
-	recovered, err := backend.RecoverConnectedUDPOriginal(listenerDestination)
+	assertRecovery(key, true)
+
+	recovered, err := backend.RecoverUDPOriginal(destination)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if recovered.Destination != netip.MustParseAddrPort("192.0.2.53:53") || !recovered.ConnectedUDP {
+	if recovered.Destination != netip.MustParseAddrPort("192.0.2.53:5353") {
 		t.Fatalf("unexpected recovered destination: %+v", recovered)
 	}
-	loaded, err := backend.LookupOriginal(ProtocolUDP, listenerDestination)
-	if err != nil {
+	assertRecovery(key, backend.udpRecoveryConsumeMode.Load() == mapLookupAndDeleteUnsupported)
+
+	legacyDestination := netip.MustParseAddrPort("127.128.10.31:5301")
+	legacyKey := installRecovery(legacyDestination)
+	backend.udpRecoveryConsumeMode.Store(mapLookupAndDeleteUnsupported)
+	if _, err = backend.RecoverUDPOriginal(legacyDestination); err != nil {
 		t.Fatal(err)
 	}
-	if loaded.Destination != recovered.Destination ||
-		loaded.ConnectedUDP != recovered.ConnectedUDP ||
-		!bytes.Equal(loaded.SourceMAC, recovered.SourceMAC) {
-		t.Fatalf("restored redirect mismatch: loaded=%+v recovered=%+v", loaded, recovered)
-	}
+	assertRecovery(legacyKey, true)
 }
 
 func TestCgroupUDPReplyRedirectIntegration(t *testing.T) {

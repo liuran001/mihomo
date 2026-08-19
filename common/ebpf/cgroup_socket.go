@@ -9,6 +9,7 @@ import (
 	"time"
 	"unsafe"
 
+	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/metacubex/sing/common/control"
 	E "github.com/metacubex/sing/common/exceptions"
 
@@ -127,15 +128,19 @@ func (b *CgroupBackend) RecoverUDPOriginal(listenerDestination netip.AddrPort) (
 	if err != nil {
 		return OriginalDestination{}, err
 	}
+	b.udpRecoveryAccess.Lock()
+	defer b.udpRecoveryAccess.Unlock()
 	b.access.RLock()
 	defer b.access.RUnlock()
 	if b.runtime == nil {
 		return OriginalDestination{}, errBackendClosed
 	}
 	var original originalDestinationValue
-	if err = lookupMap(b.udpRecoveryMapFD, unsafe.Pointer(&key), unsafe.Pointer(&original)); err != nil {
+	consumed, err := b.takeUDPRecoveryElement(&key, &original)
+	if err != nil {
 		return OriginalDestination{}, E.Cause(err, "lookup recoverable UDP original destination")
 	}
+	recoveryOriginal := original
 	if err = updateMapWithFlags(
 		b.udpRedirectMapFD,
 		unsafe.Pointer(&key),
@@ -143,13 +148,75 @@ func (b *CgroupBackend) RecoverUDPOriginal(listenerDestination netip.AddrPort) (
 		bpfNoExist,
 	); err != nil {
 		if !errors.Is(err, unix.EEXIST) {
-			return OriginalDestination{}, E.Cause(err, "restore UDP original destination")
+			return OriginalDestination{}, b.rollbackConsumedUDPRecovery(
+				&key,
+				&recoveryOriginal,
+				consumed,
+				E.Cause(err, "restore UDP original destination"),
+			)
 		}
-		if err = lookupMap(b.udpRedirectMapFD, unsafe.Pointer(&key), unsafe.Pointer(&original)); err != nil {
-			return OriginalDestination{}, E.Cause(err, "lookup concurrently restored UDP original destination")
+		var existing originalDestinationValue
+		if err = lookupMap(b.udpRedirectMapFD, unsafe.Pointer(&key), unsafe.Pointer(&existing)); err != nil {
+			return OriginalDestination{}, b.rollbackConsumedUDPRecovery(
+				&key,
+				&recoveryOriginal,
+				consumed,
+				E.Cause(err, "lookup concurrently restored UDP original destination"),
+			)
 		}
+		original = existing
 	}
 	return originalDestinationFromValue(original)
+}
+
+func (b *CgroupBackend) takeUDPRecoveryElement(
+	key *listenerLookupKey,
+	original *originalDestinationValue,
+) (bool, error) {
+	if b.udpRecoveryConsumeMode.Load() != mapLookupAndDeleteUnsupported {
+		err := lookupAndDeleteMap(
+			b.udpRecoveryMapFD,
+			unsafe.Pointer(key),
+			unsafe.Pointer(original),
+		)
+		if err == nil || errors.Is(err, unix.ENOENT) {
+			b.udpRecoveryConsumeMode.Store(mapLookupAndDeleteSupported)
+			return err == nil, err
+		}
+		if !mapLookupAndDeleteUnavailable(err) {
+			return false, err
+		}
+		b.udpRecoveryConsumeMode.Store(mapLookupAndDeleteUnsupported)
+	}
+	// A lookup+delete fallback could remove a newer kernel update between the
+	// two syscalls. Preserve the LRU entry on kernels without atomic support.
+	err := lookupMap(
+		b.udpRecoveryMapFD,
+		unsafe.Pointer(key),
+		unsafe.Pointer(original),
+	)
+	return false, err
+}
+
+func (b *CgroupBackend) rollbackConsumedUDPRecovery(
+	key *listenerLookupKey,
+	original *originalDestinationValue,
+	consumed bool,
+	recoveryErr error,
+) error {
+	if !consumed {
+		return recoveryErr
+	}
+	err := updateMapWithFlags(
+		b.udpRecoveryMapFD,
+		unsafe.Pointer(key),
+		unsafe.Pointer(original),
+		bpfNoExist,
+	)
+	if err == nil || errors.Is(err, unix.EEXIST) {
+		return recoveryErr
+	}
+	return E.Errors(recoveryErr, E.Cause(err, "restore consumed UDP recovery state"))
 }
 
 func (b *CgroupBackend) RecoverConnectedUDPOriginal(listenerDestination netip.AddrPort) (OriginalDestination, error) {
@@ -174,27 +241,11 @@ func (b *CgroupBackend) RecoverConnectedUDPOriginal(listenerDestination netip.Ad
 	if tokenMap == nil {
 		return OriginalDestination{}, E.New("connected UDP token map is unavailable")
 	}
-	var (
-		cookie       uint64
-		currentToken listenerLookupKey
-		found        bool
-		scanned      uint32
-	)
-	iterator := tokenMap.Iterate()
-	for iterator.Next(&cookie, &currentToken) {
-		scanned++
-		if currentToken == listener {
-			found = true
-			break
-		}
-		if scanned >= b.mapCapacity.UDPRedirect {
-			break
-		}
-	}
-	if err = iterator.Err(); err != nil {
+	cookie, err := b.findConnectedUDPToken(tokenMap, listener)
+	if err != nil {
 		return OriginalDestination{}, E.Cause(err, "scan connected UDP token state")
 	}
-	if !found || cookie == 0 {
+	if cookie == 0 {
 		return OriginalDestination{}, E.Cause(unix.ENOENT, "find connected UDP token state")
 	}
 	var verifiedToken listenerLookupKey
@@ -261,6 +312,81 @@ func (b *CgroupBackend) RecoverConnectedUDPOriginal(listenerDestination netip.Ad
 		return OriginalDestination{}, E.Cause(err, "restore connected UDP redirect state")
 	}
 	return originalDestinationFromValue(original)
+}
+
+func (b *CgroupBackend) findConnectedUDPToken(
+	tokenMap *CiliumEBPF.Map,
+	listener listenerLookupKey,
+) (uint64, error) {
+	// Connected UDP recovery is a cold path. Batch lookup avoids one syscall
+	// per token on kernels that implement BPF_MAP_LOOKUP_BATCH, while the
+	// support state keeps vendor/old kernels on the proven iterator path.
+	if b.connectedUDPTokenLookupSupport.mode.Load() != mapBatchUnsupported {
+		batchCapacity := min(uint32(mapBatchMaxEntries), b.mapCapacity.UDPRedirect)
+		if cap(b.connectedUDPTokenKeys) < int(batchCapacity) {
+			b.connectedUDPTokenKeys = make([]uint64, batchCapacity)
+			b.connectedUDPTokenValues = make([]listenerLookupKey, batchCapacity)
+		} else {
+			b.connectedUDPTokenKeys = b.connectedUDPTokenKeys[:batchCapacity]
+			b.connectedUDPTokenValues = b.connectedUDPTokenValues[:batchCapacity]
+		}
+		var cursor CiliumEBPF.MapBatchCursor
+		var scanned uint32
+		for scanned < b.mapCapacity.UDPRedirect {
+			batchSize := min(batchCapacity, b.mapCapacity.UDPRedirect-scanned)
+			countValue, batchErr := tokenMap.BatchLookup(
+				&cursor,
+				b.connectedUDPTokenKeys[:batchSize],
+				b.connectedUDPTokenValues[:batchSize],
+				nil,
+			)
+			count := uint32(countValue)
+			for index := range count {
+				if b.connectedUDPTokenValues[index] == listener {
+					b.connectedUDPTokenLookupSupport.mode.CompareAndSwap(mapBatchUnknown, mapBatchSupported)
+					return b.connectedUDPTokenKeys[index], nil
+				}
+			}
+			scanned += count
+			if errors.Is(batchErr, CiliumEBPF.ErrKeyNotExist) {
+				b.connectedUDPTokenLookupSupport.mode.CompareAndSwap(mapBatchUnknown, mapBatchSupported)
+				return 0, unix.ENOENT
+			}
+			if batchErr != nil {
+				if !mapBatchUnsupportedError(batchErr) {
+					return 0, batchErr
+				}
+				b.connectedUDPTokenLookupSupport.mode.Store(mapBatchUnsupported)
+				break
+			}
+			if count == 0 {
+				return 0, unix.EIO
+			}
+			b.connectedUDPTokenLookupSupport.mode.CompareAndSwap(mapBatchUnknown, mapBatchSupported)
+		}
+		if b.connectedUDPTokenLookupSupport.mode.Load() == mapBatchSupported {
+			return 0, unix.ENOENT
+		}
+	}
+	var (
+		cookie       uint64
+		currentToken listenerLookupKey
+		scanned      uint32
+	)
+	iterator := tokenMap.Iterate()
+	for iterator.Next(&cookie, &currentToken) {
+		scanned++
+		if currentToken == listener {
+			return cookie, nil
+		}
+		if scanned >= b.mapCapacity.UDPRedirect {
+			break
+		}
+	}
+	if err := iterator.Err(); err != nil {
+		return 0, err
+	}
+	return 0, unix.ENOENT
 }
 
 func (b *CgroupBackend) ReserveUDPReplyRedirect(
@@ -389,6 +515,7 @@ func (b *CgroupBackend) SweepStaleTCPRedirects(
 		return CgroupTCPRedirectSweepResult{}, errBackendClosed
 	}
 	b.tcpSweepCandidates = b.tcpSweepCandidates[:0]
+	b.tcpSweepDeleteKeys = b.tcpSweepDeleteKeys[:0]
 	scan, err := b.tcpSweepScratch.scan(
 		b.runtime.maps["cgroup_tcp_redirect"],
 		b.mapCapacity.TCPRedirect,
@@ -422,13 +549,16 @@ func (b *CgroupBackend) SweepStaleTCPRedirects(
 		if current != entry.value {
 			continue
 		}
-		if err = deleteMap(b.tcpRedirectMapFD, unsafe.Pointer(&entry.key)); err != nil {
-			if !errors.Is(err, unix.ENOENT) {
-				sweepErr = E.Errors(sweepErr, err)
-			}
-			continue
-		}
-		result.Removed++
+		b.tcpSweepDeleteKeys = append(b.tcpSweepDeleteKeys, entry.key)
+	}
+	removed, deleteErr := deleteMapBatchIfExists(
+		b.runtime.maps["cgroup_tcp_redirect"],
+		b.tcpSweepDeleteKeys,
+		&b.tcpSweepDeleteSupport,
+	)
+	result.Removed = removed
+	if deleteErr != nil {
+		sweepErr = E.Errors(sweepErr, deleteErr)
 	}
 	b.tcpSweepRemoved += result.Removed
 	if result.Complete {

@@ -104,8 +104,9 @@ fallback janitor tick over a populated 65536-entry hash map:
 
 ```sh
 sudo -E SING_BOX_EBPF_INTEGRATION=1 \
-  go test -run '^$' -bench BenchmarkMapScanMaintenance -benchmem \
-  -tags with_ebpf,ebpf_integration ./common/ebpf
+  go test -run '^$' -tags with_ebpf,ebpf_integration \
+  -bench 'Benchmark(MapScanMaintenance|ConnectedUDPTokenRecoveryScan)' \
+  -benchmem ./common/ebpf
 ```
 
 Use an empty, dedicated cgroup when testing attachment. On a target device,

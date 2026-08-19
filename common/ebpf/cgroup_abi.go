@@ -14,15 +14,15 @@ import (
 const (
 	ProtocolTCP                   = 6
 	ProtocolUDP                   = 17
-	TCPRedirectMapCapacity        = 65536
-	UDPRedirectMapCapacity        = 65536
+	TCPRedirectMapCapacity        = 32768
+	UDPRedirectMapCapacity        = 32768
 	UDPPeerMapCapacity            = 16384
 	UDPFlowMapCapacity            = 16384
-	SocketBypassMapCapacity       = 65536
+	SocketBypassMapCapacity       = 32768
 	SharedNetworkProxyCapacity    = 32768
 	SharedNetworkBypassCapacity   = 16384
 	SharedNetworkFragmentCapacity = 8192
-	UDPRecoveryMapCapacity        = 4096
+	UDPRecoveryMapCapacity        = 8192
 	MaxConfigurableMapCapacity    = 1 << 20
 	cgroupStatTCPRedirectFailure  = 0
 	cgroupStatUDPRedirectFailure

@@ -333,6 +333,35 @@ func deleteMapBatch[K any](
 	return total, nil
 }
 
+func deleteMapBatchIfExists[K any](
+	mapInstance *CiliumEBPF.Map,
+	keys []K,
+	support *mapBatchSupport,
+) (uint32, error) {
+	processed, err := deleteMapBatch(mapInstance, keys, support)
+	if err == nil {
+		return processed, nil
+	}
+	if !errors.Is(err, unix.ENOENT) && !errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
+		return processed, err
+	}
+	if mapInstance == nil {
+		return processed, errBackendClosed
+	}
+	mapFD := mapInstance.FD()
+	for index := int(processed); index < len(keys); index++ {
+		deleteErr := deleteMap(mapFD, unsafe.Pointer(&keys[index]))
+		if errors.Is(deleteErr, unix.ENOENT) || errors.Is(deleteErr, CiliumEBPF.ErrKeyNotExist) {
+			continue
+		}
+		if deleteErr != nil {
+			return processed, deleteErr
+		}
+		processed++
+	}
+	return processed, nil
+}
+
 func deleteMapBatchChunk[K any](
 	mapInstance *CiliumEBPF.Map,
 	keys []K,

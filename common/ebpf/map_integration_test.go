@@ -124,6 +124,10 @@ func TestMapBatchIntegration(t *testing.T) {
 			if entries != 0 {
 				t.Fatalf("unexpected map entry count after delete: %d", entries)
 			}
+			processed, err = deleteMapBatchIfExists(mapInstance, keys, &deleteSupport)
+			if err != nil || processed != 0 {
+				t.Fatalf("delete missing keys: processed=%d err=%v", processed, err)
+			}
 		})
 	}
 }
@@ -221,6 +225,61 @@ func BenchmarkMapScanMaintenance(b *testing.B) {
 			b.StopTimer()
 			b.ReportMetric(float64(scanned)/float64(b.N), "entries/op")
 			runtime.KeepAlive(visited)
+		})
+	}
+}
+
+func BenchmarkConnectedUDPTokenRecoveryScan(b *testing.B) {
+	requireEBPFIntegration(b, "benchmark connected UDP token recovery scans")
+	const maxEntries = UDPRedirectMapCapacity
+	mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+		Type:       CiliumEBPF.LRUHash,
+		KeySize:    uint32(unsafe.Sizeof(uint64(0))),
+		ValueSize:  uint32(unsafe.Sizeof(listenerLookupKey{})),
+		MaxEntries: maxEntries,
+	})
+	if err != nil {
+		b.Fatal(err)
+	}
+	b.Cleanup(func() { _ = mapInstance.Close() })
+	keys := make([]uint64, maxEntries)
+	values := make([]listenerLookupKey, maxEntries)
+	for index := range keys {
+		keys[index] = uint64(index + 1)
+		values[index] = listenerLookupKey{
+			Family:       addressFamilyIPv4,
+			Protocol:     ProtocolUDP,
+			ListenerPort: uint16(index),
+		}
+	}
+	var updateSupport mapBatchSupport
+	if _, err = updateMapBatch(mapInstance, keys, values, 0, &updateSupport); err != nil {
+		b.Fatal(err)
+	}
+	runtime.KeepAlive(keys)
+	runtime.KeepAlive(values)
+	missing := listenerLookupKey{Family: addressFamilyIPv6, Protocol: ProtocolUDP}
+
+	for _, testCase := range []struct {
+		name          string
+		forceFallback bool
+	}{
+		{name: "batch-full-miss"},
+		{name: "fallback-full-miss", forceFallback: true},
+	} {
+		b.Run(testCase.name, func(b *testing.B) {
+			backend := &CgroupBackend{mapCapacity: CgroupMapCapacity{UDPRedirect: maxEntries}}
+			if testCase.forceFallback {
+				backend.connectedUDPTokenLookupSupport.mode.Store(mapBatchUnsupported)
+			}
+			b.ReportMetric(maxEntries, "entries/op")
+			b.ResetTimer()
+			for range b.N {
+				cookie, lookupErr := backend.findConnectedUDPToken(mapInstance, missing)
+				if cookie != 0 || !errors.Is(lookupErr, unix.ENOENT) {
+					b.Fatalf("unexpected lookup result: cookie=%d err=%v", cookie, lookupErr)
+				}
+			}
 		})
 	}
 }
