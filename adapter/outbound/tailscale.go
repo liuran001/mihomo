@@ -160,7 +160,19 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		},
 		SystemPacketListener: func(ctx context.Context, network, address string) (net.PacketConn, error) {
 			log.Debugln("[Tailscale](%s) SystemPacketListener: start listen %s %s", option.Name, network, address)
-			pc, err := outbound.dialer.ListenPacket(ctx, network, address, netip.AddrPort{})
+			var pc net.PacketConn
+			var err error
+			if option.Interface == "" && option.RoutingMark == 0 && dialer.DefaultSocketHook == nil {
+				// Leave the magicsock UDP socket unbound: binding it to the
+				// auto-detected default interface (or the TUN interface finder
+				// fallback) prevents it from receiving packets from peers on
+				// other local interfaces (e.g. LAN), forcing DERP relay even
+				// for directly reachable peers.
+				lc := &net.ListenConfig{}
+				pc, err = lc.ListenPacket(ctx, network, address)
+			} else {
+				pc, err = outbound.dialer.ListenPacket(ctx, network, address, netip.AddrPort{})
+			}
 			log.Debugln("[Tailscale](%s) SystemPacketListener: finish listen %s %s, err: %v", option.Name, network, address, err)
 			return pc, err
 		},
