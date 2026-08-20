@@ -26,6 +26,7 @@ import (
 	"github.com/metacubex/tailscale/hostinfo"
 	"github.com/metacubex/tailscale/ipn"
 	"github.com/metacubex/tailscale/net/netmon"
+	"github.com/metacubex/tailscale/net/tsaddr"
 	"github.com/metacubex/tailscale/tailcfg"
 	"github.com/metacubex/tailscale/tsnet"
 	D "github.com/miekg/dns"
@@ -63,9 +64,32 @@ type TailscaleOption struct {
 	Ephemeral  bool   `proxy:"ephemeral,omitempty"`
 	UDP        bool   `proxy:"udp,omitempty"`
 
-	AcceptRoutes           *bool  `proxy:"accept-routes,omitempty"`
-	ExitNode               string `proxy:"exit-node,omitempty"`
-	ExitNodeAllowLANAccess *bool  `proxy:"exit-node-allow-lan-access,omitempty"`
+	AcceptRoutes           *bool    `proxy:"accept-routes,omitempty"`
+	ExitNode               string   `proxy:"exit-node,omitempty"`
+	ExitNodeAllowLANAccess *bool    `proxy:"exit-node-allow-lan-access,omitempty"`
+	AdvertiseRoutes        []string `proxy:"advertise-routes,omitempty"`
+	AdvertiseExitNode      bool     `proxy:"advertise-exit-node,omitempty"`
+}
+
+// parseAdvertiseRoutes builds the AdvertiseRoutes prefix list from the
+// advertise-routes and advertise-exit-node options. It returns nil when
+// neither is configured.
+func parseAdvertiseRoutes(option TailscaleOption) ([]netip.Prefix, error) {
+	if len(option.AdvertiseRoutes) == 0 && !option.AdvertiseExitNode {
+		return nil, nil
+	}
+	routes := make([]netip.Prefix, 0, len(option.AdvertiseRoutes)+2)
+	for _, route := range option.AdvertiseRoutes {
+		prefix, err := netip.ParsePrefix(strings.TrimSpace(route))
+		if err != nil {
+			return nil, fmt.Errorf("invalid advertise-routes entry %q: %w", route, err)
+		}
+		routes = append(routes, prefix.Masked())
+	}
+	if option.AdvertiseExitNode {
+		routes = append(routes, tsaddr.AllIPv4(), tsaddr.AllIPv6())
+	}
+	return routes, nil
 }
 
 func init() {
@@ -210,6 +234,13 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	dnsTransport := tailscaleDNSTransport{tailscale: outbound}
 	outbound.dnsResolver = dns.NewResolverFromClient(dnsTransport)
 	outbound.unregisterDNSResolver = dns.RegisterTailscaleDnsClient(option.Name, dnsTransport)
+	if routes, _ := parseAdvertiseRoutes(option); len(routes) > 0 {
+		if tunnel := option.NewTunnel(); tunnel != nil {
+			outbound.registerInboundHandlers(tunnel)
+		} else {
+			log.Warnln("[Tailscale](%s) advertise-routes configured but no tunnel available; inbound flows will be rejected", option.Name)
+		}
+	}
 	return outbound, nil
 }
 
@@ -360,6 +391,15 @@ func buildTailscaleMaskedPrefs(option TailscaleOption) (*ipn.MaskedPrefs, error)
 	if option.ExitNodeAllowLANAccess != nil && !tailscaleExitNodeNeedsStatus(option) {
 		mp.ExitNodeAllowLANAccess = *option.ExitNodeAllowLANAccess
 		mp.ExitNodeAllowLANAccessSet = true
+		changed = true
+	}
+	advertiseRoutes, err := parseAdvertiseRoutes(option)
+	if err != nil {
+		return nil, err
+	}
+	if advertiseRoutes != nil {
+		mp.AdvertiseRoutes = advertiseRoutes
+		mp.AdvertiseRoutesSet = true
 		changed = true
 	}
 	if !changed {
