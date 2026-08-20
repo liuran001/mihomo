@@ -53,6 +53,7 @@ type sharedTCAttachment struct {
 	ingress              *netlink.BpfFilter
 	egress               *netlink.BpfFilter
 	restoreRouteLocalnet bool
+	originalArpAnnounce  string
 }
 
 func (m *sharedTCManager) Start() error {
@@ -210,10 +211,11 @@ func (m *sharedTCManager) detachLocked(attachment *sharedTCAttachment) error {
 	if detachErr != nil {
 		return detachErr
 	}
+	var restoreErr error
 	if attachment.restoreRouteLocalnet {
-		return restoreSharedRouteLocalnet(attachment.interfaceName)
+		restoreErr = restoreSharedRouteLocalnet(attachment.interfaceName)
 	}
-	return nil
+	return E.Errors(restoreErr, restoreSharedArpAnnounce(attachment.interfaceName, attachment.originalArpAnnounce))
 }
 
 func (m *sharedTCManager) InterfaceString() string {
