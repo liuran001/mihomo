@@ -240,6 +240,16 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		} else {
 			log.Warnln("[Tailscale](%s) advertise-routes configured but no tunnel available; inbound flows will be rejected", option.Name)
 		}
+		// Advertised routes mean this node serves the tailnet (subnet router
+		// or exit node), so bring the backend up eagerly instead of waiting
+		// for the first locally-routed connection: peers must be able to
+		// reach it right after a (re)start, and DNS "ts://" lookups would
+		// otherwise fail during the lazy-start window.
+		go func() {
+			if err := outbound.start(); err != nil {
+				log.Warnln("[Tailscale](%s) eager start failed: %v", option.Name, err)
+			}
+		}()
 	}
 	return outbound, nil
 }
