@@ -56,6 +56,7 @@ type TailscaleOption struct {
 	BasicOption
 	Name       string `proxy:"name"`
 	Hostname   string `proxy:"hostname,omitempty"`
+	ListenPort uint16 `proxy:"listen-port,omitempty"`
 	AuthKey    string `proxy:"auth-key,omitempty"`
 	ControlURL string `proxy:"control-url,omitempty"`
 	StateDir   string `proxy:"state-dir,omitempty"`
@@ -149,6 +150,7 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	outbound.server = &tsnet.Server{
 		Dir:        option.StateDir,
 		Hostname:   option.Hostname,
+		Port:       option.ListenPort,
 		AuthKey:    option.AuthKey,
 		ControlURL: option.ControlURL,
 		Ephemeral:  option.Ephemeral,
@@ -162,13 +164,28 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 			log.Debugln("[Tailscale](%s) SystemPacketListener: start listen %s %s", option.Name, network, address)
 			var pc net.PacketConn
 			var err error
-			if option.Interface == "" && option.RoutingMark == 0 && dialer.DefaultSocketHook == nil {
+			if option.Interface == "" && dialer.DefaultSocketHook == nil {
 				// Leave the magicsock UDP socket unbound: binding it to the
 				// auto-detected default interface (or the TUN interface finder
 				// fallback) prevents it from receiving packets from peers on
 				// other local interfaces (e.g. LAN), forcing DERP relay even
 				// for directly reachable peers.
+				//
+				// An unbound socket's egress can however be captured by
+				// mihomo's own TUN when auto-route is active (its policy rules
+				// send local-originated traffic with an undecided source into
+				// the TUN table), looping magicsock traffic back through
+				// mihomo. Honor the proxy's routing-mark (or the global one)
+				// so users can route the socket around the TUN; alternatively
+				// set listen-port and exclude it via tun.exclude-src-port.
+				mark := option.RoutingMark
+				if mark == 0 {
+					mark = int(dialer.DefaultRoutingMark.Load())
+				}
 				lc := &net.ListenConfig{}
+				if mark != 0 {
+					dialer.BindMarkToListenConfig(mark, lc, network, address)
+				}
 				pc, err = lc.ListenPacket(ctx, network, address)
 			} else {
 				pc, err = outbound.dialer.ListenPacket(ctx, network, address, netip.AddrPort{})
