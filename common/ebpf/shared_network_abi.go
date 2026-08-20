@@ -14,11 +14,10 @@ import (
 const sharedNetworkStatTokenReservationFailure = 0
 
 const (
-	sharedNetworkScratchSize         = 352
+	sharedNetworkScratchSize         = 272
 	sharedNetworkFragmentKeySize     = 44
 	sharedNetworkFragmentValueSize   = 32
 	sharedNetworkBypassFlowValueSize = 16
-	sharedNetworkReplyValueSize      = 20
 )
 
 type SharedNetworkConfig struct {
@@ -108,27 +107,10 @@ type sharedNetworkOriginalKey struct {
 }
 
 type sharedNetworkTokenValue struct {
-	TokenAddr   [16]byte
-	Generation  uint64
-	CreatedAtNS uint64
-	LastSeenNS  uint64
-}
-
-type sharedNetworkReplyKey struct {
-	InterfaceIndex uint32
-	Family         uint8
-	Protocol       uint8
-	ClientPort     uint16
-	ListenerPort   uint16
-	Reserved       uint16
-	ClientAddr     [16]byte
-	TokenAddr      [16]byte
-}
-
-type sharedNetworkReplyValue struct {
-	OriginalPort uint16
-	Reserved     uint16
-	OriginalAddr [16]byte
+	TokenAddr  [16]byte
+	Generation uint64
+	LastSeenNS uint64
+	Reserved   uint64
 }
 
 type sharedNetworkOriginalValue struct {
@@ -137,15 +119,15 @@ type sharedNetworkOriginalValue struct {
 	Port           uint16
 	Addr           [16]byte
 	InterfaceIndex uint32
-	Reserved       uint32
+	Generation     uint64
 	SourceMAC      [6]byte
 	Reserved2      [2]byte
 }
 
 type SharedNetworkFlowHandle struct {
 	originalKey sharedNetworkOriginalKey
-	replyKey    sharedNetworkReplyKey
 	listenerKey sharedNetworkListenerKey
+	generation  uint64
 }
 
 type SharedNetworkFlowSweepResult struct {
@@ -250,16 +232,8 @@ func makeSharedNetworkFlowHandle(key sharedNetworkListenerKey, value sharedNetwo
 			ClientAddr:     key.ClientAddr,
 			OriginalAddr:   value.Addr,
 		},
-		replyKey: sharedNetworkReplyKey{
-			InterfaceIndex: value.InterfaceIndex,
-			Family:         key.Family,
-			Protocol:       key.Protocol,
-			ClientPort:     key.ClientPort,
-			ListenerPort:   key.ListenerPort,
-			ClientAddr:     key.ClientAddr,
-			TokenAddr:      key.TokenAddr,
-		},
 		listenerKey: key,
+		generation:  value.Generation,
 	}
 }
 
@@ -267,21 +241,14 @@ func makeSharedNetworkFlowHandleFromOriginal(
 	key sharedNetworkOriginalKey,
 	token [16]byte,
 	listenerPort uint16,
+	generation uint64,
 ) SharedNetworkFlowHandle {
 	return SharedNetworkFlowHandle{
 		originalKey: key,
-		replyKey: sharedNetworkReplyKey{
-			InterfaceIndex: key.InterfaceIndex,
-			Family:         key.Family,
-			Protocol:       key.Protocol,
-			ClientPort:     key.ClientPort,
-			ListenerPort:   listenerPort,
-			ClientAddr:     key.ClientAddr,
-			TokenAddr:      token,
-		},
 		listenerKey: sharedNetworkListenerKey{
 			Family: key.Family, Protocol: key.Protocol, ListenerPort: listenerPort,
 			TokenAddr: token, ClientPort: key.ClientPort, ClientAddr: key.ClientAddr,
 		},
+		generation: generation,
 	}
 }

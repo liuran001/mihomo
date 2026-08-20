@@ -515,6 +515,92 @@ func TestSharedNetworkSharedMapProgramLoadIntegration(t *testing.T) {
 	})
 }
 
+func TestSharedNetworkGenerationCleanupIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "validate shared-network generation-aware cleanup")
+	backend, err := PrepareSharedNetwork(nil, SharedNetworkConfig{
+		ListenerPort: 65531,
+		EnableTCP:    true,
+		RedirectIPv4: netip.MustParsePrefix("127.128.0.0/9"),
+		MapCapacity: SharedNetworkMapCapacities{
+			Proxy:    16,
+			Bypass:   1,
+			Fragment: 1,
+		},
+		UDPTimeout: 5 * time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = backend.Close() })
+
+	originalKey := sharedNetworkOriginalKey{
+		InterfaceIndex: 7,
+		Family:         addressFamilyIPv4,
+		Protocol:       ProtocolTCP,
+		ClientPort:     53000,
+		OriginalPort:   443,
+	}
+	copy(originalKey.ClientAddr[:], netip.MustParseAddr("192.0.2.2").AsSlice())
+	copy(originalKey.OriginalAddr[:], netip.MustParseAddr("198.51.100.10").AsSlice())
+	token := netip.MustParseAddr("127.200.1.2").As4()
+	var tokenAddress [16]byte
+	copy(tokenAddress[:], token[:])
+	oldFlow := makeSharedNetworkFlowHandleFromOriginal(originalKey, tokenAddress, 65531, 10)
+	newFlow := makeSharedNetworkFlowHandleFromOriginal(originalKey, tokenAddress, 65531, 11)
+	newTokenValue := sharedNetworkTokenValue{
+		TokenAddr:  tokenAddress,
+		Generation: newFlow.generation,
+		LastSeenNS: 1,
+	}
+	newOriginalValue := sharedNetworkOriginalValue{
+		Family:         addressFamilyIPv4,
+		Protocol:       ProtocolTCP,
+		Port:           originalKey.OriginalPort,
+		Addr:           originalKey.OriginalAddr,
+		InterfaceIndex: originalKey.InterfaceIndex,
+		Generation:     newFlow.generation,
+	}
+	if err = updateMap(
+		backend.runtime.flow_by_original_map_fd,
+		unsafe.Pointer(&originalKey),
+		unsafe.Pointer(&newTokenValue),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if err = updateMap(
+		backend.runtime.flow_by_token_map_fd,
+		unsafe.Pointer(&newFlow.listenerKey),
+		unsafe.Pointer(&newOriginalValue),
+	); err != nil {
+		t.Fatal(err)
+	}
+	if removed, cleanupErr := backend.deleteFlowGenerationLocked(oldFlow); cleanupErr != nil || removed {
+		t.Fatalf("old generation removed current state: removed=%t err=%v", removed, cleanupErr)
+	}
+	if err = backend.validateFlowGenerationLocked(newFlow); err != nil {
+		t.Fatal("current generation did not survive old cleanup: ", err)
+	}
+	if removed, cleanupErr := backend.deleteFlowGenerationLocked(newFlow); cleanupErr != nil || !removed {
+		t.Fatalf("current generation was not removed: removed=%t err=%v", removed, cleanupErr)
+	}
+	var tokenValue sharedNetworkTokenValue
+	if err = lookupMap(
+		backend.runtime.flow_by_original_map_fd,
+		unsafe.Pointer(&originalKey),
+		unsafe.Pointer(&tokenValue),
+	); !errors.Is(err, unix.ENOENT) {
+		t.Fatalf("original state survived matching cleanup: %v", err)
+	}
+	var originalValue sharedNetworkOriginalValue
+	if err = lookupMap(
+		backend.runtime.flow_by_token_map_fd,
+		unsafe.Pointer(&newFlow.listenerKey),
+		unsafe.Pointer(&originalValue),
+	); !errors.Is(err, unix.ENOENT) {
+		t.Fatalf("token state survived matching cleanup: %v", err)
+	}
+}
+
 func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend, hijackDNS bool, dnsRespectBypass bool, bypassPrivateAddress bool) *SharedNetworkBackend {
 	t.Helper()
 	sharedBackend, err := PrepareSharedNetwork(cgroupBackend, SharedNetworkConfig{

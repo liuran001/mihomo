@@ -74,10 +74,9 @@ func TestEmbeddedSharedNetworkObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadSharedNetwork, map[string]objectMapLayout{
 		"shared_control":             {4, 80},
 		"shared_stats":               {4, 8},
-		"shared_original_to_token":   {44, 40},
+		"shared_flow_by_original":    {44, 40},
 		"shared_bypass_flow":         {44, 16},
-		"shared_reply":               {44, 20},
-		"shared_listener":            {40, 36},
+		"shared_flow_by_token":       {40, 40},
 		"shared_fragment":            {44, 32},
 		"shared_host_ipv4":           {8, 1},
 		"shared_host_ipv6":           {20, 1},
@@ -89,7 +88,7 @@ func TestEmbeddedSharedNetworkObjectLayout(t *testing.T) {
 		"shared_exclude_source_mac":  {8, 1},
 		"shared_bypass_ipv4":         {8, 1},
 		"shared_bypass_ipv6":         {20, 1},
-		"shared_scratch":             {4, 352},
+		"shared_scratch":             {4, 272},
 	}, []string{
 		"classifier/ingress",
 		"classifier/egress",

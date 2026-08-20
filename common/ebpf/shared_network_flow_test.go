@@ -9,6 +9,7 @@ func TestSharedNetworkFlowReferences(t *testing.T) {
 	flow := SharedNetworkFlowHandle{
 		originalKey: sharedNetworkOriginalKey{InterfaceIndex: 7, Protocol: ProtocolTCP},
 		listenerKey: sharedNetworkListenerKey{Protocol: ProtocolTCP, ListenerPort: 1234},
+		generation:  11,
 	}
 	backend.retainFlowLocked(flow)
 	backend.retainFlowLocked(flow)

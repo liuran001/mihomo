@@ -36,15 +36,14 @@
 
 EXTERNAL_MAP(shared_control, __u32, struct sb_shared_control, 1U);
 EXTERNAL_MAP(shared_stats, __u32, __u64, SB_SHARED_STAT_COUNT);
-EXTERNAL_MAP(shared_original_to_token, struct sb_shared_original_key, struct sb_shared_token_value, SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES);
+EXTERNAL_MAP(shared_flow_by_original, struct sb_shared_original_key, struct sb_shared_token_value, SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES);
 struct bpf_map_def SEC("maps") shared_bypass_flow = {
     .type = BPF_MAP_TYPE_LRU_HASH,
     .key_size = sizeof(struct sb_shared_original_key),
     .value_size = sizeof(struct sb_shared_bypass_flow_value),
     .max_entries = SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES,
 };
-EXTERNAL_MAP(shared_reply, struct sb_shared_reply_key, struct sb_shared_reply_value, SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES);
-EXTERNAL_MAP(shared_listener, struct sb_shared_listener_key, struct sb_shared_original_value, SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES);
+EXTERNAL_MAP(shared_flow_by_token, struct sb_shared_listener_key, struct sb_shared_original_value, SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES);
 struct bpf_map_def SEC("maps") shared_fragment = {
     .type = BPF_MAP_TYPE_LRU_HASH,
     .key_size = sizeof(struct sb_shared_fragment_key),
@@ -437,20 +436,20 @@ NOINLINE int egress_ipv4(
         return TC_ACT_SHOT;
     }
 
-    __builtin_memset(&scratch->reply_key, 0, sizeof(scratch->reply_key));
-    scratch->reply_key.ifindex = skb->ifindex;
-    scratch->reply_key.family = AF_INET_VALUE;
-    scratch->reply_key.protocol = ip->protocol;
-    scratch->reply_key.client_port = swap16(ports->destination);
-    scratch->reply_key.listener_port = control->listener_port;
-    __builtin_memcpy(scratch->reply_key.client_addr, &ip->destination, 4U);
-    __builtin_memcpy(scratch->reply_key.token_addr, &ip->source, 4U);
-    struct sb_shared_reply_value *original = map_lookup(
-        &shared_reply,
-        &scratch->reply_key);
-    if (original == 0) return TC_ACT_SHOT;
+    __builtin_memset(&scratch->listener_key, 0, sizeof(scratch->listener_key));
+    scratch->listener_key.family = AF_INET_VALUE;
+    scratch->listener_key.protocol = ip->protocol;
+    scratch->listener_key.client_port = swap16(ports->destination);
+    scratch->listener_key.listener_port = control->listener_port;
+    __builtin_memcpy(scratch->listener_key.client_addr, &ip->destination, 4U);
+    __builtin_memcpy(scratch->listener_key.token_addr, &ip->source, 4U);
+    struct sb_shared_original_value *original = map_lookup(
+        &shared_flow_by_token,
+        &scratch->listener_key);
+    if (original == 0 || original->ifindex != skb->ifindex) return TC_ACT_SHOT;
+    __builtin_memcpy(&scratch->original_value, original, sizeof(scratch->original_value));
     __be32 original_address;
-    __builtin_memcpy(&original_address, original->original_addr, 4U);
+    __builtin_memcpy(&original_address, scratch->original_value.addr, 4U);
     if (more_fragments) {
         prepare_fragment_key(
             scratch,
@@ -474,7 +473,7 @@ NOINLINE int egress_ipv4(
         ip->source,
         original_address,
         ports->source,
-        swap16(original->original_port),
+        swap16(scratch->original_value.port),
         ip->protocol);
 }
 
@@ -800,19 +799,18 @@ NOINLINE int egress_ipv6(
         return TC_ACT_SHOT;
     }
 
-    __builtin_memset(&scratch->reply_key, 0, sizeof(scratch->reply_key));
-    scratch->reply_key.ifindex = skb->ifindex;
-    scratch->reply_key.family = AF_INET6_VALUE;
-    scratch->reply_key.protocol = protocol;
-    scratch->reply_key.client_port = swap16(destination_port_raw);
-    scratch->reply_key.listener_port = control->listener_port;
-    copy_address(scratch->reply_key.client_addr, ip->destination, 16U);
-    copy_address(scratch->reply_key.token_addr, ip->source, 16U);
-    struct sb_shared_reply_value *original = map_lookup(
-        &shared_reply,
-        &scratch->reply_key);
-    if (original == 0) return TC_ACT_SHOT;
-    __builtin_memcpy(&scratch->reply_value, original, sizeof(scratch->reply_value));
+    __builtin_memset(&scratch->listener_key, 0, sizeof(scratch->listener_key));
+    scratch->listener_key.family = AF_INET6_VALUE;
+    scratch->listener_key.protocol = protocol;
+    scratch->listener_key.client_port = swap16(destination_port_raw);
+    scratch->listener_key.listener_port = control->listener_port;
+    copy_address(scratch->listener_key.client_addr, ip->destination, 16U);
+    copy_address(scratch->listener_key.token_addr, ip->source, 16U);
+    struct sb_shared_original_value *original = map_lookup(
+        &shared_flow_by_token,
+        &scratch->listener_key);
+    if (original == 0 || original->ifindex != skb->ifindex) return TC_ACT_SHOT;
+    __builtin_memcpy(&scratch->original_value, original, sizeof(scratch->original_value));
     if (fragment_state == SB_SHARED_FRAGMENT_FIRST) {
         prepare_fragment_key(
             scratch,
@@ -824,7 +822,7 @@ NOINLINE int egress_ipv6(
             ip->source,
             ip->destination,
             16U);
-        if (!store_fragment(scratch, scratch->reply_value.original_addr, 16U, SB_SHARED_POLICY_PROXY)) {
+        if (!store_fragment(scratch, scratch->original_value.addr, 16U, SB_SHARED_POLICY_PROXY)) {
             return TC_ACT_SHOT;
         }
     }
@@ -833,10 +831,10 @@ NOINLINE int egress_ipv6(
         l3_offset,
         transport,
         true,
-        scratch->reply_key.token_addr,
-        scratch->reply_value.original_addr,
+        scratch->listener_key.token_addr,
+        scratch->original_value.addr,
         source_port_raw,
-        swap16(scratch->reply_value.original_port),
+        swap16(scratch->original_value.port),
         protocol);
 }
 

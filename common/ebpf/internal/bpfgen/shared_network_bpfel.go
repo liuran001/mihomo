@@ -23,15 +23,14 @@ const (
 	SharedNetworkMapSharedExcludeSourceIpv4 = "shared_exclude_source_ipv4"
 	SharedNetworkMapSharedExcludeSourceIpv6 = "shared_exclude_source_ipv6"
 	SharedNetworkMapSharedExcludeSourceMac  = "shared_exclude_source_mac"
+	SharedNetworkMapSharedFlowByOriginal    = "shared_flow_by_original"
+	SharedNetworkMapSharedFlowByToken       = "shared_flow_by_token"
 	SharedNetworkMapSharedFragment          = "shared_fragment"
 	SharedNetworkMapSharedHostIpv4          = "shared_host_ipv4"
 	SharedNetworkMapSharedHostIpv6          = "shared_host_ipv6"
 	SharedNetworkMapSharedIncludeSourceIpv4 = "shared_include_source_ipv4"
 	SharedNetworkMapSharedIncludeSourceIpv6 = "shared_include_source_ipv6"
 	SharedNetworkMapSharedIncludeSourceMac  = "shared_include_source_mac"
-	SharedNetworkMapSharedListener          = "shared_listener"
-	SharedNetworkMapSharedOriginalToToken   = "shared_original_to_token"
-	SharedNetworkMapSharedReply             = "shared_reply"
 	SharedNetworkMapSharedScratch           = "shared_scratch"
 	SharedNetworkMapSharedStats             = "shared_stats"
 	SharedNetworkProgSingboxSharedEgress    = "singbox_shared_egress"
@@ -95,15 +94,14 @@ type SharedNetworkMapSpecs struct {
 	SharedExcludeSourceIpv4 *ebpf.MapSpec `ebpf:"shared_exclude_source_ipv4"`
 	SharedExcludeSourceIpv6 *ebpf.MapSpec `ebpf:"shared_exclude_source_ipv6"`
 	SharedExcludeSourceMac  *ebpf.MapSpec `ebpf:"shared_exclude_source_mac"`
+	SharedFlowByOriginal    *ebpf.MapSpec `ebpf:"shared_flow_by_original"`
+	SharedFlowByToken       *ebpf.MapSpec `ebpf:"shared_flow_by_token"`
 	SharedFragment          *ebpf.MapSpec `ebpf:"shared_fragment"`
 	SharedHostIpv4          *ebpf.MapSpec `ebpf:"shared_host_ipv4"`
 	SharedHostIpv6          *ebpf.MapSpec `ebpf:"shared_host_ipv6"`
 	SharedIncludeSourceIpv4 *ebpf.MapSpec `ebpf:"shared_include_source_ipv4"`
 	SharedIncludeSourceIpv6 *ebpf.MapSpec `ebpf:"shared_include_source_ipv6"`
 	SharedIncludeSourceMac  *ebpf.MapSpec `ebpf:"shared_include_source_mac"`
-	SharedListener          *ebpf.MapSpec `ebpf:"shared_listener"`
-	SharedOriginalToToken   *ebpf.MapSpec `ebpf:"shared_original_to_token"`
-	SharedReply             *ebpf.MapSpec `ebpf:"shared_reply"`
 	SharedScratch           *ebpf.MapSpec `ebpf:"shared_scratch"`
 	SharedStats             *ebpf.MapSpec `ebpf:"shared_stats"`
 }
@@ -141,15 +139,14 @@ type SharedNetworkMaps struct {
 	SharedExcludeSourceIpv4 *ebpf.Map `ebpf:"shared_exclude_source_ipv4"`
 	SharedExcludeSourceIpv6 *ebpf.Map `ebpf:"shared_exclude_source_ipv6"`
 	SharedExcludeSourceMac  *ebpf.Map `ebpf:"shared_exclude_source_mac"`
+	SharedFlowByOriginal    *ebpf.Map `ebpf:"shared_flow_by_original"`
+	SharedFlowByToken       *ebpf.Map `ebpf:"shared_flow_by_token"`
 	SharedFragment          *ebpf.Map `ebpf:"shared_fragment"`
 	SharedHostIpv4          *ebpf.Map `ebpf:"shared_host_ipv4"`
 	SharedHostIpv6          *ebpf.Map `ebpf:"shared_host_ipv6"`
 	SharedIncludeSourceIpv4 *ebpf.Map `ebpf:"shared_include_source_ipv4"`
 	SharedIncludeSourceIpv6 *ebpf.Map `ebpf:"shared_include_source_ipv6"`
 	SharedIncludeSourceMac  *ebpf.Map `ebpf:"shared_include_source_mac"`
-	SharedListener          *ebpf.Map `ebpf:"shared_listener"`
-	SharedOriginalToToken   *ebpf.Map `ebpf:"shared_original_to_token"`
-	SharedReply             *ebpf.Map `ebpf:"shared_reply"`
 	SharedScratch           *ebpf.Map `ebpf:"shared_scratch"`
 	SharedStats             *ebpf.Map `ebpf:"shared_stats"`
 }
@@ -163,15 +160,14 @@ func (m *SharedNetworkMaps) Close() error {
 		m.SharedExcludeSourceIpv4,
 		m.SharedExcludeSourceIpv6,
 		m.SharedExcludeSourceMac,
+		m.SharedFlowByOriginal,
+		m.SharedFlowByToken,
 		m.SharedFragment,
 		m.SharedHostIpv4,
 		m.SharedHostIpv6,
 		m.SharedIncludeSourceIpv4,
 		m.SharedIncludeSourceIpv6,
 		m.SharedIncludeSourceMac,
-		m.SharedListener,
-		m.SharedOriginalToToken,
-		m.SharedReply,
 		m.SharedScratch,
 		m.SharedStats,
 	)

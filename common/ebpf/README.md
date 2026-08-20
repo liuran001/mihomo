@@ -24,6 +24,109 @@ and checksum helpers, but are compiled as one verifier-visible translation unit
 per entry point. Shared ingress and egress have separate entry points so each
 loaded program remains below the Linux 4.19 4096-instruction limit.
 
+## Data paths
+
+### Local cgroup path
+
+The local backend attaches socket-address programs to cgroup v2. Connect and
+sendmsg hooks apply protocol, UID, DNS, private-address, host-address, FakeIP,
+and CIDR policy before replacing the destination with an internal listener
+token. recvmsg hooks restore connected UDP peer addresses. The userspace
+listener uses the token to recover the original destination and then enters the
+normal sing-box routing pipeline.
+
+TCP state is short-lived Hash state removed by the listener or the stale-state
+janitor. UDP uses two capability-selected layouts:
+
+- `socket_release`: ordinary Hash maps plus an attached
+  `cgroup/sock_release` program perform exact socket-cookie cleanup.
+- `lru_fallback`: bounded LRU maps, connected-peer recovery, and conservative
+  userspace cleanup support kernels without a usable release hook.
+
+The BPF hot path uses direct helpers. Go hot-path map access uses fixed ABI
+structs and raw typed `bpf(2)` calls to avoid reflection and allocation.
+Cilium APIs are used for object loading, probes, links, metadata, and cold-path
+batch operations.
+
+### Shared TC path
+
+The shared backend attaches ingress and egress classifiers to each selected
+downstream interface. Ingress parses Ethernet/VLAN and IPv4/IPv6, applies
+source and destination policy, reserves a token address, and rewrites the
+destination to the internal listener. Egress finds the same flow by client and
+token, restores the original source, and updates checksums. Fragment state is
+kept separately in a bounded LRU map.
+
+Proxy flow state has two authoritative lookup directions:
+
+| Map | Key | Value | Reader |
+|-----|-----|-------|--------|
+| `shared_flow_by_original` | interface, family, protocol, client, original destination | token, generation, last activity | ingress and janitor |
+| `shared_flow_by_token` | family, protocol, listener port, token, client | original destination, interface, source MAC, generation | userspace listener and egress |
+
+The old layout stored the same logical flow in original, listener, and reply
+maps. Independent publication and deletion could expose a partially built flow
+under short-connection churn. The two-map layout uses this lifecycle:
+
+1. Generate a token and a 64-bit generation from monotonic time and the flow
+   hash.
+2. Insert `flow_by_token` with `BPF_NOEXIST`.
+3. Publish `flow_by_original` last with `BPF_NOEXIST`.
+4. On cleanup, verify the generation and unpublish `flow_by_original` first.
+5. Delete `flow_by_token` only when its generation still matches.
+
+Publication therefore never makes ingress use a token before reverse lookup is
+ready. Cleanup for an old connection cannot delete a newer generation, even if
+the original tuple or token key is reused. Userspace validates both directions
+once when accepting a flow; established packets retain one Hash lookup in each
+direction and do not pay for a second generation lookup.
+
+Compared with the former three-map layout, a proxy entry now uses two map
+elements instead of three, a new flow performs two successful updates instead
+of three, and cleanup performs two conditional deletes instead of three. The
+reverse value is slightly larger because it contains all userspace and egress
+metadata plus the generation. Total key/value payload per logical flow falls
+from 224 to 164 bytes before allocator and bucket overhead. The per-CPU shared
+scratch value also falls from 352 to 272 bytes.
+
+## Policy maps
+
+Exact host addresses use Hash maps. UID ranges, destination bypass CIDRs, and
+shared source CIDRs use LPM tries because longest-prefix matching is required.
+Source MAC policy uses Hash maps. Large rule sets are compiled and updated in
+userspace; packet processing performs a bounded number of map lookups rather
+than iterating rules.
+
+Hash maps with `BPF_F_NO_PREALLOC` allocate elements on demand, although their
+bucket array still scales with `max_entries`. LRU maps are reserved for bounded
+cache or recovery state where eviction is semantically acceptable. Authoritative
+shared proxy state uses non-LRU Hash maps and an explicit janitor so the kernel
+cannot independently evict one lookup direction.
+
+## Runtime lifecycle
+
+Shared programs and maps are prepared lazily when the first configured
+interface appears, then retained across temporary interface loss. TCX is used
+at the default priority when available; clsact is the compatibility fallback.
+Cgroup BPF links are preferred over legacy `BPF_PROG_ATTACH`. Neither path pins
+runtime state in bpffs, so closing the owning process releases all kernel
+objects.
+
+Correctness maintenance remains enabled in release builds:
+
+| Task | Normal trigger | Purpose |
+|------|----------------|---------|
+| Shared pressure poll | 5 seconds | Detect reservation failures and sustained proxy-map pressure. |
+| Shared orphan sweep | 30 seconds, faster under pressure | Reclaim unreferenced proxy generations. |
+| Shared attachment reconciliation | Network change or 30 seconds | Attach new interfaces and repair TCX/clsact and `route_localnet`. |
+| Local TCP cleanup | 1 minute | Remove state from failed or abandoned accepts. |
+| Local IPv6 probe | Debounced network change | Implement `local.ipv6_mode: auto`. |
+
+Normal Debug logging reports lightweight status every ten minutes without
+walking large maps. `ebpf_debug` changes the interval to five minutes and adds
+full occupancy, Go runtime, task timing, and optional kernel program runtime
+statistics. It does not add instrumentation to the packet path.
+
 ## Generated objects
 
 `internal/bpfgen/*_bpf{el,eb}.o` and their Go bindings are checked in. They are
@@ -96,17 +199,50 @@ sudo -E SING_BOX_EBPF_INTEGRATION=1 \
 
 sudo -E SING_BOX_EBPF_SHARED_INTEGRATION=1 \
   go test -count=1 -tags with_ebpf,ebpf_integration \
-  -run TestSharedNetworkDataPathIntegration ./protocol/ebpf
+  -run 'TestSharedNetwork(DataPath|TCPChurn)Integration' ./protocol/ebpf
 ```
 
-The maintenance benchmark compares a full batch scan with one bounded legacy
-fallback janitor tick over a populated 65536-entry hash map:
+`TestSharedNetworkTCPChurnIntegration` creates 5000 short TCP connections with
+128 workers and validates lookup, generation retention, reply, and cleanup for
+every accepted connection. The common-package generation cleanup test also
+simulates a stale userspace handle against a newer map generation.
+
+The maintenance benchmarks compare a full batch scan with one bounded legacy
+fallback janitor tick over a populated 65536-entry hash map, and compare batch
+and legacy connected-UDP recovery scans at the current default redirect
+capacity:
 
 ```sh
 sudo -E SING_BOX_EBPF_INTEGRATION=1 \
   go test -run '^$' -tags with_ebpf,ebpf_integration \
   -bench 'Benchmark(MapScanMaintenance|ConnectedUDPTokenRecoveryScan)' \
   -benchmem ./common/ebpf
+```
+
+For end-to-end comparisons against Redirect, TProxy, route-based TUN, and TUN
+auto-redirect, use the isolated namespace harness described in
+[`../../.github/benchmark/README.md`](../../.github/benchmark/README.md). It
+measures local and shared eBPF separately, validates that tested flows do not
+silently use the direct path, and includes long-lived UDP plus per-socket UDP
+churn. Keep this cross-inbound harness separate from microbenchmarks: its
+results include the complete sing-box routing and listener pipeline.
+
+An opt-in end-to-end stress test attaches only to a temporary child cgroup. It
+measures short TCP connections plus connected-UDP request/reply restoration and
+socket-release cleanup. Counts and concurrency can be changed with
+`SING_BOX_EBPF_STRESS_TCP_COUNT`, `SING_BOX_EBPF_STRESS_UDP_CONNECTED_COUNT`,
+`SING_BOX_EBPF_STRESS_UDP_UNCONNECTED_COUNT`, and
+`SING_BOX_EBPF_STRESS_WORKERS`. An `ebpf_debug` test binary can additionally
+set `SING_BOX_EBPF_STRESS_STATS=1` to report per-program kernel runtime; keep
+that system-wide instrumentation out of throughput baselines. Raise one UDP
+count at a time for socket-churn limits: combining very large TCP, connected
+UDP, and unconnected UDP counts can measure the host's ephemeral-port reuse
+instead of the eBPF data path.
+
+```sh
+sudo -E SING_BOX_EBPF_INTEGRATION=1 SING_BOX_EBPF_STRESS=1 \
+  go test -count=1 -v -tags with_ebpf,ebpf_integration \
+  -run TestCgroupBackendTrafficStressIntegration ./common/ebpf
 ```
 
 Use an empty, dedicated cgroup when testing attachment. On a target device,
@@ -130,6 +266,143 @@ not add probes to the packet hot path. Use sing-box's
 `experimental.debug.listen` option for Go pprof. See the
 [troubleshooting guide](../../docs/manual/misc/ebpf-troubleshooting.md) for
 collection commands and scope limitations.
+
+## Configuration and policy mapping
+
+The public configuration is decoded in `option/ebpf.go`, normalized by
+`protocol/ebpf/config.go`, and compiled into the small ABI records consumed by
+the native programs. Keep this flow explicit when adding a field; a field that
+only changes Go listener behavior must not be added to the BPF ABI.
+
+| User field | Go owner | Native control | Effect |
+|------------|----------|----------------|--------|
+| `mode: local` | `protocol/ebpf/inbound.go` | cgroup section selection | Redirect sockets created by the sing-box cgroup. |
+| `mode: shared` | `protocol/ebpf/shared_network.go` | TC ingress/egress flags | Redirect traffic arriving from selected interfaces. |
+| `network` | `config.go` | per-program enable flags | Load only TCP/UDP sections requested by the user. |
+| `uid` / `package` include/exclude | `inbound_policy.go` | UID LPM maps and ranges | Match the creating process UID; see the limitation below. |
+| `bypass_private_address` | policy compilers | private/host exact maps | Skip proxying private destinations while preserving mandatory local safety exceptions. |
+| `bypass_rule_set` | policy compiler | destination LPM maps | Skip destinations in the resolved CIDR rule set. |
+| `dns_mode` | `inbound_policy.go` | DNS decision flag | `hijack`, `respect_bypass_hijack`, or `off`; DNS is evaluated before ordinary destination bypass. |
+| `local.ipv6_mode` / `shared.ipv6_mode` | `ipv6.go` | IPv6 section and host map | `auto` follows capability and address availability, `always` requires native IPv6, `off` loads IPv4-only sections. |
+| `shared.interface` | `shared_network.go` | TC attachment set | Only named, currently present interfaces are attached; no dynamic “wlan0” guessing is performed. |
+
+The include/exclude UID ranges are logged after normalization in diagnostic
+builds (and as a compact summary at startup in release builds). This is the
+authoritative view of what the configuration became, including Android package
+resolution and range coalescing.
+
+### UID and package boundary
+
+Package policy is a socket-creator policy. It guarantees decisions for sockets
+created directly by the selected UID. It cannot identify a package when the
+kernel or another service creates the socket on its behalf. In particular, the
+policy is not a guarantee for system DNS proxies, `DownloadManager`, VPN or
+connectivity services, isolated processes, or sockets handed across a Binder
+boundary. Do not infer package ownership from the UID of a later relay.
+
+DNS follows the configured `dns_mode` compatibility semantics. `hijack` always
+redirects DNS. `respect_bypass_hijack` applies UID/private/rule-set bypass before
+redirecting DNS. `off` leaves DNS untouched. Shared mode applies the same
+decision to packets received from the selected interface, so a downstream
+client bypass rule must include the client-facing source/destination context.
+
+`local` and `shared` compile separate host-address and private-address maps.
+Host addresses are exact local `/32` or `/128` entries; an interface's entire
+prefix is never inserted. Shared mode additionally keeps multicast, unspecified,
+and the complete loopback ranges as unconditional local safety exceptions when
+private bypass is disabled. FakeIP ranges must not be marked private unless the
+desired result is to bypass those synthetic destinations.
+
+## Map inventory and sizing
+
+The exact key/value structs are declared in `common/ebpf/*_abi.go` and mirrored
+byte-for-byte in `native/abi.h` and the generated object metadata. The principal
+maps are:
+
+| Map family | Kind | Default bound | Allocation policy |
+|------------|------|---------------|-------------------|
+| UID include/exclude | LPM trie | normalized range count | Pre-sized policy map, replaced atomically. |
+| Destination bypass | LPM trie | configured rule count | Updated on rule-set changes; no packet-path iteration. |
+| Local host/private | Hash | 4096 per address family | `BPF_F_NO_PREALLOC`; buckets still scale with `max_entries`. |
+| Local TCP redirect | Hash | bounded redirect capacity | Delete on accept/close plus janitor fallback. |
+| Local UDP token/peer | Hash or LRU fallback | bounded UDP capacity | Cookie/recovery state; release hook is preferred. |
+| Shared flow by original/token | Hash | configured shared capacity | Two authoritative directions and generation checks. |
+| Shared source/MAC | LPM/Hash | sized from configured inputs | Prepared only when shared interfaces are active. |
+| Fragment/rewrite scratch | LRU/array | small fixed bound | Eviction is acceptable; never authoritative flow state. |
+
+`NO_PREALLOC` makes hash elements grow on demand but does not make the bucket
+array dynamic. Therefore increasing `max_entries` is a real kernel memory
+decision even when a map is empty. Capacity changes should be justified with a
+pressure benchmark and an estimate of bucket plus value memory. Never use an
+LRU map for one side of an authoritative pair without an explicit generation or
+recovery protocol: independent eviction can otherwise create a redirect that
+cannot be resolved.
+
+Map values are intentionally fixed-size and allocation-free on the packet path.
+Changing a struct field order, width, alignment, or map pinning/type is an ABI
+change, even when Go still compiles. Regenerate both endian objects and run the
+manifest/check target after every native change.
+
+## Capability-driven compatibility
+
+`kernel_probe.go` performs feature probes by attempting the relevant map,
+program, helper, link, or batch operation and then closes the temporary object.
+Kernel version strings are informational only. The loader chooses, in order:
+
+1. BPF link attachment, then legacy `BPF_PROG_ATTACH`.
+2. TCX, then clsact/netlink TC attachment.
+3. Batch lookup/update/delete, then bounded one-entry syscalls.
+4. Socket-release cleanup, then LRU plus userspace janitor recovery.
+5. Native IPv6 sections, then IPv4-only sections when the probe or address set
+   says IPv6 is unavailable.
+
+Every fallback must remain functional on Linux 4.19 where the selected feature
+exists. Do not gate a path solely on `uname -r`, and do not make a probe attach
+to a production cgroup or interface. New native instructions must stay within
+the v1 ISA and the 4096-instruction verifier budget used by the oldest target.
+
+## Maintenance and performance rules
+
+The packet programs must remain bounded, branch-conscious, and free of loops,
+allocations, timers, kfuncs, dynptrs, BTF/CO-RE assumptions, or global mutable
+state. A new policy check belongs in a map lookup or a compact helper, not in a
+periodic userspace scan. Cold-path batch APIs are allowed for maintenance and
+rule updates; data-path lookups must continue using typed raw syscalls.
+
+Release builds keep only correctness maintenance and lightweight counters.
+Full map occupancy walks, per-task timing, and `BPF_STATS_RUN_TIME` belong to
+`ebpf_debug`; they must never be enabled merely because the log level is
+`debug`. Go pprof is exposed through sing-box's shared
+`experimental.debug.listen` endpoint and is useful for userspace CPU/heap
+hotspots, while BPF runtime stats measure kernel program cost. Neither should be
+enabled in throughput baselines without recording the overhead.
+
+When changing a janitor interval, map capacity, or fallback threshold, record
+the expected short-connection and UDP-churn effect. Validate with both a
+steady-state test and a network-change/restart test; a map that is “usually
+empty” can still consume bucket memory or retain stale generations during a
+connectivity transition.
+
+## Handoff checklist for maintainers and AI agents
+
+Before modifying this directory:
+
+1. Read the user-facing inbound document and the relevant tests, then identify
+   whether the change is policy, data path, lifecycle, compatibility, or
+   diagnostics.
+2. Preserve the Go/C ABI, generated object manifest, old-kernel fallback, and
+   allocation-free hot path unless the change explicitly updates all of them.
+3. Add a focused unit or privileged integration test for map lifecycle and
+   network churn. Keep debug-only observability behind `ebpf_debug`.
+4. Run `make -C common/ebpf check` and the focused Go tests. For native changes,
+   verify both endian objects and inspect the instruction count for the Linux
+   4.19 target.
+5. Review the final diff for unrelated sing-box changes. This backend should
+   not change behavior outside eBPF inbound integration points.
+
+Do not remove a fallback, raise a map bound, or alter a default merely to make a
+new kernel test pass. Document the capability being probed, the minimum
+semantic guarantee, and the measured memory/CPU trade-off in the same change.
 
 ## Credits
 

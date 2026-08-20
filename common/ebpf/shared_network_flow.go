@@ -55,7 +55,7 @@ func (b *SharedNetworkBackend) lookupFlow(
 	}
 	var value sharedNetworkOriginalValue
 	if err = lookupMap(
-		int(b.runtime.listener_map_fd),
+		int(b.runtime.flow_by_token_map_fd),
 		unsafe.Pointer(&key),
 		unsafe.Pointer(&value),
 	); err != nil {
@@ -66,6 +66,9 @@ func (b *SharedNetworkBackend) lookupFlow(
 		return OriginalDestination{}, nil, err
 	}
 	flow := makeSharedNetworkFlowHandle(key, value)
+	if err = b.validateFlowGenerationLocked(flow); err != nil {
+		return OriginalDestination{}, nil, err
+	}
 	if retain {
 		b.retainFlowLocked(flow)
 	}
@@ -127,10 +130,6 @@ func (b *SharedNetworkBackend) ReserveUDPReplyFlow(
 		InterfaceIndex: originalKey.InterfaceIndex,
 	}
 	copy(originalValue.SourceMAC[:], sourceMAC)
-	replyValue := sharedNetworkReplyValue{
-		OriginalPort: destination.Port(),
-		OriginalAddr: originalKey.OriginalAddr,
-	}
 
 	for attempt := 0; attempt < userspaceReplyTokenAttempts; {
 		sequence := b.replyTokenSequence.Add(1)
@@ -147,9 +146,16 @@ func (b *SharedNetworkBackend) ReserveUDPReplyFlow(
 		if tokenFamily != originalKey.Family {
 			return netip.Addr{}, nil, E.New("shared-network UDP reply token family mismatch")
 		}
-		flow := makeSharedNetworkFlowHandleFromOriginal(originalKey, tokenAddress, b.control.ListenerPort)
+		generation := nowNS ^ sequence
+		originalValue.Generation = generation
+		flow := makeSharedNetworkFlowHandleFromOriginal(
+			originalKey,
+			tokenAddress,
+			b.control.ListenerPort,
+			generation,
+		)
 		err = updateMapWithFlags(
-			int(b.runtime.listener_map_fd),
+			int(b.runtime.flow_by_token_map_fd),
 			unsafe.Pointer(&flow.listenerKey),
 			unsafe.Pointer(&originalValue),
 			bpfNoExist,
@@ -158,33 +164,21 @@ func (b *SharedNetworkBackend) ReserveUDPReplyFlow(
 			continue
 		}
 		if err != nil {
-			return netip.Addr{}, nil, E.Cause(err, "reserve shared-network UDP reply listener token")
-		}
-		if err = updateMap(
-			int(b.runtime.reply_map_fd),
-			unsafe.Pointer(&flow.replyKey),
-			unsafe.Pointer(&replyValue),
-		); err != nil {
-			cleanupErr := deleteMapIfExists(int(b.runtime.listener_map_fd), unsafe.Pointer(&flow.listenerKey))
-			return netip.Addr{}, nil, E.Errors(E.Cause(err, "reserve shared-network UDP reply state"), cleanupErr)
+			return netip.Addr{}, nil, E.Cause(err, "reserve shared-network UDP reply token")
 		}
 		tokenValue := sharedNetworkTokenValue{
-			TokenAddr:   tokenAddress,
-			Generation:  nowNS ^ sequence,
-			CreatedAtNS: nowNS,
-			LastSeenNS:  nowNS,
+			TokenAddr:  tokenAddress,
+			Generation: generation,
+			LastSeenNS: nowNS,
 		}
 		err = updateMapWithFlags(
-			int(b.runtime.original_to_token_map_fd),
+			int(b.runtime.flow_by_original_map_fd),
 			unsafe.Pointer(&flow.originalKey),
 			unsafe.Pointer(&tokenValue),
 			bpfNoExist,
 		)
 		if err != nil {
-			cleanupErr := E.Errors(
-				deleteMapIfExists(int(b.runtime.reply_map_fd), unsafe.Pointer(&flow.replyKey)),
-				deleteMapIfExists(int(b.runtime.listener_map_fd), unsafe.Pointer(&flow.listenerKey)),
-			)
+			cleanupErr := b.deleteTokenGenerationLocked(flow)
 			if errors.Is(err, unix.EEXIST) {
 				existingToken, existingFlow, loaded, lookupErr := b.lookupUDPReplyFlowLocked(originalKey)
 				if lookupErr != nil {
@@ -214,7 +208,7 @@ func (b *SharedNetworkBackend) lookupUDPReplyFlowLocked(
 ) (netip.Addr, *SharedNetworkFlowHandle, bool, error) {
 	var value sharedNetworkTokenValue
 	if err := lookupMap(
-		int(b.runtime.original_to_token_map_fd),
+		int(b.runtime.flow_by_original_map_fd),
 		unsafe.Pointer(&originalKey),
 		unsafe.Pointer(&value),
 	); err != nil {
@@ -227,7 +221,18 @@ func (b *SharedNetworkBackend) lookupUDPReplyFlowLocked(
 	if err != nil {
 		return netip.Addr{}, nil, false, err
 	}
-	flow := makeSharedNetworkFlowHandleFromOriginal(originalKey, value.TokenAddr, b.control.ListenerPort)
+	flow := makeSharedNetworkFlowHandleFromOriginal(
+		originalKey,
+		value.TokenAddr,
+		b.control.ListenerPort,
+		value.Generation,
+	)
+	if err = b.validateFlowGenerationLocked(flow); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			return netip.Addr{}, nil, false, nil
+		}
+		return netip.Addr{}, nil, false, err
+	}
 	b.retainFlowLocked(flow)
 	return token, &flow, true, nil
 }
@@ -268,10 +273,67 @@ func (b *SharedNetworkBackend) ReleaseFlow(flow *SharedNetworkFlowHandle) error 
 	if !b.releaseFlowReferenceLocked(*flow) {
 		return nil
 	}
-	return E.Errors(
-		deleteMapIfExists(int(b.runtime.listener_map_fd), unsafe.Pointer(&flow.listenerKey)),
-		deleteMapIfExists(int(b.runtime.reply_map_fd), unsafe.Pointer(&flow.replyKey)),
-		deleteMapIfExists(int(b.runtime.original_to_token_map_fd), unsafe.Pointer(&flow.originalKey)),
+	_, err := b.deleteFlowGenerationLocked(*flow)
+	return err
+}
+
+func (b *SharedNetworkBackend) validateFlowGenerationLocked(flow SharedNetworkFlowHandle) error {
+	var current sharedNetworkTokenValue
+	if err := lookupMap(
+		int(b.runtime.flow_by_original_map_fd),
+		unsafe.Pointer(&flow.originalKey),
+		unsafe.Pointer(&current),
+	); err != nil {
+		return E.Cause(err, "validate shared-network flow generation")
+	}
+	if current.Generation != flow.generation || current.TokenAddr != flow.listenerKey.TokenAddr {
+		return E.Cause(unix.ENOENT, "shared-network flow generation changed")
+	}
+	return nil
+}
+
+func (b *SharedNetworkBackend) deleteFlowGenerationLocked(flow SharedNetworkFlowHandle) (bool, error) {
+	var current sharedNetworkTokenValue
+	originalErr := lookupMap(
+		int(b.runtime.flow_by_original_map_fd),
+		unsafe.Pointer(&flow.originalKey),
+		unsafe.Pointer(&current),
+	)
+	removed := false
+	if originalErr != nil && !errors.Is(originalErr, unix.ENOENT) {
+		return false, originalErr
+	}
+	if originalErr == nil && current.Generation == flow.generation && current.TokenAddr == flow.listenerKey.TokenAddr {
+		if err := deleteMapIfExists(
+			int(b.runtime.flow_by_original_map_fd),
+			unsafe.Pointer(&flow.originalKey),
+		); err != nil {
+			return false, err
+		}
+		removed = true
+	}
+	return removed, b.deleteTokenGenerationLocked(flow)
+}
+
+func (b *SharedNetworkBackend) deleteTokenGenerationLocked(flow SharedNetworkFlowHandle) error {
+	var current sharedNetworkOriginalValue
+	err := lookupMap(
+		int(b.runtime.flow_by_token_map_fd),
+		unsafe.Pointer(&flow.listenerKey),
+		unsafe.Pointer(&current),
+	)
+	if errors.Is(err, unix.ENOENT) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	if current.Generation != flow.generation {
+		return nil
+	}
+	return deleteMapIfExists(
+		int(b.runtime.flow_by_token_map_fd),
+		unsafe.Pointer(&flow.listenerKey),
 	)
 }
 
@@ -332,10 +394,10 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(
 	if b.runtime == nil {
 		return SharedNetworkFlowSweepResult{}, errBackendClosed
 	}
-	mapFD := int(b.runtime.original_to_token_map_fd)
+	mapFD := int(b.runtime.flow_by_original_map_fd)
 	b.flowSweepCandidates = b.flowSweepCandidates[:0]
 	scan, err := b.flowSweepScratch.scan(
-		b.runtime.maps["shared_original_to_token"],
+		b.runtime.maps["shared_flow_by_original"],
 		b.mapCapacity.Proxy,
 		fallbackBudget,
 		func(key sharedNetworkOriginalKey, value sharedNetworkTokenValue) {
@@ -395,6 +457,7 @@ func (b *SharedNetworkBackend) removeOrphanedFlowCandidate(
 		entry.key,
 		entry.value.TokenAddr,
 		b.control.ListenerPort,
+		entry.value.Generation,
 	)
 	b.flowAccess.Lock()
 	defer b.flowAccess.Unlock()
@@ -411,12 +474,8 @@ func (b *SharedNetworkBackend) removeOrphanedFlowCandidate(
 	if current != entry.value {
 		return false, false, nil
 	}
-	err = E.Errors(
-		deleteMapIfExists(int(b.runtime.listener_map_fd), unsafe.Pointer(&flow.listenerKey)),
-		deleteMapIfExists(int(b.runtime.reply_map_fd), unsafe.Pointer(&flow.replyKey)),
-		deleteMapIfExists(mapFD, unsafe.Pointer(&flow.originalKey)),
-	)
-	return err == nil, false, err
+	removed, err = b.deleteFlowGenerationLocked(flow)
+	return removed, false, err
 }
 
 func (b *SharedNetworkBackend) ProxyMapUsage() (MapUsage, error) {

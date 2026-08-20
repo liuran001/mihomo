@@ -40,6 +40,7 @@ INLINE void fill_listener(struct sb_shared_scratch *scratch, const struct sb_sha
     scratch->original_value.protocol = scratch->original.protocol;
     scratch->original_value.port = scratch->original.original_port;
     scratch->original_value.ifindex = scratch->original.ifindex;
+    scratch->original_value.generation = scratch->token.generation;
     __builtin_memcpy(scratch->original_value.source_mac, scratch->source_mac.address, 6U);
     copy_address(
         scratch->original_value.addr,
@@ -47,46 +48,29 @@ INLINE void fill_listener(struct sb_shared_scratch *scratch, const struct sb_sha
         scratch->original.family == AF_INET6_VALUE ? 16U : 4U);
 }
 
-INLINE void fill_reply(struct sb_shared_scratch *scratch, const struct sb_shared_control *control) {
-    __builtin_memset(&scratch->reply_key, 0, sizeof(scratch->reply_key));
-    scratch->reply_key.ifindex = scratch->original.ifindex;
-    scratch->reply_key.family = scratch->original.family;
-    scratch->reply_key.protocol = scratch->original.protocol;
-    scratch->reply_key.client_port = scratch->original.client_port;
-    scratch->reply_key.listener_port = control->listener_port;
-    copy_address(
-        scratch->reply_key.client_addr,
-        scratch->original.client_addr,
-        scratch->original.family == AF_INET6_VALUE ? 16U : 4U);
-    copy_address(
-        scratch->reply_key.token_addr,
-        scratch->token.token_addr,
-        scratch->original.family == AF_INET6_VALUE ? 16U : 4U);
-    __builtin_memset(&scratch->reply_value, 0, sizeof(scratch->reply_value));
-    scratch->reply_value.original_port = scratch->original.original_port;
-    copy_address(
-        scratch->reply_value.original_addr,
-        scratch->original.original_addr,
-        scratch->original.family == AF_INET6_VALUE ? 16U : 4U);
-}
-
-NOINLINE bool sync_token(
+NOINLINE bool publish_token(
     struct sb_shared_scratch *scratch,
     const struct sb_shared_control *control,
     __u64 listener_flags) {
     fill_listener(scratch, control);
-    fill_reply(scratch, control);
-    if (map_update(&shared_listener, &scratch->listener_key, &scratch->original_value, listener_flags) != 0) return false;
-    if (map_update(&shared_reply, &scratch->reply_key, &scratch->reply_value, BPF_ANY) != 0) {
-        if (listener_flags == BPF_NOEXIST) map_delete(&shared_listener, &scratch->listener_key);
-        return false;
+    return map_update(
+        &shared_flow_by_token,
+        &scratch->listener_key,
+        &scratch->original_value,
+        listener_flags) == 0;
+}
+
+INLINE void delete_token_generation(struct sb_shared_scratch *scratch) {
+    struct sb_shared_original_value *reverse = map_lookup(
+        &shared_flow_by_token,
+        &scratch->listener_key);
+    if (reverse != 0 && reverse->generation == scratch->token.generation) {
+        map_delete(&shared_flow_by_token, &scratch->listener_key);
     }
-    return true;
 }
 
 #define SB_SHARED_TOKEN_RETRY 0
 #define SB_SHARED_TOKEN_RESERVED 1
-#define SB_SHARED_TOKEN_FAILED -1
 
 // Keep each attempt in its own BPF subprogram: LLVM 21 otherwise carries loop
 // state in caller-clobbered registers across the hash and map subprogram calls.
@@ -95,7 +79,11 @@ NOINLINE int reserve_token_attempt(
     const struct sb_shared_control *control,
     __u32 attempt) {
     __builtin_memset(&scratch->token, 0, sizeof(scratch->token));
-    __u32 hash = hash_original(&scratch->original, 0x9e3779b9U * (attempt + 1U));
+    __u64 now = ktime_get_ns();
+    __u32 generation_salt = (__u32)now ^ (__u32)(now >> 32U);
+    __u32 hash = hash_original(
+        &scratch->original,
+        generation_salt ^ (0x9e3779b9U * (attempt + 1U)));
     if (scratch->original.family == AF_INET_VALUE) {
         __u32 prefix = ((__u32)control->token_ipv4_prefix[0] << 24U) |
             ((__u32)control->token_ipv4_prefix[1] << 16U) |
@@ -113,7 +101,9 @@ NOINLINE int reserve_token_attempt(
         scratch->token.token_addr[3] = (__u8)candidate;
     } else {
         copy_address(scratch->token.token_addr, control->token_ipv6_prefix, 8U);
-        __u32 second = hash_original(&scratch->original, 0x85ebca6bU ^ attempt);
+        __u32 second = hash_original(
+            &scratch->original,
+            generation_salt ^ 0x85ebca6bU ^ attempt);
         scratch->token.token_addr[8] = (__u8)(hash >> 24U);
         scratch->token.token_addr[9] = (__u8)(hash >> 16U);
         scratch->token.token_addr[10] = (__u8)(hash >> 8U);
@@ -123,31 +113,30 @@ NOINLINE int reserve_token_attempt(
         scratch->token.token_addr[14] = (__u8)(second >> 8U);
         scratch->token.token_addr[15] = (__u8)second;
     }
-    __u64 now = ktime_get_ns();
     scratch->token.generation = now ^ ((__u64)hash << 32U);
-    scratch->token.created_at_ns = now;
     scratch->token.last_seen_ns = now;
-    if (!sync_token(scratch, control, BPF_NOEXIST)) return SB_SHARED_TOKEN_RETRY;
+    if (!publish_token(scratch, control, BPF_NOEXIST)) return SB_SHARED_TOKEN_RETRY;
     if (map_update(
-            &shared_original_to_token,
+            &shared_flow_by_original,
             &scratch->original,
             &scratch->token,
             BPF_NOEXIST) == 0) {
         return SB_SHARED_TOKEN_RESERVED;
     }
-    map_delete(&shared_reply, &scratch->reply_key);
-    map_delete(&shared_listener, &scratch->listener_key);
+    delete_token_generation(scratch);
     struct sb_shared_token_value *existing = map_lookup(
-        &shared_original_to_token,
+        &shared_flow_by_original,
         &scratch->original);
     if (existing != 0) {
         __builtin_memcpy(&scratch->token, existing, sizeof(scratch->token));
         return SB_SHARED_TOKEN_RESERVED;
     }
-    return SB_SHARED_TOKEN_FAILED;
+    return SB_SHARED_TOKEN_RETRY;
 }
 
-NOINLINE bool reserve_token(struct sb_shared_scratch *scratch, const struct sb_shared_control *control) {
+NOINLINE bool reserve_token(
+    struct sb_shared_scratch *scratch,
+    const struct sb_shared_control *control) {
     int result = SB_SHARED_TOKEN_RETRY;
 #pragma clang loop unroll(full)
     for (__u32 attempt = 0U; attempt < SB_SHARED_TOKEN_ATTEMPTS; ++attempt) {
@@ -160,7 +149,9 @@ NOINLINE bool reserve_token(struct sb_shared_scratch *scratch, const struct sb_s
 }
 
 INLINE bool load_cached_token(struct sb_shared_scratch *scratch) {
-    struct sb_shared_token_value *existing = map_lookup(&shared_original_to_token, &scratch->original);
+    struct sb_shared_token_value *existing = map_lookup(
+        &shared_flow_by_original,
+        &scratch->original);
     if (existing == 0) return false;
     __builtin_memcpy(&scratch->token, existing, sizeof(scratch->token));
     refresh_activity_timestamp(&existing->last_seen_ns, ktime_get_ns());

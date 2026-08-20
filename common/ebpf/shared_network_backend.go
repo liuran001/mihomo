@@ -26,10 +26,9 @@ type sharedNetworkRuntime struct {
 	programs                    []*CiliumEBPF.Program
 	control_map_fd              int
 	stats_map_fd                int
-	original_to_token_map_fd    int
+	flow_by_original_map_fd     int
 	bypass_flow_map_fd          int
-	reply_map_fd                int
-	listener_map_fd             int
+	flow_by_token_map_fd        int
 	fragment_map_fd             int
 	host_ipv4_map_fd            int
 	host_ipv6_map_fd            int
@@ -178,6 +177,12 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		}
 		return nil, prepareErr
 	}
+	if bypassIPv4Map == nil {
+		bypassIPv4Map = runtimeState.maps["shared_bypass_ipv4"]
+	}
+	if bypassIPv6Map == nil {
+		bypassIPv6Map = runtimeState.maps["shared_bypass_ipv6"]
+	}
 
 	bypassIPv4MapFD := runtimeState.fallback_bypass_ipv4_map_fd
 	bypassIPv6MapFD := runtimeState.fallback_bypass_ipv6_map_fd
@@ -260,10 +265,9 @@ func prepareSharedNetworkRuntime(
 	runtimeState.maps, err = loadObjectMaps(loadSharedNetwork, map[string]mapSpecOverride{
 		"shared_control":             {name: "sb_sh_control", mapType: CiliumEBPF.Array, maxEntries: 1},
 		"shared_stats":               {name: "sb_sh_stats", mapType: CiliumEBPF.Array, maxEntries: 1},
-		"shared_original_to_token":   {name: "sb_sh_orig", mapType: CiliumEBPF.Hash, maxEntries: capacity.Proxy, flags: bpfFlagNoPrealloc},
+		"shared_flow_by_original":    {name: "sb_sh_orig", mapType: CiliumEBPF.Hash, maxEntries: capacity.Proxy, flags: bpfFlagNoPrealloc},
 		"shared_bypass_flow":         {name: "sb_sh_bypass", mapType: CiliumEBPF.LRUHash, maxEntries: capacity.Bypass},
-		"shared_reply":               {name: "sb_sh_reply", mapType: CiliumEBPF.Hash, maxEntries: capacity.Proxy, flags: bpfFlagNoPrealloc},
-		"shared_listener":            {name: "sb_sh_listener", mapType: CiliumEBPF.Hash, maxEntries: capacity.Proxy, flags: bpfFlagNoPrealloc},
+		"shared_flow_by_token":       {name: "sb_sh_token", mapType: CiliumEBPF.Hash, maxEntries: capacity.Proxy, flags: bpfFlagNoPrealloc},
 		"shared_fragment":            {name: "sb_sh_fragment", mapType: CiliumEBPF.LRUHash, maxEntries: capacity.Fragment},
 		"shared_host_ipv4":           {name: "sb_sh_host4", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
 		"shared_host_ipv6":           {name: "sb_sh_host6", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
@@ -308,10 +312,9 @@ func prepareSharedNetworkRuntime(
 	runtimeState.programs = programs
 	runtimeState.control_map_fd = runtimeState.maps["shared_control"].FD()
 	runtimeState.stats_map_fd = runtimeState.maps["shared_stats"].FD()
-	runtimeState.original_to_token_map_fd = runtimeState.maps["shared_original_to_token"].FD()
+	runtimeState.flow_by_original_map_fd = runtimeState.maps["shared_flow_by_original"].FD()
 	runtimeState.bypass_flow_map_fd = runtimeState.maps["shared_bypass_flow"].FD()
-	runtimeState.reply_map_fd = runtimeState.maps["shared_reply"].FD()
-	runtimeState.listener_map_fd = runtimeState.maps["shared_listener"].FD()
+	runtimeState.flow_by_token_map_fd = runtimeState.maps["shared_flow_by_token"].FD()
 	runtimeState.fragment_map_fd = runtimeState.maps["shared_fragment"].FD()
 	runtimeState.host_ipv4_map_fd = runtimeState.maps["shared_host_ipv4"].FD()
 	runtimeState.host_ipv6_map_fd = runtimeState.maps["shared_host_ipv6"].FD()
