@@ -35,6 +35,7 @@ type GroupCommonOption struct {
 	Lazy                bool     `group:"lazy,omitempty"`
 	DisableUDP          bool     `group:"disable-udp,omitempty"`
 	RequireUDP          bool     `group:"require-udp,omitempty"`
+	PenalizeUnstable    bool     `group:"penalize-unstable,omitempty"`
 	RequireIPv6         bool     `group:"require-ipv6,omitempty"`
 	Filter              string   `group:"filter,omitempty"`
 	ExcludeFilter       string   `group:"exclude-filter,omitempty"`

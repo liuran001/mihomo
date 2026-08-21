@@ -1,6 +1,7 @@
 package statistic
 
 import (
+	"github.com/metacubex/mihomo/component/health"
 	"io"
 	"net"
 	"sync"
@@ -49,6 +50,10 @@ type TrackerInfo struct {
 	MaxUploadRate   atomic.Int64 `json:"maxUploadRate"`
 	MaxDownloadRate atomic.Int64 `json:"maxDownloadRate"`
 }
+
+// stallWindow bounds how quickly a payload-less connection must close to
+// count as a stall rather than an idle keep-alive.
+const stallWindow = 8 * time.Second
 
 type tcpTracker struct {
 	C.Conn `json:"-"`
@@ -136,7 +141,24 @@ func (tt *tcpTracker) UnwrapWriter() (io.Writer, []N.CountFunc) {
 func (tt *tcpTracker) Close() error {
 	connErr := tt.Conn.Close()
 	tt.manager.Leave(tt)
+	tt.reportStall()
 	return connErr
+}
+
+// reportStall flags connections that were established and sent data but got
+// nothing back before closing quickly — the signature of a relay that
+// black-holes traffic while still passing latency probes.
+func (tt *tcpTracker) reportStall() {
+	if len(tt.Chain) == 0 {
+		return
+	}
+	if tt.DownloadTotal.Load() > 0 || tt.UploadTotal.Load() == 0 {
+		return
+	}
+	if time.Since(tt.Start) > stallWindow {
+		return
+	}
+	health.RecordStall(tt.Chain[0])
 }
 
 func (tt *tcpTracker) Upstream() any {

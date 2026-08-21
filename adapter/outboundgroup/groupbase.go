@@ -37,6 +37,7 @@ type GroupBase struct {
 	emptyFallback     C.Proxy
 	requireUDP        bool
 	requireIPv6       bool
+	penalizeUnstable  bool
 
 	// for GetProxies
 	getProxiesMutex  sync.Mutex
@@ -45,19 +46,20 @@ type GroupBase struct {
 }
 
 type GroupBaseOption struct {
-	Name           string
-	Type           C.AdapterType
-	Hidden         bool
-	Icon           string
-	Filter         string
-	ExcludeFilter  string
-	ExcludeType    string
-	TestTimeout    int
-	MaxFailedTimes int
-	EmptyFallback  C.Proxy
-	RequireUDP     bool
-	RequireIPv6    bool
-	Providers      []P.ProxyProvider
+	Name             string
+	Type             C.AdapterType
+	Hidden           bool
+	Icon             string
+	Filter           string
+	ExcludeFilter    string
+	ExcludeType      string
+	TestTimeout      int
+	MaxFailedTimes   int
+	EmptyFallback    C.Proxy
+	RequireUDP       bool
+	RequireIPv6      bool
+	PenalizeUnstable bool
+	Providers        []P.ProxyProvider
 }
 
 func NewGroupBase(opt GroupBaseOption) *GroupBase {
@@ -96,6 +98,7 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 		emptyFallback:     opt.EmptyFallback,
 		requireUDP:        opt.RequireUDP,
 		requireIPv6:       opt.RequireIPv6,
+		penalizeUnstable:  opt.PenalizeUnstable,
 	}
 
 	if gb.testTimeout == 0 {

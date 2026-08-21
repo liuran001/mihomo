@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"github.com/metacubex/mihomo/component/health"
 	"time"
 
 	"github.com/metacubex/mihomo/common/callback"
@@ -100,6 +101,25 @@ func (u *URLTest) healthCheck() {
 	u.fastSingle.Reset()
 }
 
+// rankDelay is the latency used for ranking: the measured delay plus, when
+// penalize-unstable is on, a penalty derived from recently stalled
+// connections through that proxy. A node that passes latency probes but
+// black-holes real traffic therefore stops winning the comparison.
+func (u *URLTest) rankDelay(proxy C.Proxy) uint16 {
+	delay := proxy.LastDelayForTestUrl(u.testUrl)
+	if !u.penalizeUnstable {
+		return delay
+	}
+	p := health.Penalty(proxy.Name())
+	if p == 0 {
+		return delay
+	}
+	if uint32(delay)+uint32(p) > 0xFFFF {
+		return 0xFFFF
+	}
+	return delay + p
+}
+
 func (u *URLTest) fast(touch bool) C.Proxy {
 	elm, _, shared := u.fastSingle.Do(func() (C.Proxy, error) {
 		proxies := u.GetProxies(touch)
@@ -116,7 +136,7 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 		}
 
 		fast := proxies[0]
-		minDelay := fast.LastDelayForTestUrl(u.testUrl)
+		minDelay := u.rankDelay(fast)
 		fastNotExist := true
 
 		for _, proxy := range proxies[1:] {
@@ -128,7 +148,7 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 				continue
 			}
 
-			delay := proxy.LastDelayForTestUrl(u.testUrl)
+			delay := u.rankDelay(proxy)
 			if delay < minDelay {
 				fast = proxy
 				minDelay = delay
@@ -136,7 +156,7 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 
 		}
 		// tolerance
-		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.fastNode.LastDelayForTestUrl(u.testUrl) > fast.LastDelayForTestUrl(u.testUrl)+u.tolerance {
+		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.rankDelay(u.fastNode) > u.rankDelay(fast)+u.tolerance {
 			u.fastNode = fast
 		}
 		return u.fastNode, nil
@@ -198,19 +218,20 @@ func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFall
 	}
 	urlTest := &URLTest{
 		GroupBase: NewGroupBase(GroupBaseOption{
-			Name:           option.Name,
-			Type:           C.URLTest,
-			Hidden:         option.Hidden,
-			Icon:           option.Icon,
-			Filter:         option.Filter,
-			ExcludeFilter:  option.ExcludeFilter,
-			ExcludeType:    option.ExcludeType,
-			TestTimeout:    option.TestTimeout,
-			MaxFailedTimes: option.MaxFailedTimes,
-			EmptyFallback:  emptyFallback,
-			RequireUDP:     option.RequireUDP,
-			RequireIPv6:    option.RequireIPv6,
-			Providers:      providers,
+			Name:             option.Name,
+			Type:             C.URLTest,
+			Hidden:           option.Hidden,
+			Icon:             option.Icon,
+			Filter:           option.Filter,
+			ExcludeFilter:    option.ExcludeFilter,
+			ExcludeType:      option.ExcludeType,
+			TestTimeout:      option.TestTimeout,
+			MaxFailedTimes:   option.MaxFailedTimes,
+			EmptyFallback:    emptyFallback,
+			RequireUDP:       option.RequireUDP,
+			PenalizeUnstable: option.PenalizeUnstable,
+			RequireIPv6:      option.RequireIPv6,
+			Providers:        providers,
 		}),
 		fastSingle:     singledo.NewSingle[C.Proxy](time.Second * 10),
 		disableUDP:     option.DisableUDP,
