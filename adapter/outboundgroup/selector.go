@@ -132,6 +132,8 @@ func NewSelector(option GroupCommonOption, selectorOption SelectorOption, emptyF
 			TestTimeout:    option.TestTimeout,
 			MaxFailedTimes: option.MaxFailedTimes,
 			EmptyFallback:  emptyFallback,
+			RequireUDP:     option.RequireUDP,
+			RequireIPv6:    option.RequireIPv6,
 			Providers:      providers,
 		}),
 		selected:   selectorOption.DefaultSelected,

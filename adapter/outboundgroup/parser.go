@@ -34,6 +34,8 @@ type GroupCommonOption struct {
 	EmptyFallback       string   `group:"empty-fallback,omitempty"`
 	Lazy                bool     `group:"lazy,omitempty"`
 	DisableUDP          bool     `group:"disable-udp,omitempty"`
+	RequireUDP          bool     `group:"require-udp,omitempty"`
+	RequireIPv6         bool     `group:"require-ipv6,omitempty"`
 	Filter              string   `group:"filter,omitempty"`
 	ExcludeFilter       string   `group:"exclude-filter,omitempty"`
 	ExcludeType         string   `group:"exclude-type,omitempty"`

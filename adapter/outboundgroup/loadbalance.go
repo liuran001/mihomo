@@ -271,6 +271,8 @@ func NewLoadBalance(option GroupCommonOption, loadBalanceOption LoadBalanceOptio
 			TestTimeout:    option.TestTimeout,
 			MaxFailedTimes: option.MaxFailedTimes,
 			EmptyFallback:  emptyFallback,
+			RequireUDP:     option.RequireUDP,
+			RequireIPv6:    option.RequireIPv6,
 			Providers:      providers,
 		}),
 		strategyFn:     strategyFn,

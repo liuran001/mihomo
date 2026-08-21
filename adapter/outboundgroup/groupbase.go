@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"github.com/metacubex/mihomo/adapter"
 	"strings"
 	"sync"
 	"time"
@@ -34,6 +35,8 @@ type GroupBase struct {
 	testTimeout       int
 	maxFailedTimes    int
 	emptyFallback     C.Proxy
+	requireUDP        bool
+	requireIPv6       bool
 
 	// for GetProxies
 	getProxiesMutex  sync.Mutex
@@ -52,6 +55,8 @@ type GroupBaseOption struct {
 	TestTimeout    int
 	MaxFailedTimes int
 	EmptyFallback  C.Proxy
+	RequireUDP     bool
+	RequireIPv6    bool
 	Providers      []P.ProxyProvider
 }
 
@@ -89,6 +94,8 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 		testTimeout:       opt.TestTimeout,
 		maxFailedTimes:    opt.MaxFailedTimes,
 		emptyFallback:     opt.EmptyFallback,
+		requireUDP:        opt.RequireUDP,
+		requireIPv6:       opt.RequireIPv6,
 	}
 
 	if gb.testTimeout == 0 {
@@ -134,7 +141,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 
 	// return the cached proxies if version not changed
 	if slices.Equal(providerVersions, gb.providerVersions) {
-		return gb.providerProxies
+		return adapter.FilterProxiesByCapability(gb.providerProxies, gb.requireUDP, gb.requireIPv6)
 	}
 
 	var proxies []C.Proxy
@@ -231,7 +238,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	gb.providerVersions = providerVersions
 	gb.providerProxies = proxies
 
-	return proxies
+	return adapter.FilterProxiesByCapability(proxies, gb.requireUDP, gb.requireIPv6)
 }
 
 func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {

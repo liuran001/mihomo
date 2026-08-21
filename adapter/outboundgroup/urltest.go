@@ -208,6 +208,8 @@ func NewURLTest(option GroupCommonOption, urlTestOption URLTestOption, emptyFall
 			TestTimeout:    option.TestTimeout,
 			MaxFailedTimes: option.MaxFailedTimes,
 			EmptyFallback:  emptyFallback,
+			RequireUDP:     option.RequireUDP,
+			RequireIPv6:    option.RequireIPv6,
 			Providers:      providers,
 		}),
 		fastSingle:     singledo.NewSingle[C.Proxy](time.Second * 10),
