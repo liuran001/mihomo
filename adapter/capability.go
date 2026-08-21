@@ -219,26 +219,44 @@ func tierOf(p C.Proxy, preferUDP, preferIPv6 bool) int {
 	}
 }
 
-// FilterProxiesByCapability narrows a group to its best available tier
-// instead of hard-filtering: nodes with both capabilities win, otherwise it
-// degrades to UDP-only, then to unprobed, and finally to whatever is left.
-// A group therefore never goes empty just because few nodes qualify — it
-// simply uses the best tier that has members.
+// minCandidates is the smallest candidate pool a group should end up with.
+// Sticking to a single top-tier node makes a group brittle — one bad node and
+// the group has nowhere to go until probes refresh — so lower tiers are
+// merged in until the pool is big enough.
+const minCandidates = 5
+
+// FilterProxiesByCapability reorders and narrows a group by measured
+// capability instead of hard-filtering. Nodes are ranked into tiers (both
+// capabilities confirmed, UDP confirmed, unprobed, confirmed lacking) and
+// tiers are merged from the top down until at least minCandidates nodes are
+// available, so a group never shrinks to a fragile handful — or to nothing —
+// just because few nodes qualify.
 func FilterProxiesByCapability(proxies []C.Proxy, preferUDP, preferIPv6 bool) []C.Proxy {
-	if !preferUDP && !preferIPv6 || len(proxies) < 2 {
+	if !preferUDP && !preferIPv6 || len(proxies) <= minCandidates {
 		return proxies
 	}
-	best, bestTier := make([]C.Proxy, 0, len(proxies)), -1
+	var tiers [5][]C.Proxy
 	for _, p := range proxies {
 		t := tierOf(p, preferUDP, preferIPv6)
-		if t > bestTier {
-			bestTier, best = t, append(best[:0], p)
-		} else if t == bestTier {
-			best = append(best, p)
+		if t < 0 {
+			t = 0
+		} else if t >= len(tiers) {
+			t = len(tiers) - 1
+		}
+		tiers[t] = append(tiers[t], p)
+	}
+	out := make([]C.Proxy, 0, len(proxies))
+	for t := len(tiers) - 1; t >= 0; t-- {
+		if len(tiers[t]) == 0 {
+			continue
+		}
+		out = append(out, tiers[t]...)
+		if len(out) >= minCandidates {
+			break
 		}
 	}
-	if len(best) == 0 {
+	if len(out) == 0 {
 		return proxies
 	}
-	return best
+	return out
 }

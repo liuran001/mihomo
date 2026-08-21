@@ -35,35 +35,71 @@ func TestCapabilityTierLadder(t *testing.T) {
 	capabilityCache.Range(func(k, _ any) bool { capabilityCache.Delete(k); return true })
 	yes, no := true, false
 
-	seed("both", &yes, &yes)   // UDP + IPv6
-	seed("udponly", &yes, &no) // 仅 UDP
-	seed("unprobed", nil, nil) // 未探测
-	seed("neither", &no, &no)  // 都不支持
-	all := []C.Proxy{stub("both"), stub("udponly"), stub("unprobed"), stub("neither")}
+	// 构造：3 个双通、2 个仅 UDP、2 个未探测、3 个都不支持，共 10 个（> minCandidates）
+	var all []C.Proxy
+	mk := func(prefix string, n int, udp, v6 *bool) []C.Proxy {
+		out := make([]C.Proxy, 0, n)
+		for i := 0; i < n; i++ {
+			name := prefix + string(rune('A'+i))
+			seed(name, udp, v6)
+			out = append(out, stub(name))
+		}
+		return out
+	}
+	both := mk("both", 3, &yes, &yes)
+	udpOnly := mk("udp", 2, &yes, &no)
+	unprobed := mk("unk", 2, nil, nil)
+	neither := mk("bad", 3, &no, &no)
+	all = append(all, both...)
+	all = append(all, udpOnly...)
+	all = append(all, unprobed...)
+	all = append(all, neither...)
 
-	// 1) 最优层存在时只用它
-	if got := names(FilterProxiesByCapability(all, true, true)); len(got) != 1 || got[0] != "both" {
-		t.Errorf("应只选 both，得到 %v", got)
+	// 1) 顶层不足 minCandidates → 向下合并直到够用，且顶层节点排在前面
+	got := names(FilterProxiesByCapability(all, true, true))
+	if len(got) < minCandidates {
+		t.Errorf("候选应至少 %d 个，得到 %d: %v", minCandidates, len(got), got)
 	}
-	// 2) 去掉最优层 → 降级到仅 UDP
-	if got := names(FilterProxiesByCapability(all[1:], true, true)); len(got) != 1 || got[0] != "udponly" {
-		t.Errorf("应降级到 udponly，得到 %v", got)
+	for i, n := range got[:3] {
+		if n != "both"+string(rune('A'+i)) {
+			t.Errorf("双通节点应排在最前，位置 %d 得到 %s", i, n)
+		}
 	}
-	// 3) 再去掉 → 降级到未探测
-	if got := names(FilterProxiesByCapability(all[2:], true, true)); len(got) != 1 || got[0] != "unprobed" {
-		t.Errorf("应降级到 unprobed，得到 %v", got)
+	if contains(got, "badA") {
+		t.Errorf("已有足够候选时不应纳入确认不支持的节点: %v", got)
 	}
-	// 4) 只剩确认不支持的 → 仍然返回（兜底，不让组变空）
-	if got := names(FilterProxiesByCapability(all[3:], true, true)); len(got) != 1 || got[0] != "neither" {
-		t.Errorf("应兜底返回 neither，得到 %v", got)
+
+	// 2) 顶层本身就够 → 只用顶层
+	many := mk("rich", 6, &yes, &yes)
+	got2 := names(FilterProxiesByCapability(append(many, neither...), true, true))
+	if len(got2) != 6 {
+		t.Errorf("顶层足够时应只用顶层 6 个，得到 %d: %v", len(got2), got2)
 	}
-	// 5) 未开启偏好时原样返回
-	if got := FilterProxiesByCapability(all, false, false); len(got) != 4 {
-		t.Errorf("未开启时应返回全部 4 个，得到 %d", len(got))
+
+	// 3) 只剩确认不支持的 → 仍然返回，不让组变空
+	got3 := names(FilterProxiesByCapability(neither, true, true))
+	if len(got3) != len(neither) {
+		t.Errorf("兜底应返回全部 %d 个，得到 %v", len(neither), got3)
 	}
-	// 6) 只要求 UDP 时，ipv6 缺失不该影响入选
-	if got := names(FilterProxiesByCapability(all, true, false)); len(got) != 2 ||
-		got[0] != "both" || got[1] != "udponly" {
-		t.Errorf("只要求 UDP 时应选 both+udponly，得到 %v", got)
+
+	// 4) 未开启偏好 → 原样返回
+	if len(FilterProxiesByCapability(all, false, false)) != len(all) {
+		t.Error("未开启偏好时应原样返回")
 	}
+
+	// 5) 候选总数本就不超过下限 → 不做任何筛选
+	small := append([]C.Proxy{}, both...)
+	small = append(small, neither[0])
+	if len(FilterProxiesByCapability(small, true, true)) != len(small) {
+		t.Error("总数不足下限时应原样返回")
+	}
+}
+
+func contains(list []string, want string) bool {
+	for _, v := range list {
+		if v == want {
+			return true
+		}
+	}
+	return false
 }
