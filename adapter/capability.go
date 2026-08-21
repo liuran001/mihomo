@@ -65,30 +65,38 @@ func capabilityStateFor(name string) *capabilityState {
 	return v.(*capabilityState)
 }
 
-// passesOrProbe reports whether the proxy currently passes the capability
-// requirement. Unknown or expired entries schedule an async probe and pass.
-func (s *capabilityState) passesOrProbe(p C.Proxy, kind capabilityKind) bool {
+// Capability verdicts. Unknown is a distinct state: it means no probe has
+// finished yet, which ranks below a confirmed capability but above a
+// confirmed failure.
+const (
+	capYes     = 1
+	capUnknown = 0
+	capNo      = -1
+)
+
+// stateOrProbe returns the cached verdict for this proxy, scheduling an async
+// probe when nothing usable is cached. A stale verdict keeps being reported
+// while the refresh runs.
+func (s *capabilityState) stateOrProbe(p C.Proxy, kind capabilityKind) int {
 	entry := &s.udp
 	if kind == capabilityIPv6 {
 		entry = &s.ipv6
 	}
 	entry.mu.Lock()
-	if entry.known && time.Now().Before(entry.expire) {
-		ok := entry.ok
-		entry.mu.Unlock()
-		return ok
-	}
-	stale := entry.known
-	staleOK := entry.ok
-	if !entry.probing {
+	fresh := entry.known && time.Now().Before(entry.expire)
+	known, ok := entry.known, entry.ok
+	if !fresh && !entry.probing {
 		entry.probing = true
 		go probeCapability(p, kind, entry)
 	}
 	entry.mu.Unlock()
-	if stale {
-		return staleOK // keep last verdict while re-probing
+	if !known {
+		return capUnknown
 	}
-	return true // unknown: stay selectable until proven missing
+	if ok {
+		return capYes
+	}
+	return capNo
 }
 
 func probeCapability(p C.Proxy, kind capabilityKind, entry *capabilityEntry) {
@@ -178,28 +186,59 @@ func probeUDP(ctx context.Context, p C.Proxy) bool {
 	}
 }
 
-// FilterProxiesByCapability drops proxies whose probed capabilities are known
-// to miss the requirements. Unknown nodes pass (and get probed). If every
-// proxy would be dropped the original list is returned so the group never
-// goes empty because of probing.
-func FilterProxiesByCapability(proxies []C.Proxy, requireUDP, requireIPv6 bool) []C.Proxy {
-	if !requireUDP && !requireIPv6 {
+// tierOf scores a proxy against the preferences: higher is better. The score
+// encodes the degradation ladder — both capabilities confirmed, then UDP
+// confirmed, then still unprobed, then confirmed lacking.
+func tierOf(p C.Proxy, preferUDP, preferIPv6 bool) int {
+	state := capabilityStateFor(p.Name())
+	u, v := capUnknown, capUnknown
+	if preferUDP {
+		u = state.stateOrProbe(p, capabilityUDP)
+	}
+	if preferIPv6 {
+		v = state.stateOrProbe(p, capabilityIPv6)
+	}
+	switch {
+	case preferUDP && preferIPv6:
+		switch {
+		case u == capYes && v == capYes:
+			return 4 // UDP + IPv6 both confirmed
+		case u == capYes && v == capUnknown:
+			return 3 // UDP confirmed, IPv6 still unprobed
+		case u == capYes:
+			return 2 // UDP only (IPv6 confirmed missing)
+		case u == capUnknown:
+			return 1 // nothing confirmed yet
+		default:
+			return 0 // UDP confirmed missing
+		}
+	case preferUDP:
+		return map[int]int{capYes: 2, capUnknown: 1, capNo: 0}[u]
+	default:
+		return map[int]int{capYes: 2, capUnknown: 1, capNo: 0}[v]
+	}
+}
+
+// FilterProxiesByCapability narrows a group to its best available tier
+// instead of hard-filtering: nodes with both capabilities win, otherwise it
+// degrades to UDP-only, then to unprobed, and finally to whatever is left.
+// A group therefore never goes empty just because few nodes qualify — it
+// simply uses the best tier that has members.
+func FilterProxiesByCapability(proxies []C.Proxy, preferUDP, preferIPv6 bool) []C.Proxy {
+	if !preferUDP && !preferIPv6 || len(proxies) < 2 {
 		return proxies
 	}
-	filtered := make([]C.Proxy, 0, len(proxies))
+	best, bestTier := make([]C.Proxy, 0, len(proxies)), -1
 	for _, p := range proxies {
-		state := capabilityStateFor(p.Name())
-		if requireUDP && !state.passesOrProbe(p, capabilityUDP) {
-			continue
+		t := tierOf(p, preferUDP, preferIPv6)
+		if t > bestTier {
+			bestTier, best = t, append(best[:0], p)
+		} else if t == bestTier {
+			best = append(best, p)
 		}
-		if requireIPv6 && !state.passesOrProbe(p, capabilityIPv6) {
-			continue
-		}
-		filtered = append(filtered, p)
 	}
-	if len(filtered) == 0 {
-		log.Warnln("[Capability] all proxies filtered out by capability requirements, keeping original list")
+	if len(best) == 0 {
 		return proxies
 	}
-	return filtered
+	return best
 }

@@ -35,8 +35,8 @@ type GroupBase struct {
 	testTimeout       int
 	maxFailedTimes    int
 	emptyFallback     C.Proxy
-	requireUDP        bool
-	requireIPv6       bool
+	preferUDP         bool
+	preferIPv6        bool
 	penalizeUnstable  bool
 
 	// for GetProxies
@@ -56,8 +56,8 @@ type GroupBaseOption struct {
 	TestTimeout      int
 	MaxFailedTimes   int
 	EmptyFallback    C.Proxy
-	RequireUDP       bool
-	RequireIPv6      bool
+	PreferUDP        bool
+	PreferIPv6       bool
 	PenalizeUnstable bool
 	Providers        []P.ProxyProvider
 }
@@ -96,8 +96,8 @@ func NewGroupBase(opt GroupBaseOption) *GroupBase {
 		testTimeout:       opt.TestTimeout,
 		maxFailedTimes:    opt.MaxFailedTimes,
 		emptyFallback:     opt.EmptyFallback,
-		requireUDP:        opt.RequireUDP,
-		requireIPv6:       opt.RequireIPv6,
+		preferUDP:         opt.PreferUDP,
+		preferIPv6:        opt.PreferIPv6,
 		penalizeUnstable:  opt.PenalizeUnstable,
 	}
 
@@ -144,7 +144,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 
 	// return the cached proxies if version not changed
 	if slices.Equal(providerVersions, gb.providerVersions) {
-		return adapter.FilterProxiesByCapability(gb.providerProxies, gb.requireUDP, gb.requireIPv6)
+		return adapter.FilterProxiesByCapability(gb.providerProxies, gb.preferUDP, gb.preferIPv6)
 	}
 
 	var proxies []C.Proxy
@@ -241,7 +241,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	gb.providerVersions = providerVersions
 	gb.providerProxies = proxies
 
-	return adapter.FilterProxiesByCapability(proxies, gb.requireUDP, gb.requireIPv6)
+	return adapter.FilterProxiesByCapability(proxies, gb.preferUDP, gb.preferIPv6)
 }
 
 func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {

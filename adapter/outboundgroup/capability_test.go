@@ -9,21 +9,21 @@ import (
 func TestRequireCapabilityDecode(t *testing.T) {
 	decoder := structure.NewDecoder(structure.Option{TagName: "group", WeaklyTypedInput: true})
 	raw := map[string]any{
-		"name":         "自动选择",
-		"type":         "url-test",
-		"require-udp":  true,
-		"require-ipv6": true,
-		"use":          []any{"SSLinks"},
+		"name":        "自动选择",
+		"type":        "url-test",
+		"prefer-udp":  true,
+		"prefer-ipv6": true,
+		"use":         []any{"SSLinks"},
 	}
 	opt := GroupCommonOption{}
 	if err := decoder.Decode(raw, &opt); err != nil {
 		t.Fatalf("decode: %v", err)
 	}
-	if !opt.RequireUDP {
-		t.Error("require-udp 未解析为 true")
+	if !opt.PreferUDP {
+		t.Error("prefer-udp 未解析为 true")
 	}
-	if !opt.RequireIPv6 {
-		t.Error("require-ipv6 未解析为 true")
+	if !opt.PreferIPv6 {
+		t.Error("prefer-ipv6 未解析为 true")
 	}
-	t.Logf("decoded: RequireUDP=%v RequireIPv6=%v", opt.RequireUDP, opt.RequireIPv6)
+	t.Logf("decoded: PreferUDP=%v PreferIPv6=%v", opt.PreferUDP, opt.PreferIPv6)
 }
