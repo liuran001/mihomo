@@ -147,8 +147,8 @@ github.com/metacubex/kcp-go v0.0.0-20260105040817-550693377604 h1:hJwCVlE3ojViC3
 github.com/metacubex/kcp-go v0.0.0-20260105040817-550693377604/go.mod h1:lpmN3m269b3V5jFCWtffqBLS4U3QQoIid9ugtO+OhVc=
 github.com/metacubex/mhurl v0.1.0 h1:ZdW4Zxe3j3uJ89gNytOazHu6kbHn5owutN/VfXOI8GE=
 github.com/metacubex/mhurl v0.1.0/go.mod h1:2qpQImCbXoUs6GwJrjuEXKelPyoimsIXr07eNKZdS00=
-github.com/metacubex/mipstack v0.0.0-20260816065001-b7038299fe13 h1:aOU4avd9u7uFivubzn+SjFmEDWAkGF+gvZ0ecEdeg64=
-github.com/metacubex/mipstack v0.0.0-20260816065001-b7038299fe13/go.mod h1:+bbwALZI0pbi2auSG5A3ptdpV2DZ2eLObziXo+P7oj0=
+github.com/metacubex/mipstack v0.0.0-20260820120222-f3276095eefa h1:nB/OYUlv1s0TFxAFY9KZKlsJ4x2Kp5OThQ3PkD1HnrI=
+github.com/metacubex/mipstack v0.0.0-20260820120222-f3276095eefa/go.mod h1:+bbwALZI0pbi2auSG5A3ptdpV2DZ2eLObziXo+P7oj0=
 github.com/metacubex/mlkem v0.1.0 h1:wFClitonSFcmipzzQvax75beLQU+D7JuC+VK1RzSL8I=
 github.com/metacubex/mlkem v0.1.0/go.mod h1:amhaXZVeYNShuy9BILcR7P0gbeo/QLZsnqCdL8U2PDQ=
 github.com/metacubex/nftables v0.0.0-20260426003805-208c2c1ba2cb h1:wk6mHYPURSUvWcUv72gNP79oiylFsscBSDPJ6ieV6Iw=
@@ -185,8 +185,8 @@ github.com/metacubex/smux v0.0.0-20260105030934-d0c8756d3141 h1:DK2l6m2Fc85H2Bhi
 github.com/metacubex/smux v0.0.0-20260105030934-d0c8756d3141/go.mod h1:/yI4OiGOSn0SURhZdJF3CbtPg3nwK700bG8TZLMBvAg=
 github.com/metacubex/ssh v0.1.0 h1:iGfr99qk/eMHzUnQ/0bTxXT8+8SWqLSHBWDHoAhngzw=
 github.com/metacubex/ssh v0.1.0/go.mod h1:NUtl0d+/f2cG9ECEpMM8iCVOpmggQlC13oLeDUONDlU=
-github.com/metacubex/tailscale v0.0.0-20260807072706-a4fb5feabcbb h1:EE4+ehlygfki5qJvkIYs6zJXhv7WFAX+4cDQi/b6cY8=
-github.com/metacubex/tailscale v0.0.0-20260807072706-a4fb5feabcbb/go.mod h1:fMMYScJPYt8Ss3D4VhontA2uV2N9NPZbbXsPP6LgQeo=
+github.com/metacubex/tailscale v0.0.0-20260821002758-7e607643d76d h1:Nqqv/OL1XeHIi773YknT517pjzrDtz3L3jY4ESAsEG8=
+github.com/metacubex/tailscale v0.0.0-20260821002758-7e607643d76d/go.mod h1:fMMYScJPYt8Ss3D4VhontA2uV2N9NPZbbXsPP6LgQeo=
 github.com/metacubex/tailscale-wireguard-go v0.0.0-20260725073821-e61ab99cede2 h1:nKyLVJEU4jsLVx+rdqbDUbEKTX/Sdu161AeVoZC9tlY=
 github.com/metacubex/tailscale-wireguard-go v0.0.0-20260725073821-e61ab99cede2/go.mod h1:W00EeoPdd2jbV3+ZUa0m2b7FdKx5B1LFsXvEpy7cToQ=
 github.com/metacubex/tfo-go v0.0.0-20260623020846-376a77860b8c h1:+2C1UshSLzaogLY/IDz1XhOLxjhs3rkhVHB4eCN9Zto=
