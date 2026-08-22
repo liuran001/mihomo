@@ -54,21 +54,42 @@ func TestTailscaleWatcherReconnectsAfterTemporaryError(t *testing.T) {
 	}
 }
 
+// 取消必须能中断重试等待，而不只是被循环前的 ctx 检查挡住。先前的写法在启动
+// goroutine 后立刻 cancel，goroutine 常常还没进过循环就退出了 —— watchIPNBusHook
+// 一次都没被调用，测试却是绿的。这里等 hook 真的被调用过再取消，确保覆盖的是
+// waitTailscaleWatcherRetry 里的取消路径。
 func TestTailscaleWatcherStopsOnCancel(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	tailscale := &Tailscale{ctx: ctx, backendInitCh: make(chan struct{})}
 	var watchCalls atomic.Int32
+	subscribed := make(chan struct{}, 1)
 	tailscale.watchIPNBusHook = func(context.Context) (tailscaleIPNBusWatcher, error) {
 		watchCalls.Add(1)
+		select {
+		case subscribed <- struct{}{}:
+		default:
+		}
 		return &fakeTailscaleWatcher{err: errors.New("temporary EOF")}, nil
 	}
 	done := make(chan struct{})
 	go func() { tailscale.watchBackendState(); close(done) }()
+
+	select {
+	case <-subscribed:
+	case <-time.After(2 * time.Second):
+		cancel()
+		<-done
+		t.Fatal("watcher never subscribed, cancellation path was not exercised")
+	}
 	cancel()
+
 	select {
 	case <-done:
-	case <-time.After(time.Second):
+	case <-time.After(2 * time.Second):
 		t.Fatal("watcher did not stop after cancellation")
+	}
+	if watchCalls.Load() < 1 {
+		t.Fatal("watch hook was never invoked")
 	}
 	calls := watchCalls.Load()
 	time.Sleep(150 * time.Millisecond)
