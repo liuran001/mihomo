@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/metacubex/mihomo/adapter"
 	C "github.com/metacubex/mihomo/constant"
@@ -165,11 +166,43 @@ func demotedProxies(names ...string) []C.Proxy {
 	return proxies
 }
 
+// awaitDemoted blocks until every proxy reports demoted.
+//
+// CapabilityDemoted dispatches its probe asynchronously and reports capUnknown
+// until the result lands, so a rotation measured while the probes are still in
+// flight is measuring the transition, not the steady state. Observed as a real
+// CI failure: proxy a settled first and was skipped by the preferred pass on
+// every subsequent call while b was still unknown and kept winning it, giving
+// a=1 b=3 out of four calls.
+func awaitDemoted(t *testing.T, proxies []C.Proxy) {
+	t.Helper()
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		settled := true
+		for _, proxy := range proxies {
+			if !adapter.CapabilityDemoted(proxy, false, true) {
+				settled = false
+				break
+			}
+		}
+		if settled {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("capability probes did not settle; the rotation below would be timing-dependent")
+		}
+		time.Sleep(time.Millisecond)
+	}
+}
+
 func TestRoundRobinKeepsDemotedProxiesInRotation(t *testing.T) {
 	metadata := &C.Metadata{Host: "example.com"}
 	proxies := demotedProxies("a", "b")
-	strategy := strategyRoundRobin("test", false, true)
+	awaitDemoted(t, proxies)
 
+	// Build the strategy only once the verdicts are stable, so idx starts at a
+	// known position and every call takes the same branch.
+	strategy := strategyRoundRobin("test", false, true)
 	seen := map[string]int{}
 	for i := 0; i < 4; i++ {
 		seen[strategy(proxies, metadata, true).Name()]++
