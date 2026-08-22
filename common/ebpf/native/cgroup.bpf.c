@@ -238,8 +238,15 @@ INLINE bool token_v4_attempt(
     __u32 network_candidate = swap32(candidate);
     __builtin_memset(key->token_addr, 0, sizeof(key->token_addr));
     __builtin_memcpy(key->token_addr, &network_candidate, sizeof(network_candidate));
-    struct sb_ebpf_original_dst *existing = map_lookup(&cgroup_udp_redirect, key);
-    if (protocol == TCP_VALUE) existing = map_lookup(&cgroup_tcp_redirect, key);
+    // Select the map before looking up rather than probing the UDP map first and
+    // overwriting the result for TCP: the protocol is part of the key, so the
+    // discarded probe could never hit, it just cost a hash and a bucket walk on
+    // every TCP connect() -- up to REDIRECT_TOKEN_ATTEMPTS times per call. The
+    // ternary keeps both map references constant, which is what the verifier
+    // needs and what the map_update below already relies on.
+    struct sb_ebpf_original_dst *existing = protocol == TCP_VALUE
+        ? map_lookup(&cgroup_tcp_redirect, key)
+        : map_lookup(&cgroup_udp_redirect, key);
     if (existing != 0 && equal_original(existing, value)) {
         existing->created_at_ns = value->created_at_ns;
         return true;
@@ -283,8 +290,9 @@ INLINE bool token_v6_attempt(
     __builtin_memcpy(key->token_addr, config->redirect_ipv6_prefix, 8U);
     __builtin_memcpy(key->token_addr + 8U, &seed0, 4U);
     __builtin_memcpy(key->token_addr + 12U, &seed1, 4U);
-    struct sb_ebpf_original_dst *existing = map_lookup(&cgroup_udp_redirect, key);
-    if (protocol == TCP_VALUE) existing = map_lookup(&cgroup_tcp_redirect, key);
+    struct sb_ebpf_original_dst *existing = protocol == TCP_VALUE
+        ? map_lookup(&cgroup_tcp_redirect, key)
+        : map_lookup(&cgroup_udp_redirect, key);
     if (existing != 0 && equal_original(existing, value)) {
         existing->created_at_ns = value->created_at_ns;
         return true;
