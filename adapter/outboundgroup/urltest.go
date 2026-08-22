@@ -116,7 +116,7 @@ func (u *URLTest) rankDelay(proxy C.Proxy) uint16 {
 	if !u.penalizeUnstable {
 		return delay
 	}
-	p := health.Penalty(proxy.Name())
+	p := health.Penalty(health.ProxyKey(proxy.Name(), proxy.ProxyInfo().ProviderName))
 	if p == 0 {
 		return delay
 	}
@@ -162,7 +162,8 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 
 		}
 		// tolerance
-		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) || u.rankDelay(u.fastNode) > u.rankDelay(fast)+u.tolerance {
+		if u.fastNode == nil || fastNotExist || !u.fastNode.AliveForTestUrl(u.testUrl) ||
+			delayExceedsTolerance(u.rankDelay(u.fastNode), u.rankDelay(fast), u.tolerance) {
 			u.fastNode = fast
 		}
 		return u.fastNode, nil
@@ -172,6 +173,10 @@ func (u *URLTest) fast(touch bool) C.Proxy {
 	}
 
 	return elm
+}
+
+func delayExceedsTolerance(current, candidate, tolerance uint16) bool {
+	return uint32(current) > uint32(candidate)+uint32(tolerance)
 }
 
 // SupportUDP implements C.ProxyAdapter

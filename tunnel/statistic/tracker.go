@@ -1,7 +1,6 @@
 package statistic
 
 import (
-	"github.com/metacubex/mihomo/component/health"
 	"io"
 	"net"
 	"sync"
@@ -11,6 +10,7 @@ import (
 	"github.com/metacubex/mihomo/common/buf"
 	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/common/utils"
+	"github.com/metacubex/mihomo/component/health"
 	C "github.com/metacubex/mihomo/constant"
 
 	"github.com/gofrs/uuid/v5"
@@ -171,7 +171,11 @@ func (tt *tcpTracker) reportStall() {
 	if time.Since(tt.Start) > stallWindow {
 		return
 	}
-	health.RecordStall(tt.Chain[0])
+	provider := ""
+	if len(tt.ProviderChain) > 0 {
+		provider = tt.ProviderChain[0]
+	}
+	health.RecordStall(health.ProxyKey(tt.Chain[0], provider))
 }
 
 func (tt *tcpTracker) Upstream() any {

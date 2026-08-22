@@ -206,3 +206,12 @@ func TestCapabilityCacheSeparatesProxyIdentity(t *testing.T) {
 		t.Fatal("same-named proxies from different providers must not share capability state")
 	}
 }
+
+func TestProxyIdentitySeparatesDelimiterCollisions(t *testing.T) {
+	a := stubProxy{name: "same", type_: C.Http, provider: "provider|segment", addr: "endpoint"}
+	b := stubProxy{name: "same", type_: C.Http, provider: "provider", addr: "segment|endpoint"}
+
+	if ProxyIdentity(a) == ProxyIdentity(b) {
+		t.Fatal("proxy identity must not collide when delimiters move between provider and address")
+	}
+}

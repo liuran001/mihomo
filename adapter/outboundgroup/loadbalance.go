@@ -66,7 +66,14 @@ func getKeyWithSrcAndDst(metadata *C.Metadata) string {
 		src = metadata.SrcIP.String()
 	}
 
-	return fmt.Sprintf("%s%s", src, dst)
+	// Both components are user-/network-derived strings. Length prefixes keep
+	// the sticky-session key unambiguous even if a future address formatter
+	// introduces a separator that can occur in either component.
+	return stickySessionKey(src, dst)
+}
+
+func stickySessionKey(src, dst string) string {
+	return fmt.Sprintf("%d:%s%d:%s", len(src), src, len(dst), dst)
 }
 
 // DialContext implements C.ProxyAdapter
@@ -135,7 +142,7 @@ func strategyRoundRobin(url string, preferUDP, preferIPv6 bool) strategyFn {
 				if !proxy.AliveForTestUrl(url) {
 					continue
 				}
-				if preferredOnly && adapter.CapabilityPenalty(proxy, preferUDP, preferIPv6) != 0 {
+				if preferredOnly && adapter.CapabilityDemoted(proxy, preferUDP, preferIPv6) {
 					continue
 				}
 				if touch {
@@ -152,26 +159,31 @@ func strategyRoundRobin(url string, preferUDP, preferIPv6 bool) strategyFn {
 	}
 }
 
+// consistent-hashing and sticky-sessions exist to give a flow a STABLE node.
+// Capability preferences deliberately take no part in that choice: a probe
+// verdict changes over time (unknown -> confirmed), so letting it rank the
+// candidates rewrites the mapping every time a probe lands, migrating live
+// sessions onto different nodes during the very window after a config load or
+// provider refresh when the most flows are being established. Preferences are
+// applied where ranking is already time-varying (url-test, smart, round-robin);
+// here a node that cannot carry the traffic is handled by the normal
+// alive/dead path instead. preferUDP/preferIPv6 are kept in the signature so
+// every strategy shares one constructor shape.
 func strategyConsistentHashing(url string, preferUDP, preferIPv6 bool) strategyFn {
 	return func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
 		key := utils.MapHash(getKey(metadata))
 		var best, bestAlive C.Proxy
 		var bestScore, bestAliveScore uint64
-		var bestAlivePenalty uint16
 		for _, proxy := range proxies {
-			score := rendezvousScore(key, proxyIdentity(proxy))
+			score := rendezvousScore(key, adapter.ProxyIdentity(proxy))
 			if best == nil || score > bestScore {
 				best, bestScore = proxy, score
 			}
 			if !proxy.AliveForTestUrl(url) {
 				continue
 			}
-			// Rank by capability penalty first, then by rendezvous score, so
-			// preferences pick the bucket and hashing stays stable within it.
-			penalty := adapter.CapabilityPenalty(proxy, preferUDP, preferIPv6)
-			if bestAlive == nil || penalty < bestAlivePenalty ||
-				(penalty == bestAlivePenalty && score > bestAliveScore) {
-				bestAlive, bestAliveScore, bestAlivePenalty = proxy, score, penalty
+			if bestAlive == nil || score > bestAliveScore {
+				bestAlive, bestAliveScore = proxy, score
 			}
 		}
 		if bestAlive != nil {
@@ -185,14 +197,8 @@ func rendezvousScore(key uint64, name string) uint64 {
 	return utils.MapHash(fmt.Sprintf("%016x:%s", key, name))
 }
 
-func proxyIdentity(proxy C.Proxy) string {
-	if proxy == nil {
-		return ""
-	}
-	info := proxy.ProxyInfo()
-	return fmt.Sprintf("%s|%s|%s|%s", proxy.Name(), proxy.Type().String(), info.ProviderName, proxy.Addr())
-}
-
+// See strategyConsistentHashing for why capability preferences are not
+// consulted here.
 func strategyStickySessions(url string, preferUDP, preferIPv6 bool) strategyFn {
 	ttl := time.Minute * 10
 	lruCache := lru.New[uint64, string](
@@ -202,7 +208,7 @@ func strategyStickySessions(url string, preferUDP, preferIPv6 bool) strategyFn {
 		key := utils.MapHash(getKeyWithSrcAndDst(metadata))
 		if identity, has := lruCache.Get(key); has {
 			for _, proxy := range proxies {
-				if proxyIdentity(proxy) == identity && proxy.AliveForTestUrl(url) {
+				if adapter.ProxyIdentity(proxy) == identity && proxy.AliveForTestUrl(url) {
 					return proxy
 				}
 			}
@@ -210,23 +216,20 @@ func strategyStickySessions(url string, preferUDP, preferIPv6 bool) strategyFn {
 
 		var best, bestAlive C.Proxy
 		var bestScore, bestAliveScore uint64
-		var bestAlivePenalty uint16
 		for _, proxy := range proxies {
-			score := rendezvousScore(key, proxyIdentity(proxy))
+			score := rendezvousScore(key, adapter.ProxyIdentity(proxy))
 			if best == nil || score > bestScore {
 				best, bestScore = proxy, score
 			}
 			if !proxy.AliveForTestUrl(url) {
 				continue
 			}
-			penalty := adapter.CapabilityPenalty(proxy, preferUDP, preferIPv6)
-			if bestAlive == nil || penalty < bestAlivePenalty ||
-				(penalty == bestAlivePenalty && score > bestAliveScore) {
-				bestAlive, bestAliveScore, bestAlivePenalty = proxy, score, penalty
+			if bestAlive == nil || score > bestAliveScore {
+				bestAlive, bestAliveScore = proxy, score
 			}
 		}
 		if bestAlive != nil {
-			lruCache.Set(key, proxyIdentity(bestAlive))
+			lruCache.Set(key, adapter.ProxyIdentity(bestAlive))
 			return bestAlive
 		}
 		return best

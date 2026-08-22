@@ -6,7 +6,9 @@
 package health
 
 import (
+	"fmt"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -20,14 +22,33 @@ const (
 	penaltyCap = 1500
 	// maxEvents caps per-proxy bookkeeping.
 	maxEvents = 32
+	// addStoreAttempts bounds the retry when a concurrent sweep removes the
+	// record between lookup and lock.
+	addStoreAttempts = 8
 )
 
 type record struct {
-	mu     sync.Mutex
-	events []time.Time
+	mu       sync.Mutex
+	events   []time.Time
+	lastUsed time.Time
 }
 
-var store sync.Map // proxy name -> *record
+var store sync.Map // stable proxy key -> *record
+
+var sweepAccesses atomic.Uint64
+var sweepRunning atomic.Uint32
+
+const (
+	sweepEvery = 256
+	idleTTL    = window
+)
+
+// ProxyKey builds the key shared by connection tracking and proxy ranking.
+// Provider names are included so identically named nodes from different
+// providers do not inherit one another's stall history.
+func ProxyKey(name, provider string) string {
+	return fmt.Sprintf("%d:%s%d:%s", len(name), name, len(provider), provider)
+}
 
 func recordFor(name string) *record {
 	if v, ok := store.Load(name); ok {
@@ -41,13 +62,26 @@ func add(name string) {
 	if name == "" {
 		return
 	}
-	r := recordFor(name)
 	now := time.Now()
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	r.events = append(r.events, now)
-	if len(r.events) > maxEvents {
-		r.events = r.events[len(r.events)-maxEvents:]
+	// A concurrent sweep may drop the record between recordFor and the lock,
+	// which would append an incident to an unreachable object. Retry, but
+	// bounded: losing one diagnostic incident is preferable to spinning on the
+	// dial path if the store is ever contended pathologically.
+	for attempt := 0; attempt < addStoreAttempts; attempt++ {
+		r := recordFor(name)
+		r.mu.Lock()
+		current, loaded := store.Load(name)
+		if !loaded || current != r {
+			r.mu.Unlock()
+			continue
+		}
+		r.events = append(r.events, now)
+		if len(r.events) > maxEvents {
+			r.events = r.events[len(r.events)-maxEvents:]
+		}
+		r.lastUsed = now
+		r.mu.Unlock()
+		return
 	}
 }
 
@@ -79,7 +113,11 @@ func Penalty(name string) uint16 {
 	}
 	r.events = live
 	n := len(live)
+	r.lastUsed = time.Now()
 	r.mu.Unlock()
+	// Reclamation is left to the asynchronous sweep: this call path just
+	// refreshed lastUsed, so an inline idle check could never fire.
+	maybeSweep()
 	if n == 0 {
 		return 0
 	}
@@ -99,12 +137,58 @@ func Incidents(name string) int {
 	r := v.(*record)
 	cutoff := time.Now().Add(-window)
 	r.mu.Lock()
-	defer r.mu.Unlock()
 	n := 0
+	live := r.events[:0]
 	for _, t := range r.events {
 		if t.After(cutoff) {
 			n++
+			live = append(live, t)
 		}
 	}
+	r.events = live
+	r.lastUsed = time.Now()
+	r.mu.Unlock()
+	maybeSweep()
 	return n
+}
+
+func maybeSweep() {
+	if sweepAccesses.Add(1)%sweepEvery != 0 ||
+		!sweepRunning.CompareAndSwap(0, 1) {
+		return
+	}
+	go func() {
+		defer sweepRunning.Store(0)
+		cutoff := time.Now().Add(-idleTTL)
+		store.Range(func(key, value any) bool {
+			r, ok := value.(*record)
+			if !ok {
+				return true
+			}
+			r.mu.Lock()
+			live := r.events[:0]
+			for _, event := range r.events {
+				if event.After(cutoff) {
+					live = append(live, event)
+				}
+			}
+			r.events = live
+			idle := len(live) == 0 && (r.lastUsed.IsZero() || r.lastUsed.Before(cutoff))
+			r.mu.Unlock()
+			if idle {
+				if keyString, ok := key.(string); ok {
+					removeIfIdle(keyString, r, cutoff)
+				}
+			}
+			return true
+		})
+	}()
+}
+
+func removeIfIdle(key string, r *record, cutoff time.Time) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if len(r.events) == 0 && (r.lastUsed.IsZero() || r.lastUsed.Before(cutoff)) {
+		store.CompareAndDelete(key, r)
+	}
 }

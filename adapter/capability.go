@@ -5,10 +5,12 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/binary"
-	"fmt"
 	"net"
 	"net/netip"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/metacubex/mihomo/component/resolver"
@@ -51,20 +53,79 @@ type capabilityEntry struct {
 type capabilityState struct {
 	udp  capabilityEntry
 	ipv6 capabilityEntry
+	// lastUsed lets the opportunistic cache sweep remove identities that are
+	// no longer present after a provider refresh. TTLs invalidate verdicts but
+	// otherwise do not reclaim the sync.Map key itself.
+	lastUsed atomic.Int64
 }
 
 var (
-	capabilityCache sync.Map // proxy identity -> *capabilityState
+	capabilityCache          sync.Map // proxy identity -> *capabilityState
+	capabilityCacheSweepRun  atomic.Uint32
+	capabilityCacheSweepNext atomic.Int64
 	// limit concurrent probes so a large provider doesn't stampede
 	capabilityProbeSem = make(chan struct{}, 8)
 )
 
+const (
+	capabilityCacheSweepInterval = 5 * time.Minute
+	capabilityCacheIdleTTL       = time.Hour
+)
+
 func capabilityStateFor(name string) *capabilityState {
+	now := time.Now()
 	if v, ok := capabilityCache.Load(name); ok {
-		return v.(*capabilityState)
+		state := v.(*capabilityState)
+		state.lastUsed.Store(now.UnixNano())
+		maybeSweepCapabilityCache(now)
+		return state
 	}
-	v, _ := capabilityCache.LoadOrStore(name, &capabilityState{})
-	return v.(*capabilityState)
+	state := &capabilityState{}
+	state.lastUsed.Store(now.UnixNano())
+	v, _ := capabilityCache.LoadOrStore(name, state)
+	state = v.(*capabilityState)
+	state.lastUsed.Store(now.UnixNano())
+	maybeSweepCapabilityCache(now)
+	return state
+}
+
+func maybeSweepCapabilityCache(now time.Time) {
+	nowNS := now.UnixNano()
+	next := capabilityCacheSweepNext.Load()
+	if next != 0 && nowNS < next {
+		return
+	}
+	if !capabilityCacheSweepNext.CompareAndSwap(next, now.Add(capabilityCacheSweepInterval).UnixNano()) {
+		return
+	}
+	// Range and per-entry locking can be expensive with large providers. Never
+	// make the caller that is selecting a proxy pay that cost. The sweep is
+	// scheduled at a low fixed cadence instead of once per N candidate visits,
+	// which otherwise scales with provider size and connection churn.
+	if !capabilityCacheSweepRun.CompareAndSwap(0, 1) {
+		return
+	}
+	go func() {
+		defer capabilityCacheSweepRun.Store(0)
+		sweepNow := time.Now()
+		cutoff := sweepNow.Add(-capabilityCacheIdleTTL).UnixNano()
+		capabilityCache.Range(func(key, value any) bool {
+			state, ok := value.(*capabilityState)
+			if !ok || state.lastUsed.Load() >= cutoff {
+				return true
+			}
+			state.udp.mu.Lock()
+			udpIdle := !state.udp.probing && (!state.udp.known || !sweepNow.Before(state.udp.expire))
+			state.udp.mu.Unlock()
+			state.ipv6.mu.Lock()
+			ipv6Idle := !state.ipv6.probing && (!state.ipv6.known || !sweepNow.Before(state.ipv6.expire))
+			state.ipv6.mu.Unlock()
+			if udpIdle && ipv6Idle {
+				capabilityCache.CompareAndDelete(key, state)
+			}
+			return true
+		})
+	}()
 }
 
 // capabilityStateForProxy separates entries for same-named proxies coming
@@ -75,8 +136,25 @@ func capabilityStateForProxy(p C.Proxy) *capabilityState {
 }
 
 func capabilityCacheKey(p C.Proxy) string {
+	return ProxyIdentity(p)
+}
+
+// ProxyIdentity returns an unambiguous, stable identity for a proxy. Length
+// prefixes are intentional: names, provider names, and addresses are user
+// supplied and may contain any separator character.
+func ProxyIdentity(p C.Proxy) string {
+	if p == nil {
+		return ""
+	}
 	info := p.ProxyInfo()
-	return fmt.Sprintf("%s|%s|%s|%s", p.Name(), p.Type().String(), info.ProviderName, p.Addr())
+	parts := [...]string{p.Name(), p.Type().String(), info.ProviderName, p.Addr()}
+	var identity strings.Builder
+	for _, part := range parts {
+		identity.WriteString(strconv.Itoa(len(part)))
+		identity.WriteByte(':')
+		identity.WriteString(part)
+	}
+	return identity.String()
 }
 
 // Capability verdicts. Unknown is a distinct state: it means no probe has
@@ -197,14 +275,43 @@ func probeUDP(ctx context.Context, p C.Proxy) bool {
 	txid := append([]byte(nil), req[8:20]...)
 
 	dst := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip.Unmap(), port))
-	deadline, _ := ctx.Deadline()
-	_ = pc.SetDeadline(deadline)
+	deadline, hasDeadline := ctx.Deadline()
+	deadlineSupported := !hasDeadline
+	if hasDeadline {
+		deadlineSupported = pc.SetDeadline(deadline) == nil
+	}
 	if _, err = pc.WriteTo(req, dst); err != nil {
 		return false
 	}
 	buf := make([]byte, 512)
+	readPacket := func() (int, net.Addr, error) {
+		if deadlineSupported {
+			return pc.ReadFrom(buf)
+		}
+		// A few Android PacketConn implementations reject SetDeadline. Keep
+		// the read cancellable by closing the connection on context expiry;
+		// the buffered result channel lets the reader exit without leaking a
+		// goroutine after this function returns.
+		type packetResult struct {
+			n   int
+			src net.Addr
+			err error
+		}
+		result := make(chan packetResult, 1)
+		go func() {
+			n, src, readErr := pc.ReadFrom(buf)
+			result <- packetResult{n: n, src: src, err: readErr}
+		}()
+		select {
+		case value := <-result:
+			return value.n, value.src, value.err
+		case <-ctx.Done():
+			_ = pc.Close()
+			return 0, nil, ctx.Err()
+		}
+	}
 	for {
-		n, src, err := pc.ReadFrom(buf)
+		n, src, err := readPacket()
 		if err != nil {
 			return false
 		}
@@ -272,6 +379,22 @@ func CapabilityPenalty(p C.Proxy, preferUDP, preferIPv6 bool) uint16 {
 		penalty += capabilityPenaltyFor(state.stateOrProbe(p, capabilityIPv6))
 	}
 	return uint16(penalty)
+}
+
+// CapabilityDemoted reports whether a probe has CONFIRMED that this proxy
+// lacks a preferred capability. An unfinished probe is not a demotion: treating
+// unknown like a confirmed failure would penalize every node that simply has
+// not been measured yet, which on a large provider means the whole group is
+// demoted for the first minutes after a config load.
+func CapabilityDemoted(p C.Proxy, preferUDP, preferIPv6 bool) bool {
+	if p == nil || (!preferUDP && !preferIPv6) {
+		return false
+	}
+	state := capabilityStateForProxy(p)
+	if preferUDP && state.stateOrProbe(p, capabilityUDP) == capNo {
+		return true
+	}
+	return preferIPv6 && state.stateOrProbe(p, capabilityIPv6) == capNo
 }
 
 func capabilityPenaltyFor(verdict int) int {

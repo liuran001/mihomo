@@ -55,3 +55,19 @@ func TestEmptyNameIgnored(t *testing.T) {
 		t.Errorf("空名应忽略，得到 %d", got)
 	}
 }
+
+func TestProxyKeySeparatesProviders(t *testing.T) {
+	reset()
+	first := ProxyKey("node", "provider-a")
+	second := ProxyKey("node", "provider-b")
+	if first == second {
+		t.Fatal("provider-aware health keys collided")
+	}
+	RecordStall(first)
+	if got := Penalty(second); got != 0 {
+		t.Fatalf("stall for another provider leaked into this key: %d", got)
+	}
+	if got := Penalty(first); got != penaltyPerEvent {
+		t.Fatalf("provider-specific stall penalty = %d, want %d", got, penaltyPerEvent)
+	}
+}

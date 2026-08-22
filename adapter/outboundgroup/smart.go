@@ -553,16 +553,38 @@ func (s *Smart) Proxies() []C.Proxy {
 	return s.GetProxies(false)
 }
 
+// uniqueProxiesByName returns only names that identify one current proxy.
+// Smart's persistent store predates provider-aware identities and stores names
+// for compatibility, so an ambiguous cached name must be ignored rather than
+// silently mapped to whichever provider happened to be iterated last.
+func uniqueProxiesByName(proxies []C.Proxy) map[string]C.Proxy {
+	byName := make(map[string]C.Proxy, len(proxies))
+	ambiguous := make(map[string]struct{})
+	for _, proxy := range proxies {
+		if proxy == nil {
+			continue
+		}
+		name := proxy.Name()
+		if _, duplicate := ambiguous[name]; duplicate {
+			continue
+		}
+		if _, exists := byName[name]; exists {
+			delete(byName, name)
+			ambiguous[name] = struct{}{}
+			continue
+		}
+		byName[name] = proxy
+	}
+	return byName
+}
+
 func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool) []C.Proxy {
 	blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
 	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, metadata.SmartTarget)
 
 	var proxyByName map[string]C.Proxy
 	if len(names) > 0 {
-		proxyByName = make(map[string]C.Proxy, len(all))
-		for _, p := range all {
-			proxyByName[p.Name()] = p
-		}
+		proxyByName = uniqueProxiesByName(all)
 	}
 
 	checkNodeUsed := make(map[string]bool, len(names))
@@ -571,11 +593,11 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 	var failedSelected []C.Proxy
 
 	for i, name := range names {
-		checkNodeUsed[name] = true
 		proxy := proxyByName[name]
 		if proxy == nil || blockedNodes[name] || !proxy.AliveForTestUrl(s.testUrl) || (isUDP && !proxy.SupportUDP()) {
 			continue
 		}
+		checkNodeUsed[adapter.ProxyIdentity(proxy)] = true
 		w := 0.0
 		if weights != nil && i < len(weights) {
 			w = weights[i]
@@ -626,12 +648,12 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 		if hasPriority {
 			k.factor = s.getPriorityFactor(name)
 		}
-		allKeys[name] = k
+		allKeys[adapter.ProxyIdentity(p)] = k
 	}
 
 	defaultSort := func(proxies []C.Proxy) []C.Proxy {
 		sort.SliceStable(proxies, func(i, j int) bool {
-			ni, nj := proxies[i].Name(), proxies[j].Name()
+			ni, nj := adapter.ProxyIdentity(proxies[i]), adapter.ProxyIdentity(proxies[j])
 			ki, kj := allKeys[ni], allKeys[nj]
 			if hasPriority && ki.factor != kj.factor {
 				return ki.factor > kj.factor
@@ -660,7 +682,7 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 
 	for _, p := range all {
 		name := p.Name()
-		if checkNodeUsed[name] || wtFailNodes[name] != 0 {
+		if checkNodeUsed[adapter.ProxyIdentity(p)] || wtFailNodes[name] != 0 {
 			continue
 		}
 		if blockedNodes[name] {
@@ -791,10 +813,7 @@ func (s *Smart) selectProxies(metadata *C.Metadata, proxies []C.Proxy) ([]C.Prox
 			return
 		}
 		allProxies := s.GetProxies(true)
-		proxyByName := make(map[string]C.Proxy, len(allProxies))
-		for _, p := range allProxies {
-			proxyByName[p.Name()] = p
-		}
+		proxyByName := uniqueProxiesByName(allProxies)
 		resultProxies := make([]C.Proxy, 0, len(names))
 		for _, name := range names {
 			if p, ok := proxyByName[name]; ok {
@@ -1802,10 +1821,7 @@ func (s *Smart) closeSameConnection(metadata *C.Metadata, proxyName, target, asn
 
 func (s *Smart) checkHostStatus() {
 	proxies := s.GetProxies(false)
-	proxyMap := make(map[string]C.Proxy, len(proxies))
-	for _, p := range proxies {
-		proxyMap[p.Name()] = p
-	}
+	proxyMap := uniqueProxiesByName(proxies)
 
 	toCheck, err := s.store.CheckHostStatus(s.Name(), s.configName, s.hostFailLimit)
 	if err != nil {

@@ -2,6 +2,7 @@ package statistic
 
 import (
 	"errors"
+	"fmt"
 	"net"
 	"sync/atomic"
 	"testing"
@@ -11,6 +12,8 @@ import (
 	"github.com/metacubex/mihomo/component/health"
 	C "github.com/metacubex/mihomo/constant"
 )
+
+var trackerTestSequence atomic.Uint64
 
 type trackerTestNetConn struct{}
 
@@ -38,6 +41,10 @@ func newTrackerTestConn(name string, closeErr error) *trackerTestConn {
 	}
 }
 
+func uniqueTrackerTestName(t *testing.T) string {
+	return fmt.Sprintf("%s-%d", t.Name(), trackerTestSequence.Add(1))
+}
+
 func (c *trackerTestConn) Close() error {
 	c.closeCalls.Add(1)
 	return c.closeErr
@@ -49,7 +56,7 @@ func (c *trackerTestConn) AppendToChains(C.ProxyAdapter) {}
 func (c *trackerTestConn) RemoteDestination() string     { return "example.com:443" }
 
 func TestTCPTrackerStallIgnoresInitialUpload(t *testing.T) {
-	name := t.Name()
+	name := uniqueTrackerTestName(t)
 	manager := &Manager{}
 	conn := newTrackerTestConn(name, nil)
 	tracker := NewTCPTracker(conn, manager, &C.Metadata{}, nil, 128, 0, false)
@@ -57,13 +64,13 @@ func TestTCPTrackerStallIgnoresInitialUpload(t *testing.T) {
 	if err := tracker.Close(); err != nil {
 		t.Fatalf("close tracker: %v", err)
 	}
-	if got := health.Incidents(name); got != 0 {
+	if got := health.Incidents(health.ProxyKey(name, "")); got != 0 {
 		t.Fatalf("initial peek upload must not count as a stall, got %d incidents", got)
 	}
 }
 
 func TestTCPTrackerCloseReportsStallOnce(t *testing.T) {
-	name := t.Name()
+	name := uniqueTrackerTestName(t)
 	manager := &Manager{}
 	closeErr := errors.New("close failed")
 	conn := newTrackerTestConn(name, closeErr)
@@ -81,7 +88,7 @@ func TestTCPTrackerCloseReportsStallOnce(t *testing.T) {
 	if got := conn.closeCalls.Load(); got != 1 {
 		t.Fatalf("underlying connection closed %d times, want 1", got)
 	}
-	if got := health.Incidents(name); got != 1 {
+	if got := health.Incidents(health.ProxyKey(name, "")); got != 1 {
 		t.Fatalf("stall recorded %d times, want 1", got)
 	}
 	if got := manager.Get(tracker.ID()); got != nil {
