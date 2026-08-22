@@ -101,21 +101,24 @@ func (t *udpClientTable) cachedPacketState(
 	client netip.AddrPort,
 	redirectAddress netip.Addr,
 ) (udpOriginalDestination, bool, bool) {
-	clientState, loaded := t.load(client)
+	t.access.RLock()
+	defer t.access.RUnlock()
+	clientState, loaded := t.clients[client]
 	if !loaded {
 		return udpOriginalDestination{}, false, false
 	}
-	clientState.access.RLock()
+	clientState.access.Lock()
 	original, loaded := clientState.originals[redirectAddress]
 	if !loaded {
-		clientState.access.RUnlock()
+		clientState.access.Unlock()
 		return udpOriginalDestination{}, false, false
 	}
 	binding, bindingLoaded := clientState.bindings[original.original.Destination]
 	bindingReady := bindingLoaded &&
 		binding.address == redirectAddress &&
 		binding.connected == original.original.ConnectedUDP
-	clientState.access.RUnlock()
+	clientState.lastActive = time.Now()
+	clientState.access.Unlock()
 	return original, bindingReady, true
 }
 

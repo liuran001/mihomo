@@ -27,6 +27,11 @@ import (
 	"github.com/metacubex/sing/common/network"
 )
 
+// minimumUDPTimeout bounds udp-timeout from below. The periodic sweeper derives
+// its tick interval and the map stale-age from this value, so a near-zero
+// timeout would evict live sessions on every tick.
+const minimumUDPTimeout = 5 * time.Second
+
 // Listener is the eBPF inbound listener.
 type Listener interface {
 	Close() error
@@ -172,10 +177,7 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 	if err = validateSharedNetworkProtocols(sharedNetworkEnabled, enableUDP, dnsMode); err != nil {
 		return nil, err
 	}
-	udpTimeout := time.Duration(options.UDPTimeout)
-	if udpTimeout == 0 {
-		udpTimeout = 5 * time.Minute
-	}
+	udpTimeout := resolveUDPTimeout(options.UDPTimeout)
 	bypassPrivateAddress := options.BypassPrivateAddress == nil || *options.BypassPrivateAddress
 
 	inboundListener := &Inbound{
@@ -468,6 +470,25 @@ func (i *Inbound) stopUDPPeriodic() {
 	i.udpPeriodicStop = nil
 }
 
+// resolveUDPTimeout converts the configured udp-timeout, which is expressed in
+// SECONDS exactly like listener/sing_tun does, into a duration.
+//
+// Reading the value as a raw time.Duration would interpret it as nanoseconds:
+// `udp-timeout: 300` became 300ns, which made every sweep tick consider every
+// client idle and tear down live UDP sessions (and their eBPF redirects) a few
+// seconds after they were established. The floor keeps a hand-written tiny
+// value from degenerating the sweeper the same way.
+func resolveUDPTimeout(configured int64) time.Duration {
+	if configured <= 0 {
+		return 5 * time.Minute
+	}
+	timeout := time.Second * time.Duration(configured)
+	if timeout < minimumUDPTimeout {
+		return minimumUDPTimeout
+	}
+	return timeout
+}
+
 func (i *Inbound) udpPeriodicLoop(stop <-chan struct{}, done chan<- struct{}) {
 	defer close(done)
 	interval := i.udpTimeout / 2
@@ -500,6 +521,11 @@ func (i *Inbound) udpPeriodicLoop(stop <-chan struct{}, done chan<- struct{}) {
 					i.udpWarnings.cleanup.warn(i.logWarn, "sweep stale TCP redirects: ", sweepErr)
 				} else if result.Removed > 0 {
 					log.Debugln("[EBPF] swept %d stale TCP redirects", result.Removed)
+				}
+				if result, sweepErr := backend.SweepStaleUDPRedirects(maxAge, 1024); sweepErr != nil {
+					i.udpWarnings.cleanup.warn(i.logWarn, "sweep stale UDP redirects: ", sweepErr)
+				} else if result.Removed > 0 {
+					log.Debugln("[EBPF] swept %d stale UDP redirects", result.Removed)
 				}
 			}
 		case <-bypassTicker.C:
