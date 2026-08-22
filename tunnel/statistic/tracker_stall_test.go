@@ -28,9 +28,10 @@ func (trackerTestNetConn) SetWriteDeadline(time.Time) error { return nil }
 
 type trackerTestConn struct {
 	N.ExtendedConn
-	chain      C.Chain
-	closeErr   error
-	closeCalls atomic.Int32
+	chain         C.Chain
+	providerChain C.Chain
+	closeErr      error
+	closeCalls    atomic.Int32
 }
 
 func newTrackerTestConn(name string, closeErr error) *trackerTestConn {
@@ -51,7 +52,7 @@ func (c *trackerTestConn) Close() error {
 }
 
 func (c *trackerTestConn) Chains() C.Chain               { return c.chain }
-func (c *trackerTestConn) ProviderChains() C.Chain       { return nil }
+func (c *trackerTestConn) ProviderChains() C.Chain       { return c.providerChain }
 func (c *trackerTestConn) AppendToChains(C.ProxyAdapter) {}
 func (c *trackerTestConn) RemoteDestination() string     { return "example.com:443" }
 
@@ -93,5 +94,39 @@ func TestTCPTrackerCloseReportsStallOnce(t *testing.T) {
 	}
 	if got := manager.Get(tracker.ID()); got != nil {
 		t.Fatal("closed tracker remained registered with manager")
+	}
+}
+
+// 一条连接的 Chain 是从叶子节点向外展开的：Chain[0] 是真正承载流量的节点，
+// 后面依次是包住它的各层 group。url-test 查惩罚时用的是它自己直接成员的名字，
+// 对嵌套 group 来说那是子 group 而不是叶子节点 —— 只把事故记在 Chain[0] 上，
+// 外层 group 就永远看不见它下面的节点在黑洞流量。
+func TestTCPTrackerStallReachesEveryChainHop(t *testing.T) {
+	leaf := uniqueTrackerTestName(t)
+	inner := leaf + "-inner-group"
+	outer := leaf + "-outer-group"
+
+	manager := &Manager{}
+	conn := newTrackerTestConn(leaf, nil)
+	conn.chain = C.Chain{leaf, inner, outer}
+	conn.providerChain = C.Chain{"leaf-provider", "", ""}
+
+	tracker := NewTCPTracker(conn, manager, &C.Metadata{}, nil, 128, 0, false)
+	if _, err := tracker.Write([]byte("payload after peek")); err != nil {
+		t.Fatalf("write tracker: %v", err)
+	}
+	if err := tracker.Close(); err != nil {
+		t.Fatalf("close tracker: %v", err)
+	}
+
+	for index, name := range conn.chain {
+		provider := conn.providerChain[index]
+		if got := health.Incidents(health.ProxyKey(name, provider)); got != 1 {
+			t.Errorf("链路第 %d 跳 %q 记录了 %d 次事故，期望 1 次", index, name, got)
+		}
+	}
+	// 叶子节点的 provider 必须参与构键，否则同名不同机场的节点会互相污染。
+	if got := health.Incidents(health.ProxyKey(leaf, "")); got != 0 {
+		t.Errorf("叶子节点的事故被记到了空 provider 上：%d", got)
 	}
 }

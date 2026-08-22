@@ -171,11 +171,19 @@ func (tt *tcpTracker) reportStall() {
 	if time.Since(tt.Start) > stallWindow {
 		return
 	}
-	provider := ""
-	if len(tt.ProviderChain) > 0 {
-		provider = tt.ProviderChain[0]
+	// Record against every hop, not just the leaf. A url-test group looks the
+	// penalty up by the name of its own direct member, which for a nested
+	// group is the sub-group rather than the node that actually stalled, so
+	// attributing the incident only to Chain[0] left every enclosing group
+	// blind to it. AppendToChains fills Chain and ProviderChain in lockstep,
+	// so the two are index-aligned.
+	for index, name := range tt.Chain {
+		provider := ""
+		if index < len(tt.ProviderChain) {
+			provider = tt.ProviderChain[index]
+		}
+		health.RecordStall(health.ProxyKey(name, provider))
 	}
-	health.RecordStall(health.ProxyKey(tt.Chain[0], provider))
 }
 
 func (tt *tcpTracker) Upstream() any {
