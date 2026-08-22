@@ -220,6 +220,13 @@ INLINE __u32 mix32(__u32 value) {
     return value ^ (value >> 16);
 }
 
+// token_v4/token_v6 unroll their attempt loop by hand because the Linux 4.19
+// verifier rejects the looped form. The macro is what documents the retry
+// count, so keep the two in lockstep: without this assertion, changing
+// REDIRECT_TOKEN_ATTEMPTS would silently have no effect at all.
+_Static_assert(REDIRECT_TOKEN_ATTEMPTS == 4U,
+    "token_v4/token_v6 unroll four attempts; update both together");
+
 INLINE bool token_v4_attempt(
     const struct sb_ebpf_cgroup_control *config,
     struct sb_ebpf_listener_key *key,

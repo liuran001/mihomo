@@ -6,7 +6,7 @@ bpf2go: v0.22.1-0.20260724091036-00feb08ae4e5
 clang: Android (13989888, +pgo, +bolt, +lto, +mlgo, based on r563880c) clang version 21.0.0 (https://android.googlesource.com/toolchain/llvm-project 5e96669f06077099aa41290cdb4c5e6fa0f59349)
 b7f02dd9edf33019c851fd65ad09402e91e6422a17400493922a185f738b9de6  native/abi.h
 9eff464b63eb7eb2324e3f75d9c1d5c8d8021bd9865a7a703e3475ace9fa48f0  native/bpf_compat.h
-7ba8ddad98d8aaea4519dee0223a3680a2203480954db5ea95de8b63ec9fa91e  native/cgroup.bpf.c
+99fc41d6c3dcb1b7675bcc10466417eeb589fb22a6bd772ccf5d66fb644b786e  native/cgroup.bpf.c
 6056c5f34750f2d6d85ae1da2bfd96861c10c84558924723d0153627592f4ed7  native/private_address.h
 d0e3674020ab21e3e27de0468110519f2ae4a9b4ae1f50e8a8d984cd8d927605  native/shared_network.bpf.c
 ca5f4df84aa56f645cfb036a6eae6cb6b6d78bec731449df69a66315974d36bc  native/shared_network.h
