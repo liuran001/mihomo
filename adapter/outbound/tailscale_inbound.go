@@ -11,6 +11,7 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 
+	"github.com/metacubex/tailscale/tsnet"
 	"github.com/metacubex/tailscale/types/nettype"
 )
 
@@ -22,9 +23,12 @@ const tailscaleInboundUDPBufferSize = 65535
 // router / exit node) is dispatched through mihomo's rule engine. Flows whose
 // destination is one of this node's Tailscale IPs are left to tsnet's default
 // behavior (explicit listeners / reject).
-func (t *Tailscale) registerInboundHandlers(tunnel C.Tunnel) {
-	t.server.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (func(net.Conn), bool) {
-		if t.isSelfTailscaleAddr(dst.Addr()) || !t.isAdvertisedRoute(dst.Addr()) {
+func (t *Tailscale) registerInboundHandlers(server *tsnet.Server, tunnel C.Tunnel) {
+	if server == nil {
+		return
+	}
+	server.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (func(net.Conn), bool) {
+		if isSelfTailscaleAddr(server, dst.Addr()) || !t.isAdvertisedRoute(dst.Addr()) {
 			return nil, false
 		}
 		return func(conn net.Conn) {
@@ -39,8 +43,8 @@ func (t *Tailscale) registerInboundHandlers(tunnel C.Tunnel) {
 			tunnel.HandleTCPConn(conn, metadata)
 		}, true
 	})
-	t.server.RegisterFallbackUDPHandler(func(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
-		if t.isSelfTailscaleAddr(dst.Addr()) || !t.isAdvertisedRoute(dst.Addr()) {
+	server.RegisterFallbackUDPHandler(func(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
+		if isSelfTailscaleAddr(server, dst.Addr()) || !t.isAdvertisedRoute(dst.Addr()) {
 			return nil, false
 		}
 		return func(conn nettype.ConnPacketConn) {
@@ -83,10 +87,21 @@ func (t *Tailscale) releaseUDPFlow() {
 	}
 }
 
-func (t *Tailscale) isSelfTailscaleAddr(addr netip.Addr) bool {
-	v4, v6 := t.server.TailscaleIPs()
+func isSelfTailscaleAddr(server *tsnet.Server, addr netip.Addr) bool {
+	if server == nil {
+		return false
+	}
+	v4, v6 := server.TailscaleIPs()
 	addr = addr.Unmap()
 	return addr == v4 || addr == v6
+}
+
+func (t *Tailscale) isSelfTailscaleAddr(addr netip.Addr) bool {
+	server, err := t.snapshotServer()
+	if err != nil {
+		return false
+	}
+	return isSelfTailscaleAddr(server, addr)
 }
 
 func (t *Tailscale) handleInboundUDPFlow(tunnel C.Tunnel, conn nettype.ConnPacketConn, src, dst netip.AddrPort) {
