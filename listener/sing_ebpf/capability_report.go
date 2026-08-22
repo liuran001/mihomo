@@ -47,7 +47,11 @@ func reportKernelCapabilities(mode ECommon.KernelProbeMode, network []string, cg
 			log.Debugln("[EBPF] kernel %s provides every probed capability", report.KernelRelease)
 			return
 		}
-		log.Warnln("[EBPF] kernel %s lacks %d optional capability(ies); the inbound works but reclaims state more slowly:\n  - %s",
+		// Do not summarise what the shortfall costs: the findings differ in kind.
+		// A missing inet_sock_release slows reclamation, while a missing
+		// bpf_get_current_pid_tgid changes how the inbound recognises its own
+		// sockets. Each finding carries its own consequence; print those.
+		log.Warnln("[EBPF] kernel %s lacks %d optional capability(ies); the inbound is running on the fallback path for each:\n  - %s",
 			report.KernelRelease, len(degraded), strings.Join(degraded, "\n  - "))
 	}()
 }
