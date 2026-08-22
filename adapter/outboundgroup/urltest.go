@@ -4,8 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"github.com/metacubex/mihomo/component/health"
 	"time"
+
+	"github.com/metacubex/mihomo/adapter"
+	"github.com/metacubex/mihomo/component/health"
 
 	"github.com/metacubex/mihomo/common/callback"
 	N "github.com/metacubex/mihomo/common/net"
@@ -101,12 +103,16 @@ func (u *URLTest) healthCheck() {
 	u.fastSingle.Reset()
 }
 
-// rankDelay is the latency used for ranking: the measured delay plus, when
-// penalize-unstable is on, a penalty derived from recently stalled
+// rankDelay is the latency used for ranking: the measured delay, plus a
+// penalty for capability preferences the node does not meet, plus — when
+// penalize-unstable is on — a penalty derived from recently stalled
 // connections through that proxy. A node that passes latency probes but
-// black-holes real traffic therefore stops winning the comparison.
+// black-holes real traffic therefore stops winning the comparison, and a node
+// missing a preferred capability sinks in the ordering while staying
+// selectable as a last resort.
 func (u *URLTest) rankDelay(proxy C.Proxy) uint16 {
-	delay := proxy.LastDelayForTestUrl(u.testUrl)
+	delay := adapter.AddCapabilityPenalty(
+		proxy.LastDelayForTestUrl(u.testUrl), proxy, u.preferUDP, u.preferIPv6)
 	if !u.penalizeUnstable {
 		return delay
 	}

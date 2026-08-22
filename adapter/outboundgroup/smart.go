@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/dlclark/regexp2"
+	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/common/callback"
 	N "github.com/metacubex/mihomo/common/net"
@@ -614,7 +615,14 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 	allKeys := make(map[string]sortKey, len(all))
 	for i, p := range all {
 		name := p.Name()
-		k := sortKey{delay: p.LastDelayForTestUrl(s.testUrl), index: i}
+		// Capability preferences demote a node here rather than removing it
+		// from the pool, so a failed UDP / IPv6 probe costs a node its rank
+		// but never its availability.
+		k := sortKey{
+			delay: adapter.AddCapabilityPenalty(
+				p.LastDelayForTestUrl(s.testUrl), p, s.preferUDP, s.preferIPv6),
+			index: i,
+		}
 		if hasPriority {
 			k.factor = s.getPriorityFactor(name)
 		}
@@ -1960,8 +1968,8 @@ func applyPolicyPriority(s *Smart, policyPriority string) {
 			log.Warnln("[Smart] Invalid priority factor format for pattern [%s:%v]", patternRaw, err)
 			continue
 		}
-		if factor <= 0 {
-			log.Warnln("[Smart] Invalid priority factor [%.2f] for pattern [%s], factor must be positive", factor, patternRaw)
+		if factor <= 0 || math.IsNaN(factor) || math.IsInf(factor, 0) {
+			log.Warnln("[Smart] Invalid priority factor [%v] for pattern [%s], factor must be finite and positive", factor, patternRaw)
 			continue
 		}
 

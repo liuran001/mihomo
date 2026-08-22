@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"github.com/metacubex/mihomo/adapter"
 	"strings"
 	"sync"
 	"time"
@@ -144,7 +143,7 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 
 	// return the cached proxies if version not changed
 	if slices.Equal(providerVersions, gb.providerVersions) {
-		return adapter.FilterProxiesByCapability(gb.providerProxies, gb.preferUDP, gb.preferIPv6)
+		return gb.providerProxies
 	}
 
 	var proxies []C.Proxy
@@ -241,7 +240,11 @@ func (gb *GroupBase) GetProxies(touch bool) []C.Proxy {
 	gb.providerVersions = providerVersions
 	gb.providerProxies = proxies
 
-	return adapter.FilterProxiesByCapability(proxies, gb.preferUDP, gb.preferIPv6)
+	// Capability preferences are applied by the ranking groups (see
+	// adapter.CapabilityPenalty), not here. Narrowing the pool at this layer
+	// removed nodes from every consumer at once — including DIRECT out of a
+	// select group, which silently redirected direct traffic through a proxy.
+	return proxies
 }
 
 func (gb *GroupBase) URLTest(ctx context.Context, url string, expectedStatus utils.IntRanges[uint16]) (map[string]uint16, error) {

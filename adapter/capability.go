@@ -1,9 +1,11 @@
 package adapter
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/binary"
+	"fmt"
 	"net"
 	"net/netip"
 	"sync"
@@ -16,7 +18,7 @@ import (
 
 // Capability probing lets proxy groups filter nodes by measured abilities
 // (require-udp / require-ipv6) instead of name patterns. Results are cached
-// globally by proxy name with a TTL; unknown nodes stay selectable until a
+// globally by proxy identity with a TTL; unknown nodes stay selectable until a
 // probe proves the capability missing, so groups never go dark while probes
 // are still running.
 
@@ -52,7 +54,7 @@ type capabilityState struct {
 }
 
 var (
-	capabilityCache sync.Map // proxy name -> *capabilityState
+	capabilityCache sync.Map // proxy identity -> *capabilityState
 	// limit concurrent probes so a large provider doesn't stampede
 	capabilityProbeSem = make(chan struct{}, 8)
 )
@@ -63,6 +65,18 @@ func capabilityStateFor(name string) *capabilityState {
 	}
 	v, _ := capabilityCache.LoadOrStore(name, &capabilityState{})
 	return v.(*capabilityState)
+}
+
+// capabilityStateForProxy separates entries for same-named proxies coming
+// from different adapter types or providers. Provider refreshes commonly
+// reuse names, so the name alone is not a stable identity.
+func capabilityStateForProxy(p C.Proxy) *capabilityState {
+	return capabilityStateFor(capabilityCacheKey(p))
+}
+
+func capabilityCacheKey(p C.Proxy) string {
+	info := p.ProxyInfo()
+	return fmt.Sprintf("%s|%s|%s|%s", p.Name(), p.Type().String(), info.ProviderName, p.Addr())
 }
 
 // Capability verdicts. Unknown is a distinct state: it means no probe has
@@ -100,9 +114,17 @@ func (s *capabilityState) stateOrProbe(p C.Proxy, kind capabilityKind) int {
 }
 
 func probeCapability(p C.Proxy, kind capabilityKind, entry *capabilityEntry) {
-	capabilityProbeSem <- struct{}{}
-	defer func() { <-capabilityProbeSem }()
-
+	// Do not queue one blocked goroutine per provider node. A later call will
+	// retry after capacity is available, while this probe remains unknown.
+	select {
+	case capabilityProbeSem <- struct{}{}:
+		defer func() { <-capabilityProbeSem }()
+	default:
+		entry.mu.Lock()
+		entry.probing = false
+		entry.mu.Unlock()
+		return
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), capabilityProbeTimeout)
 	defer cancel()
 
@@ -111,8 +133,11 @@ func probeCapability(p C.Proxy, kind capabilityKind, entry *capabilityEntry) {
 	case capabilityUDP:
 		ok = probeUDP(ctx, p)
 	case capabilityIPv6:
-		_, err := p.URLTest(ctx, capabilityIPv6URL, nil)
-		ok = err == nil
+		// URLTest updates the proxy's global alive flag and delay history. A
+		// capability probe is auxiliary telemetry and must not make a proxy
+		// appear dead (or reset its health history), so use the non-mutating
+		// status probe instead.
+		_, ok, _ = p.StatusTest(ctx, capabilityIPv6URL)
 	}
 
 	ttl := capabilityOKTTL
@@ -166,7 +191,10 @@ func probeUDP(ctx context.Context, p C.Proxy) bool {
 	req := make([]byte, 20)
 	binary.BigEndian.PutUint16(req[0:2], 0x0001)
 	binary.BigEndian.PutUint32(req[4:8], 0x2112A442)
-	_, _ = rand.Read(req[8:20])
+	if _, err = rand.Read(req[8:20]); err != nil {
+		return false
+	}
+	txid := append([]byte(nil), req[8:20]...)
 
 	dst := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip.Unmap(), port))
 	deadline, _ := ctx.Deadline()
@@ -176,87 +204,96 @@ func probeUDP(ctx context.Context, p C.Proxy) bool {
 	}
 	buf := make([]byte, 512)
 	for {
-		n, _, err := pc.ReadFrom(buf)
+		n, src, err := pc.ReadFrom(buf)
 		if err != nil {
 			return false
 		}
-		if n >= 20 && binary.BigEndian.Uint32(buf[4:8]) == 0x2112A442 {
+		if validSTUNBindingSuccess(buf[:n], txid) && validSTUNSource(src, dst) {
 			return true
 		}
 	}
 }
 
-// tierOf scores a proxy against the preferences: higher is better. The score
-// encodes the degradation ladder — both capabilities confirmed, then UDP
-// confirmed, then still unprobed, then confirmed lacking.
-func tierOf(p C.Proxy, preferUDP, preferIPv6 bool) int {
-	state := capabilityStateFor(p.Name())
-	u, v := capUnknown, capUnknown
+func validSTUNSource(src net.Addr, expected *net.UDPAddr) bool {
+	got, ok := src.(*net.UDPAddr)
+	if !ok || expected == nil {
+		return false
+	}
+	return got.Port == expected.Port && got.IP.Equal(expected.IP)
+}
+
+func validSTUNBindingSuccess(message, txid []byte) bool {
+	if len(message) < 20 || len(txid) != 12 {
+		return false
+	}
+	if binary.BigEndian.Uint16(message[0:2]) != 0x0101 ||
+		int(binary.BigEndian.Uint16(message[2:4])) != len(message)-20 ||
+		binary.BigEndian.Uint32(message[4:8]) != 0x2112A442 ||
+		!bytes.Equal(message[8:20], txid) {
+		return false
+	}
+	return true
+}
+
+// Capability preferences only ever reorder a group, never shrink it. A node
+// that lacks a preferred capability gets extra latency added when ranking, so
+// it sinks below the nodes that have it while staying selectable as a last
+// resort. That matters because the probes are themselves unreliable — the
+// IPv6 probe target is reachable only when upstream IPv6 works — and a group
+// that hard-filtered on a failed probe would go dark for reasons that have
+// nothing to do with whether its nodes can carry traffic.
+const (
+	// capabilityMissingPenalty applies when a probe confirmed the capability
+	// is absent. Large enough to lose against any healthy node that has it,
+	// small enough that a fast node without it still beats a slow node with.
+	capabilityMissingPenalty = 600
+	// capabilityUnknownPenalty applies while a probe is still pending, so an
+	// unprobed node ranks just behind a confirmed one instead of being
+	// buried alongside confirmed failures.
+	capabilityUnknownPenalty = 50
+)
+
+// CapabilityPenalty returns extra latency in milliseconds to add when ranking
+// this proxy against a group's capability preferences, scheduling any probe
+// that is missing or stale. Groups apply it where they already rank by delay;
+// groups with an explicit user-chosen or configured order (select, fallback)
+// deliberately ignore it, since a probe result must not silently rewrite what
+// the user picked.
+func CapabilityPenalty(p C.Proxy, preferUDP, preferIPv6 bool) uint16 {
+	if p == nil || (!preferUDP && !preferIPv6) {
+		return 0
+	}
+	state := capabilityStateForProxy(p)
+	penalty := 0
 	if preferUDP {
-		u = state.stateOrProbe(p, capabilityUDP)
+		penalty += capabilityPenaltyFor(state.stateOrProbe(p, capabilityUDP))
 	}
 	if preferIPv6 {
-		v = state.stateOrProbe(p, capabilityIPv6)
+		penalty += capabilityPenaltyFor(state.stateOrProbe(p, capabilityIPv6))
 	}
-	switch {
-	case preferUDP && preferIPv6:
-		switch {
-		case u == capYes && v == capYes:
-			return 4 // UDP + IPv6 both confirmed
-		case u == capYes && v == capUnknown:
-			return 3 // UDP confirmed, IPv6 still unprobed
-		case u == capYes:
-			return 2 // UDP only (IPv6 confirmed missing)
-		case u == capUnknown:
-			return 1 // nothing confirmed yet
-		default:
-			return 0 // UDP confirmed missing
-		}
-	case preferUDP:
-		return map[int]int{capYes: 2, capUnknown: 1, capNo: 0}[u]
+	return uint16(penalty)
+}
+
+func capabilityPenaltyFor(verdict int) int {
+	switch verdict {
+	case capYes:
+		return 0
+	case capNo:
+		return capabilityMissingPenalty
 	default:
-		return map[int]int{capYes: 2, capUnknown: 1, capNo: 0}[v]
+		return capabilityUnknownPenalty
 	}
 }
 
-// minCandidates is the smallest candidate pool a group should end up with.
-// Sticking to a single top-tier node makes a group brittle — one bad node and
-// the group has nowhere to go until probes refresh — so lower tiers are
-// merged in until the pool is big enough.
-const minCandidates = 5
-
-// FilterProxiesByCapability reorders and narrows a group by measured
-// capability instead of hard-filtering. Nodes are ranked into tiers (both
-// capabilities confirmed, UDP confirmed, unprobed, confirmed lacking) and
-// tiers are merged from the top down until at least minCandidates nodes are
-// available, so a group never shrinks to a fragile handful — or to nothing —
-// just because few nodes qualify.
-func FilterProxiesByCapability(proxies []C.Proxy, preferUDP, preferIPv6 bool) []C.Proxy {
-	if !preferUDP && !preferIPv6 || len(proxies) <= minCandidates {
-		return proxies
+// AddCapabilityPenalty adds the capability penalty to a measured delay,
+// saturating instead of wrapping so a penalized node never sorts as fast.
+func AddCapabilityPenalty(delay uint16, p C.Proxy, preferUDP, preferIPv6 bool) uint16 {
+	penalty := CapabilityPenalty(p, preferUDP, preferIPv6)
+	if penalty == 0 {
+		return delay
 	}
-	var tiers [5][]C.Proxy
-	for _, p := range proxies {
-		t := tierOf(p, preferUDP, preferIPv6)
-		if t < 0 {
-			t = 0
-		} else if t >= len(tiers) {
-			t = len(tiers) - 1
-		}
-		tiers[t] = append(tiers[t], p)
+	if uint32(delay)+uint32(penalty) > 0xFFFF {
+		return 0xFFFF
 	}
-	out := make([]C.Proxy, 0, len(proxies))
-	for t := len(tiers) - 1; t >= 0; t-- {
-		if len(tiers[t]) == 0 {
-			continue
-		}
-		out = append(out, tiers[t]...)
-		if len(out) >= minCandidates {
-			break
-		}
-	}
-	if len(out) == 0 {
-		return proxies
-	}
-	return out
+	return delay + penalty
 }

@@ -9,6 +9,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/adapter"
 	"github.com/metacubex/mihomo/common/callback"
 	"github.com/metacubex/mihomo/common/lru"
 	N "github.com/metacubex/mihomo/common/net"
@@ -68,18 +69,6 @@ func getKeyWithSrcAndDst(metadata *C.Metadata) string {
 	return fmt.Sprintf("%s%s", src, dst)
 }
 
-func jumpHash(key uint64, buckets int32) int32 {
-	var b, j int64
-
-	for j < int64(buckets) {
-		b = j
-		key = key*2862933555777941757 + 1
-		j = int64(float64(b+1) * (float64(int64(1)<<31) / float64((key>>33)+1)))
-	}
-
-	return int32(b)
-}
-
 // DialContext implements C.ProxyAdapter
 func (lb *LoadBalance) DialContext(ctx context.Context, metadata *C.Metadata) (c C.Conn, err error) {
 	proxy := lb.Unwrap(metadata, true)
@@ -126,28 +115,36 @@ func (lb *LoadBalance) IsL3Protocol(metadata *C.Metadata) bool {
 	return lb.Unwrap(metadata, false).IsL3Protocol(metadata)
 }
 
-func strategyRoundRobin(url string) strategyFn {
+func strategyRoundRobin(url string, preferUDP, preferIPv6 bool) strategyFn {
 	idx := 0
 	idxMutex := sync.Mutex{}
+	prefers := preferUDP || preferIPv6
 	return func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
 		idxMutex.Lock()
 		defer idxMutex.Unlock()
 
-		i := 0
 		length := len(proxies)
 
-		if touch {
-			defer func() {
-				idx = (idx + i) % length
-			}()
-		}
-
-		for ; i < length; i++ {
-			id := (idx + i) % length
-			proxy := proxies[id]
-			if proxy.AliveForTestUrl(url) {
-				i++
+		// Two passes: rotate among the nodes that meet the capability
+		// preferences first, and only fall through to penalized ones when none
+		// of them is alive. A node that failed a probe loses its turn in the
+		// preferred rotation but stays in the group.
+		for _, preferredOnly := range [2]bool{true, false} {
+			for i := 0; i < length; i++ {
+				proxy := proxies[(idx+i)%length]
+				if !proxy.AliveForTestUrl(url) {
+					continue
+				}
+				if preferredOnly && adapter.CapabilityPenalty(proxy, preferUDP, preferIPv6) != 0 {
+					continue
+				}
+				if touch {
+					idx = (idx + i + 1) % length
+				}
 				return proxy
+			}
+			if !prefers {
+				break // the second pass would repeat the first
 			}
 		}
 
@@ -155,60 +152,84 @@ func strategyRoundRobin(url string) strategyFn {
 	}
 }
 
-func strategyConsistentHashing(url string) strategyFn {
-	maxRetry := 5
+func strategyConsistentHashing(url string, preferUDP, preferIPv6 bool) strategyFn {
 	return func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
 		key := utils.MapHash(getKey(metadata))
-		buckets := int32(len(proxies))
-		for i := 0; i < maxRetry; i, key = i+1, key+1 {
-			idx := jumpHash(key, buckets)
-			proxy := proxies[idx]
-			if proxy.AliveForTestUrl(url) {
-				return proxy
-			}
-		}
-
-		// when availability is poor, traverse the entire list to get the available nodes
+		var best, bestAlive C.Proxy
+		var bestScore, bestAliveScore uint64
+		var bestAlivePenalty uint16
 		for _, proxy := range proxies {
-			if proxy.AliveForTestUrl(url) {
-				return proxy
+			score := rendezvousScore(key, proxyIdentity(proxy))
+			if best == nil || score > bestScore {
+				best, bestScore = proxy, score
+			}
+			if !proxy.AliveForTestUrl(url) {
+				continue
+			}
+			// Rank by capability penalty first, then by rendezvous score, so
+			// preferences pick the bucket and hashing stays stable within it.
+			penalty := adapter.CapabilityPenalty(proxy, preferUDP, preferIPv6)
+			if bestAlive == nil || penalty < bestAlivePenalty ||
+				(penalty == bestAlivePenalty && score > bestAliveScore) {
+				bestAlive, bestAliveScore, bestAlivePenalty = proxy, score, penalty
 			}
 		}
-
-		return proxies[0]
+		if bestAlive != nil {
+			return bestAlive
+		}
+		return best
 	}
 }
 
-func strategyStickySessions(url string) strategyFn {
+func rendezvousScore(key uint64, name string) uint64 {
+	return utils.MapHash(fmt.Sprintf("%016x:%s", key, name))
+}
+
+func proxyIdentity(proxy C.Proxy) string {
+	if proxy == nil {
+		return ""
+	}
+	info := proxy.ProxyInfo()
+	return fmt.Sprintf("%s|%s|%s|%s", proxy.Name(), proxy.Type().String(), info.ProviderName, proxy.Addr())
+}
+
+func strategyStickySessions(url string, preferUDP, preferIPv6 bool) strategyFn {
 	ttl := time.Minute * 10
-	maxRetry := 5
-	lruCache := lru.New[uint64, int](
-		lru.WithAge[uint64, int](int64(ttl.Seconds())),
-		lru.WithSize[uint64, int](1000))
+	lruCache := lru.New[uint64, string](
+		lru.WithAge[uint64, string](int64(ttl.Seconds())),
+		lru.WithSize[uint64, string](1000))
 	return func(proxies []C.Proxy, metadata *C.Metadata, touch bool) C.Proxy {
 		key := utils.MapHash(getKeyWithSrcAndDst(metadata))
-		length := len(proxies)
-		idx, has := lruCache.Get(key)
-		if !has || idx >= length {
-			idx = int(jumpHash(key+uint64(time.Now().UnixNano()), int32(length)))
-		}
-
-		nowIdx := idx
-		for i := 1; i < maxRetry; i++ {
-			proxy := proxies[nowIdx]
-			if proxy.AliveForTestUrl(url) {
-				if !has || nowIdx != idx {
-					lruCache.Set(key, nowIdx)
+		if identity, has := lruCache.Get(key); has {
+			for _, proxy := range proxies {
+				if proxyIdentity(proxy) == identity && proxy.AliveForTestUrl(url) {
+					return proxy
 				}
-
-				return proxy
-			} else {
-				nowIdx = int(jumpHash(key+uint64(time.Now().UnixNano()), int32(length)))
 			}
 		}
 
-		lruCache.Set(key, 0)
-		return proxies[0]
+		var best, bestAlive C.Proxy
+		var bestScore, bestAliveScore uint64
+		var bestAlivePenalty uint16
+		for _, proxy := range proxies {
+			score := rendezvousScore(key, proxyIdentity(proxy))
+			if best == nil || score > bestScore {
+				best, bestScore = proxy, score
+			}
+			if !proxy.AliveForTestUrl(url) {
+				continue
+			}
+			penalty := adapter.CapabilityPenalty(proxy, preferUDP, preferIPv6)
+			if bestAlive == nil || penalty < bestAlivePenalty ||
+				(penalty == bestAlivePenalty && score > bestAliveScore) {
+				bestAlive, bestAliveScore, bestAlivePenalty = proxy, score, penalty
+			}
+		}
+		if bestAlive != nil {
+			lruCache.Set(key, proxyIdentity(bestAlive))
+			return bestAlive
+		}
+		return best
 	}
 }
 
@@ -251,11 +272,11 @@ func NewLoadBalance(option GroupCommonOption, loadBalanceOption LoadBalanceOptio
 	var strategyFn strategyFn
 	switch loadBalanceOption.Strategy {
 	case "", "consistent-hashing":
-		strategyFn = strategyConsistentHashing(option.URL)
+		strategyFn = strategyConsistentHashing(option.URL, option.PreferUDP, option.PreferIPv6)
 	case "round-robin":
-		strategyFn = strategyRoundRobin(option.URL)
+		strategyFn = strategyRoundRobin(option.URL, option.PreferUDP, option.PreferIPv6)
 	case "sticky-sessions":
-		strategyFn = strategyStickySessions(option.URL)
+		strategyFn = strategyStickySessions(option.URL, option.PreferUDP, option.PreferIPv6)
 	default:
 		return nil, fmt.Errorf("%w: %s", errStrategy, loadBalanceOption.Strategy)
 	}
