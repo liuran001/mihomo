@@ -46,8 +46,9 @@ func (b *CgroupBackend) RuntimeStatus() CgroupRuntimeStatus {
 		return CgroupRuntimeStatus{}
 	}
 	status := CgroupRuntimeStatus{
-		UDPCleanupMode: cgroupUDPCleanupModeLocked(b.runtime),
-		Maps:           b.statusCollector.collect(b.runtime.maps),
+		UDPCleanupMode:            cgroupUDPCleanupModeLocked(b.runtime),
+		UDPRecoveryUpdateFailures: b.udpRecoveryUpdateFailures.Load(),
+		Maps:                      b.statusCollector.collect(b.runtime.maps),
 	}
 	var statsErr error
 	status.TCPRedirectReservationFailures, statsErr = b.redirectReservationFailuresLocked(ProtocolTCP)

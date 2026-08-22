@@ -48,6 +48,7 @@ type CgroupRuntimeStatus struct {
 	UDPCleanupMode                 string                 `json:"udp_cleanup_mode"`
 	TCPRedirectReservationFailures uint64                 `json:"tcp_redirect_reservation_failures"`
 	UDPRedirectReservationFailures uint64                 `json:"udp_redirect_reservation_failures"`
+	UDPRecoveryUpdateFailures      uint64                 `json:"udp_recovery_update_failures"`
 	StatsError                     string                 `json:"stats_error,omitempty"`
 	Maps                           []RuntimeMapStatus     `json:"maps"`
 	Programs                       []RuntimeProgramStatus `json:"programs"`

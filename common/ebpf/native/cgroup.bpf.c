@@ -764,9 +764,10 @@ INLINE int release_socket(struct bpf_sock *ctx, bool delete_bypass) {
     struct sb_ebpf_listener_key *listener = map_lookup(&cgroup_udp_token, &cookie);
     if (listener != 0) {
         struct sb_ebpf_original_dst *original = map_lookup(&cgroup_udp_redirect, listener);
-        if (original != 0) map_update(&cgroup_udp_recovery, listener, original, 0U);
-        map_delete(&cgroup_udp_redirect, listener);
-        map_delete(&cgroup_udp_token, &cookie);
+        if (original == 0 || map_update(&cgroup_udp_recovery, listener, original, 0U) == 0) {
+            map_delete(&cgroup_udp_redirect, listener);
+            map_delete(&cgroup_udp_token, &cookie);
+        }
     }
     map_delete(&cgroup_udp_peer, &(__u64){cookie});
     if (delete_bypass) map_delete(&cgroup_socket_bypass, &cookie);

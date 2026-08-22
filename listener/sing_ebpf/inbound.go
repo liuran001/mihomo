@@ -491,6 +491,17 @@ func (i *Inbound) udpPeriodicLoop(stop <-chan struct{}, done chan<- struct{}) {
 					i.deleteUDPRedirects([]netip.Addr{release.reference.address})
 				}
 			})
+			if backend := i.backendInstance(); backend != nil && !backend.IsClosed() {
+				maxAge := 2 * i.udpTimeout
+				if maxAge < 30*time.Second {
+					maxAge = 30 * time.Second
+				}
+				if result, sweepErr := backend.SweepStaleTCPRedirects(maxAge, 1024); sweepErr != nil {
+					i.udpWarnings.cleanup.warn(i.logWarn, "sweep stale TCP redirects: ", sweepErr)
+				} else if result.Removed > 0 {
+					log.Debugln("[EBPF] swept %d stale TCP redirects", result.Removed)
+				}
+			}
 		case <-bypassTicker.C:
 			i.refreshBypassCIDRPeriodic()
 		}

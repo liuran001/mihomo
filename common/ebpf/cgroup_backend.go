@@ -100,6 +100,7 @@ type CgroupBackend struct {
 	tcpRedirectUsageKnown          atomic.Bool
 	lookupAndDeleteMode            atomic.Int32
 	udpRecoveryConsumeMode         atomic.Int32
+	udpRecoveryUpdateFailures      atomic.Uint64
 	statusCollector                runtimeStatusCollector
 	selfBypassTGID                 atomic.Bool
 	runtime                        *cgroupRuntime

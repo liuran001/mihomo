@@ -14,7 +14,7 @@ import (
 )
 
 type sharedNetworkTCXLink struct {
-	link      link.Link
+	link      interface{ Close() error }
 	linkID    link.ID
 	programID CiliumEBPF.ProgramID
 	attach    CiliumEBPF.AttachType
@@ -25,6 +25,7 @@ type SharedNetworkTCXAttachment struct {
 	interfaceIndex int
 	ingress        sharedNetworkTCXLink
 	egress         sharedNetworkTCXLink
+	pendingCleanup []sharedNetworkTCXLink
 }
 
 type RuntimeTCXLinkStatus struct {
@@ -117,6 +118,9 @@ func (b *SharedNetworkBackend) RepairTCX(
 	}
 	attachment.access.Lock()
 	defer attachment.access.Unlock()
+	if err := attachment.closePendingLocked(); err != nil {
+		return false, E.Cause(err, "retry pending shared-network TCX cleanup")
+	}
 	healthy, err := attachment.healthyLocked(interfaceIndex)
 	if err != nil && !isTCXAttachmentStale(err) {
 		return false, err
@@ -138,11 +142,53 @@ func (b *SharedNetworkBackend) RepairTCX(
 	if err != nil {
 		return false, E.Cause(err, "repair shared-network TCX")
 	}
-	closeErr := attachment.closeLocked()
-	attachment.interfaceIndex = replacement.interfaceIndex
-	attachment.ingress = replacement.ingress
-	attachment.egress = replacement.egress
-	return true, closeErr
+	return attachment.commitReplacementLocked(replacement)
+}
+
+func (a *SharedNetworkTCXAttachment) commitReplacementLocked(replacement *SharedNetworkTCXAttachment) (bool, error) {
+	if cleanupErr := a.closePendingLocked(); cleanupErr != nil {
+		replacementCloseErr := replacement.closeLocked()
+		a.retainRemainingLinks(replacement)
+		if replacementCloseErr == nil {
+			return false, E.Cause(cleanupErr, "retry pending shared-network TCX cleanup")
+		}
+		return false, E.Errors(
+			E.Cause(cleanupErr, "retry pending shared-network TCX cleanup"),
+			E.Cause(replacementCloseErr, "rollback repaired shared-network TCX"),
+		)
+	}
+	closeErr := a.closeLocked()
+	if closeErr != nil {
+		// Do not commit a replacement while part of the old attachment is
+		// still owned by this object. Keeping the old link references lets the
+		// next reconcile retry cleanup instead of leaking an untracked TCX link
+		// or repeatedly stacking replacements.
+		replacementCloseErr := replacement.closeLocked()
+		a.retainRemainingLinks(replacement)
+		if replacementCloseErr == nil {
+			return false, closeErr
+		}
+		return false, E.Errors(closeErr, E.Cause(replacementCloseErr, "rollback repaired shared-network TCX"))
+	}
+	a.interfaceIndex = replacement.interfaceIndex
+	a.ingress = replacement.ingress
+	a.egress = replacement.egress
+	return true, nil
+}
+
+func (a *SharedNetworkTCXAttachment) retainRemainingLinks(attachment *SharedNetworkTCXAttachment) {
+	if attachment.ingress.link != nil {
+		a.pendingCleanup = append(a.pendingCleanup, attachment.ingress)
+		attachment.ingress = sharedNetworkTCXLink{}
+	}
+	if attachment.egress.link != nil {
+		a.pendingCleanup = append(a.pendingCleanup, attachment.egress)
+		attachment.egress = sharedNetworkTCXLink{}
+	}
+	if len(attachment.pendingCleanup) != 0 {
+		a.pendingCleanup = append(a.pendingCleanup, attachment.pendingCleanup...)
+		attachment.pendingCleanup = nil
+	}
 }
 
 func (a *SharedNetworkTCXAttachment) healthyLocked(interfaceIndex int) (bool, error) {
@@ -227,13 +273,35 @@ func (a *SharedNetworkTCXAttachment) Close() error {
 func (a *SharedNetworkTCXAttachment) closeLocked() error {
 	var closeErr error
 	if a.ingress.link != nil {
-		closeErr = E.Errors(closeErr, a.ingress.link.Close())
-		a.ingress = sharedNetworkTCXLink{}
+		err := a.ingress.link.Close()
+		closeErr = E.Errors(closeErr, err)
+		if err == nil {
+			a.ingress = sharedNetworkTCXLink{}
+		}
 	}
 	if a.egress.link != nil {
-		closeErr = E.Errors(closeErr, a.egress.link.Close())
-		a.egress = sharedNetworkTCXLink{}
+		err := a.egress.link.Close()
+		closeErr = E.Errors(closeErr, err)
+		if err == nil {
+			a.egress = sharedNetworkTCXLink{}
+		}
 	}
+	return E.Errors(closeErr, a.closePendingLocked())
+}
+
+func (a *SharedNetworkTCXAttachment) closePendingLocked() error {
+	var closeErr error
+	remaining := a.pendingCleanup[:0]
+	for _, state := range a.pendingCleanup {
+		if state.link == nil {
+			continue
+		}
+		if err := state.link.Close(); err != nil {
+			closeErr = E.Errors(closeErr, err)
+			remaining = append(remaining, state)
+		}
+	}
+	a.pendingCleanup = remaining
 	return closeErr
 }
 

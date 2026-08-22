@@ -646,6 +646,7 @@ func (b *CgroupBackend) DeleteRedirect(protocol uint8, listenerDestination netip
 				unsafe.Pointer(&key),
 				unsafe.Pointer(&original),
 			); recoveryErr != nil {
+				b.udpRecoveryUpdateFailures.Add(1)
 				return E.Cause(recoveryErr, "retain recoverable UDP original destination")
 			}
 		}

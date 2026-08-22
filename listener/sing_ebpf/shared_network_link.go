@@ -17,6 +17,13 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+var (
+	sharedTCFilterList    = netlink.FilterList
+	sharedTCFilterAdd     = netlink.FilterAdd
+	sharedTCFilterReplace = netlink.FilterReplace
+	sharedTCFilterDel     = netlink.FilterDel
+)
+
 func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, enableIPv4 bool, priority uint16) (*sharedTCAttachment, error) {
 	restoreRouteLocalnet := false
 	originalArpAnnounce := ""
@@ -61,6 +68,8 @@ func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, en
 		_ = restoreSharedArpAnnounce(link.Attrs().Name, originalArpAnnounce)
 		return nil, err
 	}
+	egressProgramID, egressProgramTag := backend.EgressProgramIdentity()
+	ingressProgramID, ingressProgramTag := backend.IngressProgramIdentity()
 	egress, err := attachSharedTCFilter(
 		link,
 		netlink.HANDLE_MIN_EGRESS,
@@ -68,6 +77,8 @@ func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, en
 		"sb_share_out",
 		sharedEgressFilterHandle,
 		priority,
+		egressProgramID,
+		egressProgramTag,
 	)
 	if err != nil {
 		if restoreRouteLocalnet {
@@ -83,6 +94,8 @@ func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, en
 		"sb_share_in",
 		sharedIngressFilterHandle,
 		priority,
+		ingressProgramID,
+		ingressProgramTag,
 	)
 	if err != nil {
 		var routeErr error
@@ -192,21 +205,20 @@ func restoreSharedArpAnnounce(interfaceName string, original string) error {
 	return nil
 }
 
-func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, programName string, handle uint16, priority uint16) (*netlink.BpfFilter, error) {
+func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, programName string, handle uint16, priority uint16, programID int, programTag string) (*netlink.BpfFilter, error) {
 	if programFD < 0 {
 		return nil, E.New("shared-network eBPF program is unavailable")
 	}
-	filters, err := netlink.FilterList(link, parent)
+	filters, err := sharedTCFilterList(link, parent)
 	if err != nil {
 		return nil, err
 	}
 	filterHandle := netlink.MakeHandle(0, handle)
+	var sameName []netlink.Filter
 	for _, existing := range filters {
 		bpfFilter, isBPF := existing.(*netlink.BpfFilter)
 		if isBPF && bpfFilter.Name == programName {
-			if err = netlink.FilterDel(existing); err != nil && !errors.Is(err, unix.ENOENT) {
-				return nil, err
-			}
+			sameName = append(sameName, existing)
 			continue
 		}
 		if existing.Attrs().Handle == filterHandle {
@@ -223,10 +235,38 @@ func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, progr
 		},
 		Fd:           programFD,
 		Name:         programName,
+		Id:           programID,
+		Tag:          programTag,
 		DirectAction: true,
 	}
-	if err = netlink.FilterAdd(filter); err != nil {
+	return installSharedTCFilter(filter, sameName)
+}
+
+func installSharedTCFilter(filter *netlink.BpfFilter, sameName []netlink.Filter) (*netlink.BpfFilter, error) {
+	for _, existing := range sameName {
+		if existing.Attrs().Handle == filter.Attrs().Handle {
+			if err := sharedTCFilterReplace(filter); err != nil {
+				return nil, err
+			}
+			return filter, nil
+		}
+	}
+	if err := sharedTCFilterAdd(filter); err != nil {
 		return nil, err
+	}
+	for _, existing := range sameName {
+		if err := sharedTCFilterDel(existing); err != nil && !errors.Is(err, unix.ENOENT) {
+			// The replacement is already active. If cleanup of an old
+			// same-name filter fails, roll the replacement back so the caller
+			// does not lose ownership of an untracked kernel filter. The old
+			// filter remains available for the next reconcile attempt.
+			rollbackErr := detachSharedTCFilter(filter)
+			cleanupErr := E.Cause(err, "remove superseded TC filter")
+			if rollbackErr == nil {
+				return nil, cleanupErr
+			}
+			return nil, E.Errors(cleanupErr, E.Cause(rollbackErr, "rollback replacement TC filter"))
+		}
 	}
 	return filter, nil
 }
@@ -235,7 +275,7 @@ func detachSharedTCFilter(filter *netlink.BpfFilter) error {
 	if filter == nil {
 		return nil
 	}
-	err := netlink.FilterDel(filter)
+	err := sharedTCFilterDel(filter)
 	if errors.Is(err, unix.ENOENT) || errors.Is(err, unix.ENODEV) || errors.Is(err, unix.ESRCH) {
 		return nil
 	}

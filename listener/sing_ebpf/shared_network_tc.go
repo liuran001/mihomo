@@ -80,18 +80,13 @@ func (m *sharedTCManager) Start() error {
 
 func (m *sharedTCManager) loop(ctx context.Context) {
 	defer close(m.done)
-	var ticker *time.Ticker
-	var tickerC <-chan time.Time
-	if m.networkMonitor == nil {
-		ticker = time.NewTicker(sharedNetworkFallbackRefresh)
-		tickerC = ticker.C
-		defer ticker.Stop()
-	}
+	ticker := time.NewTicker(sharedNetworkFallbackRefresh)
+	defer ticker.Stop()
 	for {
 		select {
 		case <-ctx.Done():
 			return
-		case <-tickerC:
+		case <-ticker.C:
 		case <-m.wake:
 		}
 		if err := m.reconcile(); err != nil {
@@ -142,6 +137,20 @@ func (m *sharedTCManager) reconcile() error {
 	for interfaceName, attachment := range m.attachments {
 		link, loaded := desired[interfaceName]
 		if loaded && link.Attrs().Index == attachment.interfaceIndex {
+			if attachment.tcx != nil {
+				if _, repairErr := m.backend.RepairTCX(attachment.tcx, attachment.interfaceIndex); repairErr != nil {
+					return E.Cause(repairErr, "repair shared-network TCX on ", interfaceName)
+				}
+				continue
+			}
+			if sharedTCFiltersHealthy(link, attachment) {
+				continue
+			}
+			if err = m.detachLocked(attachment); err != nil {
+				return E.Cause(err, "replace stale shared-network interface ", interfaceName)
+			}
+			delete(m.attachments, interfaceName)
+			log.Infoln("[EBPF] shared-network repaired clsact attachment on %s", interfaceName)
 			continue
 		}
 		if err = m.detachLocked(attachment); err != nil {
@@ -156,12 +165,68 @@ func (m *sharedTCManager) reconcile() error {
 		}
 		attachment, attachErr := attachSharedTC(link, m.backend, m.enableIPv4, m.priority)
 		if attachErr != nil {
-			return E.Cause(attachErr, "attach eBPF shared-network to ", interfaceName)
+			// A stale attachment may already have been removed above. If
+			// replacement attach then fails, do not leave the BPF control
+			// map enabled while this interface has no managed filter.
+			disableErr := m.updateEnabledLocked(len(m.attachments) > 0)
+			return E.Errors(
+				E.Cause(attachErr, "attach eBPF shared-network to ", interfaceName),
+				disableErr,
+			)
 		}
 		m.attachments[interfaceName] = attachment
 		log.Infoln("[EBPF] shared-network attached to %s (ifindex=%d)", interfaceName, link.Attrs().Index)
 	}
 	return m.updateEnabledLocked(len(m.attachments) > 0)
+}
+
+func sharedTCFiltersHealthy(link netlink.Link, attachment *sharedTCAttachment) bool {
+	for parent, expected := range map[uint32]*netlink.BpfFilter{
+		netlink.HANDLE_MIN_INGRESS: attachment.ingress,
+		netlink.HANDLE_MIN_EGRESS:  attachment.egress,
+	} {
+		if expected == nil {
+			return false
+		}
+		filters, err := sharedTCFilterList(link, parent)
+		if err != nil {
+			return false
+		}
+		found := false
+		for _, filter := range filters {
+			bpf, ok := filter.(*netlink.BpfFilter)
+			if ok && sharedTCFilterMatches(bpf, expected) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			return false
+		}
+	}
+	return true
+}
+
+func sharedTCFilterMatches(current *netlink.BpfFilter, expected *netlink.BpfFilter) bool {
+	if current == nil || expected == nil ||
+		current.Name != expected.Name ||
+		current.Attrs().Handle != expected.Attrs().Handle ||
+		current.Attrs().Priority != expected.Attrs().Priority ||
+		current.Attrs().Protocol != expected.Attrs().Protocol ||
+		current.DirectAction != expected.DirectAction {
+		return false
+	}
+	// Filter dumps may omit the process-local FD. Never compare Fd: a dump
+	// may expose a newly allocated descriptor rather than the descriptor used
+	// during attach. Program ID and tag are persistent kernel identities and
+	// are safe to compare when both sides provide them.
+	if current.Id != 0 && expected.Id != 0 && current.Id != expected.Id {
+		return false
+	}
+	if current.Tag != "" && expected.Tag != "" && current.Tag != expected.Tag {
+		return false
+	}
+	return true
 }
 
 func isSharedNetworkLinkNotFound(err error) bool {
@@ -208,14 +273,11 @@ func (m *sharedTCManager) detachLocked(attachment *sharedTCAttachment) error {
 			detachSharedTCFilter(attachment.egress),
 		)
 	}
-	if detachErr != nil {
-		return detachErr
-	}
 	var restoreErr error
 	if attachment.restoreRouteLocalnet {
 		restoreErr = restoreSharedRouteLocalnet(attachment.interfaceName)
 	}
-	return E.Errors(restoreErr, restoreSharedArpAnnounce(attachment.interfaceName, attachment.originalArpAnnounce))
+	return E.Errors(detachErr, restoreErr, restoreSharedArpAnnounce(attachment.interfaceName, attachment.originalArpAnnounce))
 }
 
 func (m *sharedTCManager) InterfaceString() string {

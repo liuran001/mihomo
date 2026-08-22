@@ -438,6 +438,34 @@ func (b *SharedNetworkBackend) EgressProgramFD() int {
 	return b.runtime.egress_prog_fd
 }
 
+func (b *SharedNetworkBackend) IngressProgramIdentity() (int, string) {
+	return b.programIdentity(sharedNetworkProgramIngress)
+}
+
+func (b *SharedNetworkBackend) EgressProgramIdentity() (int, string) {
+	return b.programIdentity(sharedNetworkProgramEgress)
+}
+
+func (b *SharedNetworkBackend) programIdentity(index int) (int, string) {
+	if b == nil {
+		return 0, ""
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil || index < 0 || index >= len(b.runtime.programs) || b.runtime.programs[index] == nil {
+		return 0, ""
+	}
+	info, err := b.runtime.programs[index].Info()
+	if err != nil {
+		return 0, ""
+	}
+	id, ok := info.ID()
+	if !ok {
+		return 0, info.Tag
+	}
+	return int(id), info.Tag
+}
+
 func (b *SharedNetworkBackend) RuntimeStatus() SharedNetworkRuntimeStatus {
 	if b == nil {
 		return SharedNetworkRuntimeStatus{}
