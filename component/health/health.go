@@ -81,6 +81,11 @@ func add(name string) {
 		}
 		r.lastUsed = now
 		r.mu.Unlock()
+		// The sweep must be driven by the path that GROWS the store. Hanging it
+		// only off Penalty/Incidents made reclamation depend on penalize-unstable
+		// being enabled somewhere, while RecordStall keeps inserting regardless —
+		// so a config without that option would grow this map forever.
+		maybeSweep()
 		return
 	}
 }
