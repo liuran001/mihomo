@@ -260,3 +260,45 @@ func TestCapabilityDemotedIgnoresUnfinishedProbe(t *testing.T) {
 		t.Fatal("未开启任何偏好时不应有降权")
 	}
 }
+
+// Smart 的持久化 store 以节点名为键，早于 provider 感知的身份而存在。同名不同
+// provider 的节点因此共享同一份持久化数据，而缓存里的名字无法判断指向哪一个。
+// uniqueProxiesByName 的契约是：宁可当作没有这条记录，也不能随手解析成迭代顺序
+// 里恰好最后出现的那个节点 —— 后者会把流量按另一个机场的历史数据来选路。
+func TestUniqueProxiesByNameDropsAmbiguousNames(t *testing.T) {
+	duplicateA := strategyTestProxy{name: "same", alive: true, addr: "endpoint-a", provider: "provider-a"}
+	duplicateB := strategyTestProxy{name: "same", alive: true, addr: "endpoint-b", provider: "provider-b"}
+	unique := strategyTestProxy{name: "unique", alive: true, addr: "endpoint-c", provider: "provider-a"}
+
+	byName := uniqueProxiesByName([]C.Proxy{duplicateA, duplicateB, unique})
+
+	if _, resolved := byName["same"]; resolved {
+		t.Fatal("有歧义的名字必须被丢弃，不能解析到任意一个节点")
+	}
+	got, resolved := byName["unique"]
+	if !resolved {
+		t.Fatal("无歧义的名字应当仍可解析")
+	}
+	if got.Addr() != unique.Addr() {
+		t.Fatalf("解析到了错误的节点：%q", got.Addr())
+	}
+
+	// 顺序不能影响结果：歧义与迭代顺序无关。
+	reordered := uniqueProxiesByName([]C.Proxy{unique, duplicateB, duplicateA})
+	if _, resolved := reordered["same"]; resolved {
+		t.Fatal("调换顺序后歧义名字又被解析出来了")
+	}
+
+	// 出现三次以上同样要丢弃，且不能因为后续重复而“复活”。
+	triple := uniqueProxiesByName([]C.Proxy{duplicateA, duplicateB, duplicateA, unique})
+	if _, resolved := triple["same"]; resolved {
+		t.Fatal("重复出现三次的名字仍被解析")
+	}
+	if _, resolved := triple["unique"]; !resolved {
+		t.Fatal("歧义名字不应影响其它名字的解析")
+	}
+
+	if len(uniqueProxiesByName([]C.Proxy{nil, unique})) != 1 {
+		t.Fatal("nil 节点应被跳过而不是引发 panic")
+	}
+}
