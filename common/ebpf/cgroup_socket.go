@@ -315,11 +315,17 @@ func (b *CgroupBackend) findConnectedUDPToken(
 	tokenMap *CiliumEBPF.Map,
 	listener listenerLookupKey,
 ) (uint64, error) {
+	// This searches the token map BY VALUE, so it is inherently O(entries).
+	// It runs inline on the UDP read loop, so it must stay bounded: a densely
+	// populated map would otherwise stall packet reception for the whole scan.
+	// Giving up early is safe — the caller treats ENOENT as "cannot recover"
+	// and drops the packet, which is what an exhaustive miss would do anyway.
+	budget := min(b.mapCapacity.UDPRedirect, connectedUDPTokenScanBudget)
 	// Connected UDP recovery is a cold path. Batch lookup avoids one syscall
 	// per token on kernels that implement BPF_MAP_LOOKUP_BATCH, while the
 	// support state keeps vendor/old kernels on the proven iterator path.
 	if b.connectedUDPTokenLookupSupport.mode.Load() != mapBatchUnsupported {
-		batchCapacity := min(uint32(mapBatchMaxEntries), b.mapCapacity.UDPRedirect)
+		batchCapacity := min(uint32(mapBatchMaxEntries), budget)
 		if cap(b.connectedUDPTokenKeys) < int(batchCapacity) {
 			b.connectedUDPTokenKeys = make([]uint64, batchCapacity)
 			b.connectedUDPTokenValues = make([]listenerLookupKey, batchCapacity)
@@ -329,8 +335,8 @@ func (b *CgroupBackend) findConnectedUDPToken(
 		}
 		var cursor CiliumEBPF.MapBatchCursor
 		var scanned uint32
-		for scanned < b.mapCapacity.UDPRedirect {
-			batchSize := min(batchCapacity, b.mapCapacity.UDPRedirect-scanned)
+		for scanned < budget {
+			batchSize := min(batchCapacity, budget-scanned)
 			countValue, batchErr := tokenMap.BatchLookup(
 				&cursor,
 				b.connectedUDPTokenKeys[:batchSize],
@@ -376,7 +382,7 @@ func (b *CgroupBackend) findConnectedUDPToken(
 		if currentToken == listener {
 			return cookie, nil
 		}
-		if scanned >= b.mapCapacity.UDPRedirect {
+		if scanned >= budget {
 			break
 		}
 	}
@@ -514,6 +520,10 @@ func (b *CgroupBackend) deleteStaleRedirect(
 	}
 	return false, nil
 }
+
+// connectedUDPTokenScanBudget caps the by-value token search so it cannot
+// monopolise the UDP read loop.
+const connectedUDPTokenScanBudget = 4096
 
 type tcpRedirectEntry struct {
 	key   listenerLookupKey
