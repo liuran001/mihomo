@@ -81,11 +81,15 @@ func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, en
 		egressProgramTag,
 	)
 	if err != nil {
+		// installSharedTCFilter may return an active replacement together
+		// with an error when cleanup of an older same-name filter fails.
+		// Detach it before abandoning the attachment so Close cannot leak it.
+		cleanupErr := detachSharedTCFilter(egress)
 		if restoreRouteLocalnet {
 			_ = restoreSharedRouteLocalnet(link.Attrs().Name)
 		}
 		_ = restoreSharedArpAnnounce(link.Attrs().Name, originalArpAnnounce)
-		return nil, err
+		return nil, E.Errors(err, cleanupErr)
 	}
 	ingress, err := attachSharedTCFilter(
 		link,
@@ -103,7 +107,7 @@ func attachSharedTC(link netlink.Link, backend *ECommon.SharedNetworkBackend, en
 			routeErr = restoreSharedRouteLocalnet(link.Attrs().Name)
 		}
 		arpErr := restoreSharedArpAnnounce(link.Attrs().Name, originalArpAnnounce)
-		return nil, E.Errors(err, detachSharedTCFilter(egress), routeErr, arpErr)
+		return nil, E.Errors(err, detachSharedTCFilter(ingress), detachSharedTCFilter(egress), routeErr, arpErr)
 	}
 	return &sharedTCAttachment{
 		interfaceName:        link.Attrs().Name,
@@ -243,29 +247,30 @@ func attachSharedTCFilter(link netlink.Link, parent uint32, programFD int, progr
 }
 
 func installSharedTCFilter(filter *netlink.BpfFilter, sameName []netlink.Filter) (*netlink.BpfFilter, error) {
+	var replaced []netlink.Filter
 	for _, existing := range sameName {
 		if existing.Attrs().Handle == filter.Attrs().Handle {
 			if err := sharedTCFilterReplace(filter); err != nil {
 				return nil, err
 			}
-			return filter, nil
+			replaced = append(replaced, existing)
+			break
 		}
 	}
-	if err := sharedTCFilterAdd(filter); err != nil {
-		return nil, err
+	if len(replaced) == 0 {
+		if err := sharedTCFilterAdd(filter); err != nil {
+			return nil, err
+		}
 	}
 	for _, existing := range sameName {
+		if existing.Attrs().Handle == filter.Attrs().Handle {
+			continue
+		}
 		if err := sharedTCFilterDel(existing); err != nil && !errors.Is(err, unix.ENOENT) {
-			// The replacement is already active. If cleanup of an old
-			// same-name filter fails, roll the replacement back so the caller
-			// does not lose ownership of an untracked kernel filter. The old
-			// filter remains available for the next reconcile attempt.
-			rollbackErr := detachSharedTCFilter(filter)
-			cleanupErr := E.Cause(err, "remove superseded TC filter")
-			if rollbackErr == nil {
-				return nil, cleanupErr
-			}
-			return nil, E.Errors(cleanupErr, E.Cause(rollbackErr, "rollback replacement TC filter"))
+			// Keep the replacement active. The caller will fail closed and the
+			// next reconcile can discover the active filter by handle/name and
+			// retry cleanup without losing the installed program.
+			return filter, E.Cause(err, "remove superseded TC filter")
 		}
 	}
 	return filter, nil
