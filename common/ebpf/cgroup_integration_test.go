@@ -16,6 +16,7 @@ import (
 	"time"
 	"unsafe"
 
+	CiliumEBPF "github.com/cilium/ebpf"
 	"golang.org/x/net/ipv4"
 	"golang.org/x/sys/unix"
 )
@@ -1484,4 +1485,163 @@ func TestCgroupUDPRedirectSweepOrphanIntegration(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCgroupRedirectMapsNeverExhaustIntegration is the direct regression test
+// for the reported failure: eBPF works for hours, then every new connection
+// dies and stays dead until restart.
+//
+// The redirect maps used to be fixed-size BPF_MAP_TYPE_HASH. Once they filled,
+// bpf_map_update_elem returned -E2BIG, all four REDIRECT_TOKEN_ATTEMPTS in
+// token_v4/token_v6 failed, and handle_v4/handle_v6 returned 0 — which for a
+// cgroup/connect4 or cgroup/sendmsg4 program means the syscall is rejected with
+// EPERM. This asserts the property that fix depends on: with the maps
+// configured the way PrepareCgroup actually builds them, a reservation at and
+// beyond capacity still succeeds, and the map stays bounded.
+func TestCgroupRedirectMapsNeverExhaustIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "verify redirect maps cannot be exhausted")
+	const capacity = 64
+	// Start from the defaults so every capacity PrepareCgroup validates is
+	// populated, then shrink only the maps under test — filling 32768 entries
+	// four times over would make this needlessly slow.
+	mapCapacity := DefaultCgroupMapCapacity()
+	mapCapacity.TCPRedirect = capacity
+	mapCapacity.UDPRedirect = capacity
+	mapCapacity.UDPPeer = capacity
+	mapCapacity.UDPFlow = capacity
+	backend, err := PrepareCgroup(CgroupConfig{
+		Path:         os.Getenv("SING_BOX_EBPF_INTEGRATION_CGROUP"),
+		EnableTCP:    true,
+		EnableUDP:    true,
+		RedirectIPv4: netip.MustParsePrefix("127.128.0.0/9"),
+		MapCapacity:  mapCapacity,
+		UDPTimeout:   5 * time.Minute,
+		Policy:       CgroupPolicy{HijackDNS: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if closeErr := backend.Close(); closeErr != nil {
+			t.Errorf("close eBPF backend: %v", closeErr)
+		}
+	})
+
+	// The bound only holds if these really are LRU maps. A plain hash here is
+	// the whole bug, so assert the type the loader actually produced rather
+	// than trusting the spec we asked for.
+	for _, name := range []string{
+		"cgroup_tcp_redirect", "cgroup_udp_redirect",
+		"cgroup_udp_token", "cgroup_udp_peer",
+	} {
+		mapInstance := backend.runtime.maps[name]
+		if mapInstance == nil {
+			t.Fatalf("%s is missing", name)
+		}
+		info, infoErr := mapInstance.Info()
+		if infoErr != nil {
+			t.Fatalf("inspect %s: %v", name, infoErr)
+		}
+		if info.Type != CiliumEBPF.LRUHash {
+			t.Errorf("%s is %v, want LRUHash — a fixed hash map fails closed with EPERM once full", name, info.Type)
+		}
+	}
+
+	for _, testCase := range []struct {
+		name     string
+		protocol uint8
+		mapFD    int
+		mapName  string
+	}{
+		{name: "tcp", protocol: ProtocolTCP, mapFD: backend.tcpRedirectMapFD, mapName: "cgroup_tcp_redirect"},
+		{name: "udp", protocol: ProtocolUDP, mapFD: backend.udpRedirectMapFD, mapName: "cgroup_udp_redirect"},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			// Reserve well past capacity, exactly as a long-running process
+			// would over its uptime. BPF_NOEXIST mirrors what token_v4 uses.
+			const reservations = capacity * 4
+			for index := 0; index < reservations; index++ {
+				listener := netip.AddrPortFrom(
+					netip.AddrFrom4([4]byte{127, 128, byte(index / 256), byte(index % 256)}),
+					5300,
+				)
+				key, keyErr := makeListenerLookupKey(testCase.protocol, listener)
+				if keyErr != nil {
+					t.Fatal(keyErr)
+				}
+				value := originalDestinationValue{
+					Family:      addressFamilyIPv4,
+					Protocol:    testCase.protocol,
+					Port:        443,
+					CreatedAtNS: 1,
+				}
+				copy(value.Addr[:4], netip.MustParseAddr("192.0.2.1").AsSlice())
+				if updateErr := updateMapWithFlags(
+					testCase.mapFD,
+					unsafe.Pointer(&key),
+					unsafe.Pointer(&value),
+					bpfNoExist,
+				); updateErr != nil {
+					t.Fatalf("reservation %d of %d failed: %v — this is the EPERM-on-every-new-connection failure",
+						index+1, reservations, updateErr)
+				}
+			}
+
+			entries, countErr := countMapEntries(
+				testCase.mapFD,
+				unsafe.Sizeof(listenerLookupKey{}),
+				capacity,
+			)
+			if countErr != nil {
+				t.Fatal(countErr)
+			}
+			if entries > capacity {
+				t.Fatalf("%s holds %d entries, above its %d capacity", testCase.mapName, entries, capacity)
+			}
+		})
+	}
+
+	// Negative control. Without this the test above could pass for the wrong
+	// reason — e.g. if the kernel silently tolerated an over-capacity hash
+	// map, or if updateMapWithFlags stopped reporting errors. Build the map
+	// the way it used to be built and confirm the old failure still happens,
+	// so the assertions above are known to be able to fail.
+	t.Run("fixed hash still fails closed", func(t *testing.T) {
+		fixed, mapErr := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+			Type:       CiliumEBPF.Hash,
+			KeySize:    uint32(unsafe.Sizeof(listenerLookupKey{})),
+			ValueSize:  uint32(unsafe.Sizeof(originalDestinationValue{})),
+			MaxEntries: capacity,
+			Flags:      bpfFlagNoPrealloc,
+		})
+		if mapErr != nil {
+			t.Fatal(mapErr)
+		}
+		t.Cleanup(func() { _ = fixed.Close() })
+
+		var lastErr error
+		for index := 0; index < capacity*2; index++ {
+			listener := netip.AddrPortFrom(
+				netip.AddrFrom4([4]byte{127, 128, byte(index / 256), byte(index % 256)}),
+				5300,
+			)
+			key, keyErr := makeListenerLookupKey(ProtocolTCP, listener)
+			if keyErr != nil {
+				t.Fatal(keyErr)
+			}
+			value := originalDestinationValue{Family: addressFamilyIPv4, Protocol: ProtocolTCP, Port: 443}
+			if lastErr = updateMapWithFlags(
+				fixed.FD(),
+				unsafe.Pointer(&key),
+				unsafe.Pointer(&value),
+				bpfNoExist,
+			); lastErr != nil {
+				break
+			}
+		}
+		if lastErr == nil {
+			t.Fatal("a fixed hash map accepted more than its capacity; the bounded-map assertions above prove nothing")
+		}
+		t.Logf("fixed hash map rejected the over-capacity reservation as expected: %v", lastErr)
+	})
 }
