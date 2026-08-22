@@ -202,6 +202,8 @@ listeners:
 
 低于上述版本不会报错也不会不工作，只是回收慢一些。启动时会在日志里列出当前内核缺哪些能力、各自意味着什么，不用自己猜。
 
+**唯一一个会直接报错的情况：Linux 6.6.0 ～ 6.6.46。** 这段内核的 LPM trie 在 UBSAN 下会 panic，所以核心拒绝往里写任何基于网段的策略，`bypass-rule-set`、`local.include-uid`、`shared.include-source-cidr` 都会失败并给出明确报错。升到 6.6.47+，或者用已经回合 `bpf_lpm_trie_key_u8` 修复的内核（核心会读 BTF 自动识别，回合过的不受影响）。
+
 ---
 
 # 二、自动选择支持 UDP / IPv6 的节点
