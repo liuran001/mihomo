@@ -176,19 +176,33 @@ func (a *SharedNetworkTCXAttachment) commitReplacementLocked(replacement *Shared
 	return true, nil
 }
 
+// maxPendingTCXCleanup bounds the retry queue for links whose Close keeps
+// failing. RepairTCX runs from reconcile on every refresh tick, so a link that
+// can never be closed would otherwise append here forever — growing the slice
+// and pinning one file descriptor per entry for the life of the process. Past
+// this point the oldest reference is dropped: leaking a bounded number of
+// descriptors is recoverable, an unbounded queue on a 1-2 GB router is not.
+const maxPendingTCXCleanup = 16
+
+func (a *SharedNetworkTCXAttachment) appendPendingLocked(state sharedNetworkTCXLink) {
+	if state.link == nil {
+		return
+	}
+	if len(a.pendingCleanup) >= maxPendingTCXCleanup {
+		a.pendingCleanup = append(a.pendingCleanup[:0], a.pendingCleanup[1:]...)
+	}
+	a.pendingCleanup = append(a.pendingCleanup, state)
+}
+
 func (a *SharedNetworkTCXAttachment) retainRemainingLinks(attachment *SharedNetworkTCXAttachment) {
-	if attachment.ingress.link != nil {
-		a.pendingCleanup = append(a.pendingCleanup, attachment.ingress)
-		attachment.ingress = sharedNetworkTCXLink{}
+	a.appendPendingLocked(attachment.ingress)
+	attachment.ingress = sharedNetworkTCXLink{}
+	a.appendPendingLocked(attachment.egress)
+	attachment.egress = sharedNetworkTCXLink{}
+	for _, state := range attachment.pendingCleanup {
+		a.appendPendingLocked(state)
 	}
-	if attachment.egress.link != nil {
-		a.pendingCleanup = append(a.pendingCleanup, attachment.egress)
-		attachment.egress = sharedNetworkTCXLink{}
-	}
-	if len(attachment.pendingCleanup) != 0 {
-		a.pendingCleanup = append(a.pendingCleanup, attachment.pendingCleanup...)
-		attachment.pendingCleanup = nil
-	}
+	attachment.pendingCleanup = nil
 }
 
 func (a *SharedNetworkTCXAttachment) healthyLocked(interfaceIndex int) (bool, error) {

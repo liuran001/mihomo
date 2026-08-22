@@ -138,3 +138,35 @@ func TestTCXAttachmentStale(t *testing.T) {
 		t.Fatal("unexpectedly treated TCX permission failure as stale")
 	}
 }
+
+// RepairTCX 会在每次 reconcile 时被调用（默认几秒一次）。如果某个 link 的 Close
+// 永远失败，重试队列每轮都会再追加 —— 队列本身和它扣住的 fd 都会无限增长。
+// 在只有 1-2GB 内存的路由设备上这是不能接受的，所以队列必须有硬上界。
+func TestPendingCleanupIsBounded(t *testing.T) {
+	closeErr := errors.New("close always fails")
+	attachment := &SharedNetworkTCXAttachment{}
+
+	// 模拟远多于上界的失败重试轮次。
+	const rounds = maxPendingTCXCleanup * 5
+	for i := 0; i < rounds; i++ {
+		failing := &SharedNetworkTCXAttachment{
+			ingress: sharedNetworkTCXLink{link: &testTCXLink{closeErrors: []error{closeErr}}},
+			egress:  sharedNetworkTCXLink{link: &testTCXLink{closeErrors: []error{closeErr}}},
+		}
+		attachment.retainRemainingLinks(failing)
+		if got := len(attachment.pendingCleanup); got > maxPendingTCXCleanup {
+			t.Fatalf("第 %d 轮后队列长度 = %d，超过上界 %d", i+1, got, maxPendingTCXCleanup)
+		}
+	}
+	if got := len(attachment.pendingCleanup); got != maxPendingTCXCleanup {
+		t.Fatalf("持续失败后队列长度 = %d，期望稳定在上界 %d", got, maxPendingTCXCleanup)
+	}
+	// 被移交的一方必须被清空，否则同一个 link 会同时挂在两个对象上。
+	survivor := &SharedNetworkTCXAttachment{
+		ingress: sharedNetworkTCXLink{link: &testTCXLink{closeErrors: []error{closeErr}}},
+	}
+	attachment.retainRemainingLinks(survivor)
+	if survivor.ingress.link != nil || survivor.egress.link != nil || survivor.pendingCleanup != nil {
+		t.Fatal("移交后来源对象仍持有 link 引用")
+	}
+}
