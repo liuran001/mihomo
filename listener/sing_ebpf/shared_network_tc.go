@@ -23,12 +23,12 @@ import (
 )
 
 const (
+	// The poll stays unconditional even when a network update monitor is
+	// available. The monitor only reports interface events; it cannot see a
+	// filter removed out from under us by another tool, and that is exactly
+	// the drift the self-heal exists for. Stretching the interval would trade
+	// self-heal latency for an unmeasured wakeup saving.
 	sharedNetworkFallbackRefresh = 3 * time.Second
-	// When a network update monitor is available it wakes the reconciler on
-	// real interface events, so the poll only has to catch drift the monitor
-	// cannot see (a filter removed by another tool). Polling every 3s in that
-	// case is a pure wakeup tax, which matters on battery-powered Android.
-	sharedNetworkMonitoredRefresh = 30 * time.Second
 	// Run before Android tethering offload (IPv6 priority 2, IPv4 priority 3).
 	defaultSharedNetworkTCPriority = 1
 	sharedIngressFilterHandle      = 0x5342
@@ -86,16 +86,9 @@ func (m *sharedTCManager) Start() error {
 	return nil
 }
 
-func (m *sharedTCManager) refreshInterval() time.Duration {
-	if m.networkMonitor != nil {
-		return sharedNetworkMonitoredRefresh
-	}
-	return sharedNetworkFallbackRefresh
-}
-
 func (m *sharedTCManager) loop(ctx context.Context) {
 	defer close(m.done)
-	ticker := time.NewTicker(m.refreshInterval())
+	ticker := time.NewTicker(sharedNetworkFallbackRefresh)
 	defer ticker.Stop()
 	for {
 		select {
