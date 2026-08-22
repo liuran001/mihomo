@@ -12,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/log"
 
@@ -288,11 +289,17 @@ func (l *internalListener) readUDP() {
 		if n == 0 {
 			continue
 		}
-		packetBuffer := make([]byte, n)
+		// The payload outlives this iteration -- the tunnel keeps it until the
+		// outbound has written it -- so it has to be copied out of the read
+		// buffer. Take it from the pool and let NewPacket hand ownership to the
+		// packet, whose Drop returns it; this is the same contract the tproxy
+		// listener uses. The control message does not outlive the call: both
+		// NewPacket implementations parse the redirect address out of it before
+		// doing anything else and never store it, so it can be passed as a
+		// subslice of the read buffer and costs no allocation at all.
+		packetBuffer := pool.Get(n)
 		copy(packetBuffer, buffer[:n])
-		packetOOB := make([]byte, oobN)
-		copy(packetOOB, oob[:oobN])
-		l.handler.NewPacket(packetBuffer, packetOOB, source)
+		l.handler.NewPacket(packetBuffer, oob[:oobN], source)
 	}
 }
 

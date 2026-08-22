@@ -10,6 +10,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/inbound"
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/pool"
 	C "github.com/metacubex/mihomo/constant"
 
 	E "github.com/metacubex/sing/common/exceptions"
@@ -54,6 +55,14 @@ func (s *sharedNetwork) NewConnection(conn net.Conn) {
 }
 
 func (s *sharedNetwork) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
+	// Same pooled-buffer contract as Inbound.NewPacket: release on every path
+	// that does not reach HandleUDPPacket.
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			_ = pool.Put(data)
+		}
+	}()
 	backend := s.sharedBackendInstance()
 	if backend == nil {
 		return
@@ -102,6 +111,7 @@ func (s *sharedNetwork) NewPacket(data []byte, oob []byte, source netip.AddrPort
 		data:        data,
 		lAddr:       N.NewCustomAddr(C.EBPF.String(), client.String(), net.UDPAddrFromAddrPort(client)),
 	}
+	handedOff = true
 	s.inbound.tunnel.HandleUDPPacket(packet, metadata)
 }
 
@@ -171,6 +181,8 @@ func (p *sharedPacket) WriteBack(b []byte, addr net.Addr) (int, error) {
 }
 
 func (p *sharedPacket) Drop() {
+	_ = pool.Put(p.data)
+	p.data = nil
 }
 
 func (p *sharedPacket) LocalAddr() net.Addr {

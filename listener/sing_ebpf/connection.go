@@ -10,6 +10,7 @@ import (
 	"github.com/metacubex/mihomo/adapter/inbound"
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
 	N "github.com/metacubex/mihomo/common/net"
+	"github.com/metacubex/mihomo/common/pool"
 	C "github.com/metacubex/mihomo/constant"
 
 	E "github.com/metacubex/sing/common/exceptions"
@@ -56,6 +57,15 @@ func (i *Inbound) NewConnection(conn net.Conn) {
 }
 
 func (i *Inbound) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
+	// data comes from the pool. Every path that does not hand it to the tunnel
+	// has to give it back, including the DNS relay, which consumes the payload
+	// synchronously and returns without keeping a reference.
+	handedOff := false
+	defer func() {
+		if !handedOff {
+			_ = pool.Put(data)
+		}
+	}()
 	backend := i.backendInstance()
 	if backend == nil {
 		return
@@ -124,6 +134,9 @@ func (i *Inbound) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
 		data:        data,
 		lAddr:       N.NewCustomAddr(C.EBPF.String(), client.String(), net.UDPAddrFromAddrPort(client)),
 	}
+	// The tunnel calls Drop on every outcome it has, including a full queue and
+	// a closed sender, so ownership is safe to transfer here.
+	handedOff = true
 	i.tunnel.HandleUDPPacket(packet, metadata)
 }
 
@@ -160,6 +173,8 @@ func (p *udpPacket) WriteBack(b []byte, addr net.Addr) (int, error) {
 }
 
 func (p *udpPacket) Drop() {
+	_ = pool.Put(p.data)
+	p.data = nil
 }
 
 func (p *udpPacket) LocalAddr() net.Addr {
