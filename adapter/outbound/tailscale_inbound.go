@@ -15,6 +15,7 @@ import (
 )
 
 const tailscaleInboundUDPTimeout = 5 * time.Minute
+const tailscaleInboundUDPBufferSize = 65535
 
 // registerInboundHandlers wires tsnet's fallback flow handlers into the
 // tunnel so traffic arriving from the tailnet for advertised routes (subnet
@@ -23,7 +24,7 @@ const tailscaleInboundUDPTimeout = 5 * time.Minute
 // behavior (explicit listeners / reject).
 func (t *Tailscale) registerInboundHandlers(tunnel C.Tunnel) {
 	t.server.RegisterFallbackTCPHandler(func(src, dst netip.AddrPort) (func(net.Conn), bool) {
-		if t.isSelfTailscaleAddr(dst.Addr()) {
+		if t.isSelfTailscaleAddr(dst.Addr()) || !t.isAdvertisedRoute(dst.Addr()) {
 			return nil, false
 		}
 		return func(conn net.Conn) {
@@ -39,14 +40,47 @@ func (t *Tailscale) registerInboundHandlers(tunnel C.Tunnel) {
 		}, true
 	})
 	t.server.RegisterFallbackUDPHandler(func(src, dst netip.AddrPort) (func(nettype.ConnPacketConn), bool) {
-		if t.isSelfTailscaleAddr(dst.Addr()) {
+		if t.isSelfTailscaleAddr(dst.Addr()) || !t.isAdvertisedRoute(dst.Addr()) {
 			return nil, false
 		}
 		return func(conn nettype.ConnPacketConn) {
+			if !t.acquireUDPFlow() {
+				_ = conn.Close()
+				return
+			}
+			defer t.releaseUDPFlow()
 			t.handleInboundUDPFlow(tunnel, conn, src, dst)
 		}, true
 	})
 	log.Infoln("[Tailscale](%s) inbound handlers registered for advertised routes", t.option.Name)
+}
+
+func (t *Tailscale) isAdvertisedRoute(addr netip.Addr) bool {
+	addr = addr.Unmap()
+	for _, route := range t.advertisedRoutes {
+		if route.Contains(addr) {
+			return true
+		}
+	}
+	return false
+}
+
+func (t *Tailscale) acquireUDPFlow() bool {
+	if t.udpFlows == nil {
+		return true
+	}
+	select {
+	case t.udpFlows <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (t *Tailscale) releaseUDPFlow() {
+	if t.udpFlows != nil {
+		<-t.udpFlows
+	}
 }
 
 func (t *Tailscale) isSelfTailscaleAddr(addr netip.Addr) bool {
@@ -59,7 +93,7 @@ func (t *Tailscale) handleInboundUDPFlow(tunnel C.Tunnel, conn nettype.ConnPacke
 	defer func() { _ = conn.Close() }()
 	for {
 		_ = conn.SetReadDeadline(time.Now().Add(tailscaleInboundUDPTimeout))
-		buf := pool.Get(pool.UDPBufferSize)
+		buf := pool.Get(tailscaleInboundUDPBufferSize)
 		n, _, err := conn.ReadFrom(buf)
 		if err != nil {
 			_ = pool.Put(buf)

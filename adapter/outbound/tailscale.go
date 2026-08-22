@@ -13,6 +13,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/metacubex/mihomo/common/atomic"
 	"github.com/metacubex/mihomo/component/ca"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/iface/anet"
@@ -33,6 +34,13 @@ import (
 	"github.com/samber/lo"
 )
 
+const (
+	tailscaleExitNodeRetryDelay    = 2 * time.Second
+	tailscaleExitNodeRetryMaxDelay = 30 * time.Second
+)
+
+var errTailscaleBackendNotRunning = errors.New("tailscale backend is not running")
+
 type Tailscale struct {
 	*Base
 	server      *tsnet.Server
@@ -42,13 +50,24 @@ type Tailscale struct {
 	cancel      context.CancelFunc
 	startOnce   sync.Once
 	startErr    error
-	started     bool
 
 	backendInitOnce sync.Once
 	backendInitCh   chan struct{}
 	backendInitErr  error
+	backendReady    atomic.Bool
 
-	serverStarted bool
+	backendStateAccess     sync.Mutex
+	backendState           ipn.State
+	backendGeneration      uint64
+	backendRetrying        bool
+	backendRetryCancel     context.CancelFunc
+	backendStateErr        error
+	applyExitNodePrefsHook func(context.Context) error
+	backendIsRunningHook   func(context.Context) (bool, error)
+
+	serverStarted    atomic.Bool
+	advertisedRoutes []netip.Prefix
+	udpFlows         chan struct{}
 
 	unregisterDNSResolver func()
 }
@@ -138,6 +157,10 @@ func init() {
 }
 
 func NewTailscale(option TailscaleOption) (*Tailscale, error) {
+	advertisedRoutes, err := parseAdvertiseRoutes(option)
+	if err != nil {
+		return nil, err
+	}
 	if _, err := buildTailscaleMaskedPrefs(option); err != nil {
 		return nil, err
 	}
@@ -165,10 +188,12 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 			RoutingMark:  option.RoutingMark,
 			Prefer:       option.IPVersion,
 		}),
-		option:        option,
-		ctx:           ctx,
-		cancel:        cancel,
-		backendInitCh: make(chan struct{}),
+		option:           option,
+		ctx:              ctx,
+		cancel:           cancel,
+		backendInitCh:    make(chan struct{}),
+		advertisedRoutes: advertisedRoutes,
+		udpFlows:         make(chan struct{}, 1024),
 	}
 	outbound.dialer = option.NewDialer(outbound.DialOptions())
 	outbound.server = &tsnet.Server{
@@ -234,7 +259,7 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 	dnsTransport := tailscaleDNSTransport{tailscale: outbound}
 	outbound.dnsResolver = dns.NewResolverFromClient(dnsTransport)
 	outbound.unregisterDNSResolver = dns.RegisterTailscaleDnsClient(option.Name, dnsTransport)
-	if routes, _ := parseAdvertiseRoutes(option); len(routes) > 0 {
+	if len(advertisedRoutes) > 0 {
 		if tunnel := option.NewTunnel(); tunnel != nil {
 			outbound.registerInboundHandlers(tunnel)
 		} else {
@@ -261,7 +286,7 @@ func (t *Tailscale) start() error {
 			t.setBackendInitialized(err)
 			return
 		}
-		t.serverStarted = true
+		t.serverStarted.Store(true)
 		ctx, cancel := context.WithTimeout(t.ctx, 30*time.Second)
 		defer cancel()
 		if err := t.applyPrefs(ctx); err != nil {
@@ -278,48 +303,203 @@ func (t *Tailscale) ensureStarted(ctx context.Context) error {
 	if err := t.start(); err != nil {
 		return err
 	}
-	return t.waitBackendInitialized(ctx)
+	if err := t.waitBackendInitialized(ctx); err != nil {
+		return err
+	}
+	if !t.backendReady.Load() {
+		if err := t.currentBackendStateError(); err != nil {
+			return err
+		}
+		return errTailscaleBackendNotRunning
+	}
+	return nil
 }
 
 func (t *Tailscale) watchBackendState() {
 	lc, err := t.server.LocalClient()
 	if err != nil {
+		t.markBackendUnavailable(err)
 		t.setBackendInitialized(err)
 		return
 	}
 	watcher, err := lc.WatchIPNBus(t.ctx, ipn.NotifyInitialState)
 	if err != nil {
+		t.markBackendUnavailable(err)
 		t.setBackendInitialized(err)
 		return
 	}
 	defer watcher.Close()
 
-	backendInitialized := false
 	exitNodeNeedsStatus := tailscaleExitNodeNeedsStatus(t.option)
 	for {
 		n, err := watcher.Next()
 		if err != nil {
+			t.markBackendUnavailable(err)
 			t.setBackendInitialized(err)
 			return
+		}
+		if n.ErrMessage != nil {
+			err := errors.New("tailscale backend: " + *n.ErrMessage)
+			t.markBackendUnavailable(err)
+			// Keep the initialization gate open until the watcher either
+			// observes a valid Running state or terminates. ErrMessage can be
+			// transient; closing the once-only gate here would make a later
+			// recovery impossible.
+			continue
 		}
 		if n.State == nil {
 			continue
 		}
+		t.observeBackendState(*n.State, exitNodeNeedsStatus)
+	}
+}
 
-		if *n.State != ipn.NoState && !backendInitialized {
-			t.setBackendInitialized(nil)
-			backendInitialized = true
-			if !exitNodeNeedsStatus {
-				return
-			}
+// observeBackendState consumes an IPN state notification without blocking the
+// watcher. Exit-node preference application runs in a cancellable goroutine
+// tied to the current Running generation, so a stale success cannot revive a
+// backend that has already left Running.
+func (t *Tailscale) observeBackendState(state ipn.State, exitNodeNeedsStatus bool) {
+	t.backendStateAccess.Lock()
+	if state != t.backendState {
+		t.backendState = state
+		t.backendGeneration++
+		t.backendStateErr = nil
+	}
+	generation := t.backendGeneration
+	if !tailscaleBackendReady(state) {
+		t.backendReady.Store(false)
+		if t.backendRetryCancel != nil {
+			t.backendRetryCancel()
+			t.backendRetryCancel = nil
 		}
-		if exitNodeNeedsStatus && *n.State == ipn.Running {
-			if err := t.applyExitNodePrefs(t.ctx); err != nil {
-				log.Warnln("[Tailscale](%s) set exit node failed: %v", t.Name(), err)
+		t.backendRetrying = false
+		t.backendStateAccess.Unlock()
+		return
+	}
+	if t.backendReady.Load() || t.backendRetrying {
+		t.backendStateAccess.Unlock()
+		return
+	}
+	if !exitNodeNeedsStatus {
+		t.backendReady.Store(true)
+		t.backendStateAccess.Unlock()
+		t.setBackendInitialized(nil)
+		return
+	}
+	retryCtx, retryCancel := context.WithCancel(t.ctx)
+	t.backendRetrying = true
+	t.backendRetryCancel = retryCancel
+	t.backendStateAccess.Unlock()
+	go t.retryExitNodePrefs(retryCtx, generation)
+}
+
+func (t *Tailscale) retryExitNodePrefs(ctx context.Context, generation uint64) {
+	err := t.applyExitNodePrefsUntilReady(ctx)
+	t.backendStateAccess.Lock()
+	defer t.backendStateAccess.Unlock()
+	if generation != t.backendGeneration || t.backendState != ipn.Running || ctx.Err() != nil {
+		if generation == t.backendGeneration {
+			t.backendRetrying = false
+			t.backendRetryCancel = nil
+		}
+		return
+	}
+	t.backendRetrying = false
+	t.backendRetryCancel = nil
+	if err != nil {
+		t.backendStateErr = err
+		t.backendReady.Store(false)
+		return
+	}
+	t.backendStateErr = nil
+	t.backendReady.Store(true)
+	t.setBackendInitialized(nil)
+}
+
+func (t *Tailscale) markBackendUnavailable(err error) {
+	t.backendStateAccess.Lock()
+	t.backendGeneration++
+	t.backendState = ipn.NoState
+	t.backendStateErr = err
+	t.backendReady.Store(false)
+	if t.backendRetryCancel != nil {
+		t.backendRetryCancel()
+		t.backendRetryCancel = nil
+	}
+	t.backendRetrying = false
+	t.backendStateAccess.Unlock()
+}
+
+func (t *Tailscale) currentBackendStateError() error {
+	t.backendStateAccess.Lock()
+	defer t.backendStateAccess.Unlock()
+	return t.backendStateErr
+}
+
+func (t *Tailscale) applyExitNodePrefsUntilReady(ctx context.Context) error {
+	delay := tailscaleExitNodeRetryDelay
+	for {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		applyPrefs := t.applyExitNodePrefs
+		if t.applyExitNodePrefsHook != nil {
+			applyPrefs = t.applyExitNodePrefsHook
+		}
+		if err := applyPrefs(ctx); err == nil {
+			checkRunning := t.backendStatusRunning
+			if t.backendIsRunningHook != nil {
+				checkRunning = t.backendIsRunningHook
 			}
-			return
+			running, statusErr := checkRunning(ctx)
+			if statusErr == nil && running {
+				return nil
+			}
+			if statusErr != nil {
+				log.Warnln("[Tailscale](%s) verify running state failed, retrying: %v", t.Name(), statusErr)
+			} else {
+				log.Warnln("[Tailscale](%s) backend left Running while applying exit node, retrying", t.Name())
+			}
+		} else {
+			log.Warnln("[Tailscale](%s) set exit node failed, retrying: %v", t.Name(), err)
+		}
+
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			return ctx.Err()
+		}
+		if delay < tailscaleExitNodeRetryMaxDelay {
+			delay *= 2
+			if delay > tailscaleExitNodeRetryMaxDelay {
+				delay = tailscaleExitNodeRetryMaxDelay
+			}
 		}
 	}
+}
+
+func (t *Tailscale) backendStatusRunning(ctx context.Context) (bool, error) {
+	lc, err := t.server.LocalClient()
+	if err != nil {
+		return false, err
+	}
+	status, err := lc.StatusWithoutPeers(ctx)
+	if err != nil {
+		return false, err
+	}
+	state, ok := ipn.StateFromString(status.BackendState)
+	return ok && state == ipn.Running, nil
+}
+
+func tailscaleBackendReady(state ipn.State) bool {
+	return state == ipn.Running
 }
 
 func (t *Tailscale) setBackendInitialized(err error) {
@@ -546,13 +726,14 @@ func (t *Tailscale) IsL3Protocol(metadata *C.Metadata) bool {
 
 func (t *Tailscale) Close() error {
 	t.cancel()
+	t.markBackendUnavailable(errors.New("tailscale outbound closed"))
 	if t.unregisterDNSResolver != nil {
 		t.unregisterDNSResolver()
 	}
 	t.startOnce.Do(func() {
 		t.startErr = errors.New("tailscale outbound closed")
 	})
-	if t.server != nil && t.serverStarted { // tsnet.Server.Close() must not be called before or concurrently with Start.
+	if t.server != nil && t.serverStarted.Load() { // tsnet.Server.Close() must not be called before or concurrently with Start.
 		return t.server.Close()
 	}
 	return nil
