@@ -26,3 +26,8 @@ test/config/cache*
 /output
 .vscode/
 .fleet/
+# Built debug utilities (source lives in cmd/)
+/tcclean
+
+# Agent tooling state
+.omc/
