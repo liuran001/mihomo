@@ -61,6 +61,9 @@ type tcpTracker struct {
 	manager *Manager
 
 	pushToManager bool `json:"-"`
+	initialUpload int64
+	closeOnce     sync.Once
+	closeErr      error
 
 	uploadBucketWindow   *bucketWindow
 	downloadBucketWindow *bucketWindow
@@ -139,20 +142,30 @@ func (tt *tcpTracker) UnwrapWriter() (io.Writer, []N.CountFunc) {
 }
 
 func (tt *tcpTracker) Close() error {
-	connErr := tt.Conn.Close()
-	tt.manager.Leave(tt)
-	tt.reportStall()
-	return connErr
+	tt.closeOnce.Do(func() {
+		tt.closeErr = tt.Conn.Close()
+		tt.manager.Leave(tt)
+		tt.reportStall()
+	})
+	return tt.closeErr
 }
 
-// reportStall flags connections that were established and sent data but got
-// nothing back before closing quickly — the signature of a relay that
-// black-holes traffic while still passing latency probes.
+// reportStall flags connections that sent data after tracking started but got
+// nothing back before closing quickly. Initial upload may be peeked protocol
+// data that was already written during handshake and must not be penalized.
+//
+// This is a heuristic and it does misfire: a request the client cancels right
+// after sending it looks exactly like a relay that swallowed it. That is
+// tolerated rather than tightened, because telling the two apart needs to know
+// which side closed first, which a tracker cannot see. The cost of a false
+// positive is bounded instead — penalize-unstable is opt-in, one incident only
+// adds penaltyPerEvent to ranking latency, and component/health decays it, so a
+// node has to stall repeatedly before the penalty changes which node wins.
 func (tt *tcpTracker) reportStall() {
 	if len(tt.Chain) == 0 {
 		return
 	}
-	if tt.DownloadTotal.Load() > 0 || tt.UploadTotal.Load() == 0 {
+	if tt.DownloadTotal.Load() > 0 || tt.UploadTotal.Load() <= tt.initialUpload {
 		return
 	}
 	if time.Since(tt.Start) > stallWindow {
@@ -186,6 +199,7 @@ func NewTCPTracker(conn C.Conn, manager *Manager, metadata *C.Metadata, rule C.R
 			DownloadTotal: atomic.NewInt64(downloadTotal),
 		},
 		pushToManager:        pushToManager,
+		initialUpload:        uploadTotal,
 		uploadBucketWindow:   newBucketWindow(10, 100),
 		downloadBucketWindow: newBucketWindow(10, 100),
 	}
@@ -214,6 +228,8 @@ type udpTracker struct {
 	manager *Manager
 
 	pushToManager bool `json:"-"`
+	closeOnce     sync.Once
+	closeErr      error
 
 	uploadBucketWindow   *bucketWindow
 	downloadBucketWindow *bucketWindow
@@ -261,9 +277,11 @@ func (ut *udpTracker) WriteTo(b []byte, addr net.Addr) (int, error) {
 }
 
 func (ut *udpTracker) Close() error {
-	connErr := ut.PacketConn.Close()
-	ut.manager.Leave(ut)
-	return connErr
+	ut.closeOnce.Do(func() {
+		ut.closeErr = ut.PacketConn.Close()
+		ut.manager.Leave(ut)
+	})
+	return ut.closeErr
 }
 
 func (ut *udpTracker) Upstream() any {
