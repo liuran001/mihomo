@@ -4,6 +4,9 @@ package ebpf
 
 import (
 	"net/netip"
+	"os"
+	"strconv"
+	"strings"
 	"testing"
 	"unsafe"
 )
@@ -139,4 +142,63 @@ func TestOriginalDestinationFromUDPPeer(t *testing.T) {
 	if _, err = originalDestinationFromUDPPeer(0, peer); err == nil {
 		t.Fatal("accepted an empty connected UDP socket cookie")
 	}
+}
+
+// TestCgroupStatIndicesMatchNativeABI pins the Go stat indices to the values
+// the BPF program actually writes. The Go constants live in a const block
+// without iota, where a bare identifier repeats the previous expression, so a
+// missing "= 1" silently aliases UDP onto the TCP slot instead of failing to
+// compile.
+func TestCgroupStatIndicesMatchNativeABI(t *testing.T) {
+	native := parseNativeDefines(t, "native/abi.h")
+	for _, testCase := range []struct {
+		define string
+		value  int
+	}{
+		{"SB_EBPF_CGROUP_STAT_TCP_REDIRECT_FAILURE", cgroupStatTCPRedirectFailure},
+		{"SB_EBPF_CGROUP_STAT_UDP_REDIRECT_FAILURE", cgroupStatUDPRedirectFailure},
+	} {
+		want, ok := native[testCase.define]
+		if !ok {
+			t.Fatalf("%s is not defined in native/abi.h", testCase.define)
+		}
+		if want != testCase.value {
+			t.Errorf("%s = %d in native/abi.h, Go constant is %d", testCase.define, want, testCase.value)
+		}
+	}
+	if cgroupStatTCPRedirectFailure == cgroupStatUDPRedirectFailure {
+		t.Fatalf("stat indices collide at %d", cgroupStatTCPRedirectFailure)
+	}
+	count, ok := native["SB_EBPF_CGROUP_STAT_COUNT"]
+	if !ok {
+		t.Fatal("SB_EBPF_CGROUP_STAT_COUNT is not defined in native/abi.h")
+	}
+	for _, index := range []int{cgroupStatTCPRedirectFailure, cgroupStatUDPRedirectFailure} {
+		if index < 0 || index >= count {
+			t.Errorf("stat index %d is outside the cgroup_stats map (%d entries)", index, count)
+		}
+	}
+}
+
+// parseNativeDefines reads the plain `#define NAME <int>U` forms used by the
+// eBPF ABI headers. Anything more elaborate is intentionally ignored.
+func parseNativeDefines(t *testing.T, path string) map[string]int {
+	t.Helper()
+	content, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	defines := make(map[string]int)
+	for _, line := range strings.Split(string(content), "\n") {
+		fields := strings.Fields(strings.TrimSpace(line))
+		if len(fields) != 3 || fields[0] != "#define" {
+			continue
+		}
+		value, convErr := strconv.Atoi(strings.TrimSuffix(fields[2], "U"))
+		if convErr != nil {
+			continue
+		}
+		defines[fields[1]] = value
+	}
+	return defines
 }

@@ -45,8 +45,8 @@ func TestCgroupUDPMapConfiguration(t *testing.T) {
 			peerCapacity: 1, flowCapacity: 1,
 		}},
 		{"socket_release", true, true, cgroupUDPMapLayout{
-			cleanupType: CiliumEBPF.Hash, cleanupFlags: bpfFlagNoPrealloc,
-			peerType: CiliumEBPF.Hash, peerFlags: bpfFlagNoPrealloc,
+			cleanupType:  CiliumEBPF.LRUHash,
+			peerType:     CiliumEBPF.LRUHash,
 			peerCapacity: capacity.UDPPeer, flowCapacity: capacity.UDPFlow,
 		}},
 		{"lru_fallback", true, false, cgroupUDPMapLayout{
@@ -65,6 +65,22 @@ func TestCgroupUDPMapConfiguration(t *testing.T) {
 				t.Fatalf("unexpected UDP map configuration: %+v", layout)
 			}
 		})
+	}
+}
+
+func TestStaleUDPRedirectSkipsConnectedEntries(t *testing.T) {
+	cutoff := uint64(100)
+	if !staleUDPRedirect(originalDestinationValue{CreatedAtNS: 99}, cutoff) {
+		t.Fatal("old unconnected UDP redirect was not marked stale")
+	}
+	if staleUDPRedirect(originalDestinationValue{CreatedAtNS: 99, Flags: originalDestinationFlagConnectedUDP}, cutoff) {
+		t.Fatal("connected UDP redirect must be left to sock_release cleanup")
+	}
+	if staleUDPRedirect(originalDestinationValue{CreatedAtNS: 101}, cutoff) {
+		t.Fatal("fresh UDP redirect was marked stale")
+	}
+	if staleUDPRedirect(originalDestinationValue{}, cutoff) {
+		t.Fatal("untimestamped UDP redirect was marked stale")
 	}
 }
 

@@ -1335,3 +1335,153 @@ func containsProgram(programs []string, expected string) bool {
 	}
 	return false
 }
+
+// TestCgroupUDPRedirectSweepOrphanIntegration pins the orphan rule that the
+// bounded-LRU redesign depends on.
+//
+// cgroup_udp_token and cgroup_udp_redirect are independent LRU maps, so the
+// token can be evicted while its redirect survives. Once that happens
+// RecoverConnectedUDPOriginal cannot find the redirect any more (it searches
+// the token map by value), so the entry is unreachable state that would sit in
+// the redirect map until it filled. It must therefore be swept — but only
+// after it has aged past maxAge, so a redirect that was just installed by the
+// BPF program is never taken away from a live socket.
+func TestCgroupUDPRedirectSweepOrphanIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "sweep orphaned connected UDP redirects")
+	backend, err := PrepareCgroup(CgroupConfig{
+		Path:         os.Getenv("SING_BOX_EBPF_INTEGRATION_CGROUP"),
+		EnableUDP:    true,
+		RedirectIPv4: netip.MustParsePrefix("127.128.0.0/9"),
+		MapCapacity:  DefaultCgroupMapCapacity(),
+		UDPTimeout:   5 * time.Minute,
+		Policy:       CgroupPolicy{HijackDNS: true},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if closeErr := backend.Close(); closeErr != nil {
+			t.Errorf("close eBPF backend: %v", closeErr)
+		}
+	})
+
+	const maxAge = time.Minute
+	nowNS, err := monotonicNowNS()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if nowNS <= uint64(2*maxAge) {
+		t.Skip("system uptime is shorter than the sweep window")
+	}
+	staleNS := nowNS - uint64(2*maxAge)
+
+	install := func(t *testing.T, listenerDestination netip.AddrPort, cookie uint64, createdAtNS uint64) listenerLookupKey {
+		t.Helper()
+		key, keyErr := makeListenerLookupKey(ProtocolUDP, listenerDestination)
+		if keyErr != nil {
+			t.Fatal(keyErr)
+		}
+		value := originalDestinationValue{
+			Family:       addressFamilyIPv4,
+			Protocol:     ProtocolUDP,
+			Port:         53,
+			Flags:        originalDestinationFlagConnectedUDP,
+			SocketCookie: cookie,
+			CreatedAtNS:  createdAtNS,
+		}
+		copy(value.Addr[:4], netip.MustParseAddr("192.0.2.53").AsSlice())
+		if updateErr := updateMap(
+			backend.udpRedirectMapFD,
+			unsafe.Pointer(&key),
+			unsafe.Pointer(&value),
+		); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+		t.Cleanup(func() { _ = deleteMap(backend.udpRedirectMapFD, unsafe.Pointer(&key)) })
+		return key
+	}
+	installToken := func(t *testing.T, cookie uint64, listener listenerLookupKey) {
+		t.Helper()
+		if updateErr := updateMap(
+			backend.runtime.udp_token_map_fd,
+			unsafe.Pointer(&cookie),
+			unsafe.Pointer(&listener),
+		); updateErr != nil {
+			t.Fatal(updateErr)
+		}
+		t.Cleanup(func() { _ = deleteMap(backend.runtime.udp_token_map_fd, unsafe.Pointer(&cookie)) })
+	}
+	present := func(t *testing.T, key listenerLookupKey) bool {
+		t.Helper()
+		var value originalDestinationValue
+		lookupErr := lookupMap(backend.udpRedirectMapFD, unsafe.Pointer(&key), unsafe.Pointer(&value))
+		if lookupErr == nil {
+			return true
+		}
+		if errors.Is(lookupErr, unix.ENOENT) {
+			return false
+		}
+		t.Fatal(lookupErr)
+		return false
+	}
+
+	for _, testCase := range []struct {
+		name          string
+		destination   string
+		cookie        uint64
+		createdAtNS   uint64
+		token         bool
+		tokenMismatch bool
+		wantRemoved   bool
+	}{
+		{
+			name:        "stale without token is swept",
+			destination: "127.128.30.10:5300",
+			cookie:      0x2030405060708090,
+			createdAtNS: staleNS,
+			wantRemoved: true,
+		},
+		{
+			name:        "stale with matching token is kept",
+			destination: "127.128.30.11:5301",
+			cookie:      0x2030405060708091,
+			createdAtNS: staleNS,
+			token:       true,
+		},
+		{
+			name:          "stale with mismatched token is swept",
+			destination:   "127.128.30.12:5302",
+			cookie:        0x2030405060708092,
+			createdAtNS:   staleNS,
+			token:         true,
+			tokenMismatch: true,
+			wantRemoved:   true,
+		},
+		{
+			name:        "fresh without token is kept",
+			destination: "127.128.30.13:5303",
+			cookie:      0x2030405060708093,
+			createdAtNS: nowNS,
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			key := install(t, netip.MustParseAddrPort(testCase.destination), testCase.cookie, testCase.createdAtNS)
+			if testCase.token {
+				token := key
+				if testCase.tokenMismatch {
+					token.ListenerPort++
+				}
+				installToken(t, testCase.cookie, token)
+			}
+			if _, sweepErr := backend.SweepStaleUDPRedirects(maxAge, 1024); sweepErr != nil {
+				t.Fatal(sweepErr)
+			}
+			if present(t, key) == testCase.wantRemoved {
+				if testCase.wantRemoved {
+					t.Fatal("orphaned redirect survived the sweep")
+				}
+				t.Fatal("a redirect that is still reachable was swept")
+			}
+		})
+	}
+}

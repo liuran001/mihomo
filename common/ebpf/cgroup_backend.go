@@ -86,16 +86,18 @@ type CgroupBackend struct {
 	access                         sync.RWMutex
 	health                         backendHealth
 	tcpSweepAccess                 sync.Mutex
+	udpSweepAccess                 sync.Mutex
 	udpRecoveryAccess              sync.Mutex
 	udpReplyTokenSequence          atomic.Uint64
 	tcpSweepScratch                mapScanScratch[listenerLookupKey, originalDestinationValue]
 	tcpSweepCandidates             []tcpRedirectEntry
-	tcpSweepDeleteKeys             []listenerLookupKey
-	tcpSweepDeleteSupport          mapBatchSupport
 	connectedUDPTokenLookupSupport mapBatchSupport
 	connectedUDPTokenKeys          []uint64
 	connectedUDPTokenValues        []listenerLookupKey
 	tcpSweepRemoved                uint32
+	udpSweepScratch                mapScanScratch[listenerLookupKey, originalDestinationValue]
+	udpSweepCandidates             []tcpRedirectEntry
+	udpSweepRemoved                uint32
 	tcpRedirectUsage               atomic.Uint32
 	tcpRedirectUsageKnown          atomic.Bool
 	lookupAndDeleteMode            atomic.Int32

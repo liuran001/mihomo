@@ -33,9 +33,12 @@ func prepareCgroupMaps(runtimeState *cgroupRuntime, capacity CgroupMapCapacity, 
 	}
 	var err error
 	runtimeState.maps, err = loadObjectMaps(loadCgroup, map[string]mapSpecOverride{
-		"cgroup_control":        {name: "sb_cg_control", mapType: CiliumEBPF.Array, maxEntries: 1},
-		"cgroup_stats":          {name: "sb_cg_stats", mapType: CiliumEBPF.Array, maxEntries: 2},
-		"cgroup_tcp_redirect":   {name: "sb_cg_tcp", mapType: CiliumEBPF.Hash, maxEntries: tcpCapacity, flags: bpfFlagNoPrealloc},
+		"cgroup_control": {name: "sb_cg_control", mapType: CiliumEBPF.Array, maxEntries: 1},
+		"cgroup_stats":   {name: "sb_cg_stats", mapType: CiliumEBPF.Array, maxEntries: 2},
+		// TCP redirect entries are removed on accept, but a failed/non-accepted
+		// connect can outlive userspace. Keep the map bounded so a long-running
+		// Android process cannot turn stale state into permanent EPERM failures.
+		"cgroup_tcp_redirect":   {name: "sb_cg_tcp", mapType: CiliumEBPF.LRUHash, maxEntries: tcpCapacity},
 		"cgroup_udp_redirect":   {name: "sb_cg_udp", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
 		"cgroup_udp_recovery":   {name: "sb_cg_recover", mapType: CiliumEBPF.LRUHash, maxEntries: recoveryCapacity},
 		"cgroup_udp_token":      {name: "sb_cg_token", mapType: udpLayout.cleanupType, maxEntries: udpCapacity, flags: udpLayout.cleanupFlags},
@@ -97,14 +100,19 @@ func cgroupUDPMapConfiguration(
 		return layout
 	}
 	layout.peerCapacity = capacity.UDPPeer
-	if socketReleaseSupported {
-		layout.flowCapacity = capacity.UDPFlow
-		return layout
-	}
+	// Keep redirect, token, and peer state bounded even when the kernel has
+	// sock_release support. Unconnected sendmsg flows do not have a token entry
+	// for sock_release to find, so fixed Hash maps can still fill permanently
+	// when a packet never reaches userspace. sock_release remains the precise
+	// cleanup path; LRU is the last-resort protection for orphaned state.
 	layout.cleanupType = CiliumEBPF.LRUHash
 	layout.cleanupFlags = 0
 	layout.peerType = CiliumEBPF.LRUHash
 	layout.peerFlags = 0
+	if socketReleaseSupported {
+		layout.flowCapacity = capacity.UDPFlow
+		return layout
+	}
 	return layout
 }
 
@@ -113,20 +121,17 @@ func validateCgroupUDPCleanupMaps(runtimeState *cgroupRuntime) error {
 		return nil
 	}
 	expectedType := CiliumEBPF.LRUHash
-	if runtimeState.socket_release_supported {
-		expectedType = CiliumEBPF.Hash
-	}
-	for _, name := range []string{"cgroup_udp_redirect", "cgroup_udp_token"} {
+	for _, name := range []string{"cgroup_udp_redirect", "cgroup_udp_token", "cgroup_udp_peer"} {
 		mapInstance := runtimeState.maps[name]
 		if mapInstance == nil {
-			return E.New("missing UDP cleanup map ", name)
+			return E.New("missing UDP LRU map ", name)
 		}
 		info, err := mapInstance.Info()
 		if err != nil {
-			return E.Cause(err, "inspect UDP cleanup map ", name)
+			return E.Cause(err, "inspect UDP LRU map ", name)
 		}
 		if info.Type != expectedType {
-			return E.New("invalid UDP cleanup map type for ", name, ": ", info.Type, ", expected ", expectedType)
+			return E.New("invalid UDP LRU map type for ", name, ": ", info.Type, ", expected ", expectedType)
 		}
 	}
 	return nil

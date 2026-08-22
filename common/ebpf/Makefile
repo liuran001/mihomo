@@ -51,7 +51,7 @@ check:
 	trap 'rm -rf "$$temporary"' EXIT; \
 	mkdir -p "$$temporary/$(GENERATED_DIR)"; \
 	cp $(GENERATED) "$$temporary/$(GENERATED_DIR)"; \
-	$(MAKE) generate; \
+	$(MAKE) generate || exit 1; \
 	for file in $(GENERATED); do \
 		cmp -s "$$file" "$$temporary/$$file" || { echo "$$file is stale; run 'make generate' in common/ebpf" >&2; exit 1; }; \
 	done

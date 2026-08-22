@@ -35,13 +35,14 @@ token. recvmsg hooks restore connected UDP peer addresses. The userspace
 listener uses the token to recover the original destination and then enters the
 normal sing-box routing pipeline.
 
-TCP state is short-lived Hash state removed by the listener or the stale-state
-janitor. UDP uses two capability-selected layouts:
-
-- `socket_release`: ordinary Hash maps plus an attached
-  `cgroup/sock_release` program perform exact socket-cookie cleanup.
-- `lru_fallback`: bounded LRU maps, connected-peer recovery, and conservative
-  userspace cleanup support kernels without a usable release hook.
+TCP state is short-lived bounded LRU state removed by the listener when the
+original destination is consumed. UDP redirect, token, and peer state also use
+bounded LRU maps. When
+available, an attached `cgroup/sock_release` program performs exact
+socket-cookie cleanup; the LRU policy remains as a last-resort guard for
+unconnected sendmsg flows that have no token to clean up. Kernels without a
+usable release hook additionally use connected-peer recovery and conservative
+userspace cleanup.
 
 The BPF hot path uses direct helpers. Go hot-path map access uses fixed ABI
 structs and raw typed `bpf(2)` calls to avoid reflection and allocation.
@@ -324,8 +325,8 @@ maps are:
 | UID include/exclude | LPM trie | normalized range count | Pre-sized policy map, replaced atomically. |
 | Destination bypass | LPM trie | configured rule count | Updated on rule-set changes; no packet-path iteration. |
 | Local host/private | Hash | 4096 per address family | `BPF_F_NO_PREALLOC`; buckets still scale with `max_entries`. |
-| Local TCP redirect | Hash | bounded redirect capacity | Delete on accept/close plus janitor fallback. |
-| Local UDP token/peer | Hash or LRU fallback | bounded UDP capacity | Cookie/recovery state; release hook is preferred. |
+| Local TCP redirect | LRU hash | bounded redirect capacity | Delete on accept/close; eviction is the final guard for abandoned connects. |
+| Local UDP redirect/token/peer | LRU hash | bounded UDP capacity | Cookie/recovery state; release hook is preferred and userspace recovery validates both directions. |
 | Shared flow by original/token | Hash | configured shared capacity | Two authoritative directions and generation checks. |
 | Shared source/MAC | LPM/Hash | sized from configured inputs | Prepared only when shared interfaces are active. |
 | Fragment/rewrite scratch | LRU/array | small fixed bound | Eviction is acceptable; never authoritative flow state. |

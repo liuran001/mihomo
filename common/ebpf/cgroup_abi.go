@@ -24,8 +24,13 @@ const (
 	SharedNetworkFragmentCapacity = 8192
 	UDPRecoveryMapCapacity        = 8192
 	MaxConfigurableMapCapacity    = 1 << 20
-	cgroupStatTCPRedirectFailure  = 0
-	cgroupStatUDPRedirectFailure
+	// These mirror SB_EBPF_CGROUP_STAT_* in native/abi.h and index the
+	// cgroup_stats array map. Both values must be written out: a bare
+	// identifier in a const block without iota repeats the previous
+	// expression, which silently aliased UDP onto the TCP slot and made
+	// udp_redirect_reservation_failures report the TCP counter.
+	cgroupStatTCPRedirectFailure        = 0
+	cgroupStatUDPRedirectFailure        = 1
 	originalDestinationFlagConnectedUDP = 1
 	udpFlowActionProxy                  = 1
 	udpFlowActionBypass                 = 2
@@ -102,6 +107,13 @@ type MapUsage struct {
 }
 
 type CgroupTCPRedirectSweepResult struct {
+	Scanned  uint32
+	Removed  uint32
+	Usage    MapUsage
+	Complete bool
+}
+
+type CgroupUDPRedirectSweepResult struct {
 	Scanned  uint32
 	Removed  uint32
 	Usage    MapUsage
