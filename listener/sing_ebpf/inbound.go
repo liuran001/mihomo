@@ -91,6 +91,9 @@ type Inbound struct {
 	udpClientTable udpClientTable
 	udpWarnings    udpWarningLimiters
 
+	tcpRedirectPressure *mapPressureWatcher
+	udpRedirectPressure *mapPressureWatcher
+
 	bypassRuleSetAccess   sync.Mutex
 	bypassRuleSet         []P.RuleProvider
 	bypassRuleSetCallback io.Closer
@@ -202,6 +205,8 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		sharedNetworkMapCapacity: sharedNetworkMapCapacity,
 		sharedNetworkIncludeMAC:  sharedNetworkIncludeMAC,
 		sharedNetworkExcludeMAC:  sharedNetworkExcludeMAC,
+		tcpRedirectPressure:      newMapPressureWatcher(),
+		udpRedirectPressure:      newMapPressureWatcher(),
 		cgroupPolicy: ECommon.CgroupPolicy{
 			HijackDNS:            dnsMode != dnsModeOff,
 			DNSRespectBypass:     dnsMode == dnsModeRespectBypass,
@@ -358,7 +363,31 @@ func (i *Inbound) start() error {
 			}
 		}
 	}
+	reportKernelCapabilities(
+		i.kernelProbeMode(),
+		i.options.Network,
+		i.backendCgroupPath(),
+		i.firstSharedInterface(),
+	)
 	return nil
+}
+
+func (i *Inbound) kernelProbeMode() ECommon.KernelProbeMode {
+	switch {
+	case i.cgroupEnabled && i.sharedNetworkEnabled:
+		return ECommon.KernelProbeModeAll
+	case i.sharedNetworkEnabled:
+		return ECommon.KernelProbeModeSharedNetwork
+	default:
+		return ECommon.KernelProbeModeLocal
+	}
+}
+
+func (i *Inbound) firstSharedInterface() string {
+	if i.sharedNetwork == nil || len(i.sharedNetwork.interfaces) == 0 {
+		return ""
+	}
+	return i.sharedNetwork.interfaces[0]
 }
 
 func (i *Inbound) Close() error {
@@ -527,6 +556,12 @@ func (i *Inbound) udpPeriodicLoop(stop <-chan struct{}, done chan<- struct{}) {
 				} else if result.Removed > 0 {
 					log.Debugln("[EBPF] swept %d stale UDP redirects", result.Removed)
 				}
+				// Report after sweeping: the sweep is what refreshes the count,
+				// and reading it first would warn on the pre-reclaim number.
+				tcpUsage, tcpUsageErr := backend.RedirectMapUsage(ECommon.ProtocolTCP)
+				i.tcpRedirectPressure.observe(i.logWarn, "cgroup_tcp_redirect", tcpUsage, tcpUsageErr)
+				udpUsage, udpUsageErr := backend.RedirectMapUsage(ECommon.ProtocolUDP)
+				i.udpRedirectPressure.observe(i.logWarn, "cgroup_udp_redirect", udpUsage, udpUsageErr)
 			}
 		case <-bypassTicker.C:
 			i.refreshBypassCIDRPeriodic()

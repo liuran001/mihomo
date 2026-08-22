@@ -26,6 +26,11 @@ type sharedNetwork struct {
 	udpWarnings    udpWarningLimiters
 	mapCapacity    ECommon.SharedNetworkMapCapacities
 	tcPriority     uint16
+	// shared_flow_by_original and shared_flow_by_token are plain hash maps, not
+	// LRU: once they fill, reserve_token fails and the TC program drops the
+	// packet outright, so pressure here is worth reporting well before the map
+	// is actually full.
+	proxyPressure *mapPressureWatcher
 
 	lifecycleAccess sync.RWMutex
 	backendAccess   sync.RWMutex
@@ -44,6 +49,8 @@ func newSharedNetwork(inbound *Inbound, sharedOptions LC.EBPFShared, mapCapacity
 		options:     sharedOptions,
 		mapCapacity: mapCapacity,
 		tcPriority:  tcPriority,
+
+		proxyPressure: newMapPressureWatcher(),
 	}
 }
 
@@ -165,6 +172,9 @@ func (s *sharedNetwork) udpPeriodicLoop(stop <-chan struct{}, done chan<- struct
 				} else if result.Removed > 0 {
 					log.Debugln("[EBPF] swept %d orphaned shared-network flows", result.Removed)
 				}
+				usage, usageErr := backend.ProxyMapUsage()
+				s.proxyPressure.observe(
+					s.inbound.logWarn, "shared_flow_by_original", usage, usageErr)
 			}
 		}
 	}

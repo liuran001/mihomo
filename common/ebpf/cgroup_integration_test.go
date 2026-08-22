@@ -1477,6 +1477,13 @@ func TestCgroupUDPRedirectSweepOrphanIntegration(t *testing.T) {
 			if _, sweepErr := backend.SweepStaleUDPRedirects(maxAge, 1024); sweepErr != nil {
 				t.Fatal(sweepErr)
 			}
+			// The sweeper only deletes through BPF_MAP_LOOKUP_AND_DELETE_ELEM, which
+			// the kernel refuses on hash maps before 5.14. On an older kernel the
+			// sweep is deliberately a no-op and the LRU maps do the reclaiming, so
+			// asserting removal here would report a kernel limitation as a defect.
+			if mode := backend.LookupAndDeleteMode(); mode == "unsupported_lru_only" {
+				t.Skip("kernel cannot lookup-and-delete hash maps; reclamation is LRU-only")
+			}
 			if present(t, key) == testCase.wantRemoved {
 				if testCase.wantRemoved {
 					t.Fatal("orphaned redirect survived the sweep")

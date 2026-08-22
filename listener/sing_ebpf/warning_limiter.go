@@ -17,6 +17,10 @@ type warningLimiter struct {
 	access     sync.Mutex
 	next       time.Time
 	suppressed uint64
+	// interval overrides packetWarningInterval. A condition that persists for
+	// hours -- map pressure, say -- would otherwise repeat every ten seconds
+	// and drown out the per-packet warnings this limiter was written for.
+	interval time.Duration
 }
 
 func (l *warningLimiter) allow(now time.Time) (bool, uint64) {
@@ -28,7 +32,11 @@ func (l *warningLimiter) allow(now time.Time) (bool, uint64) {
 	}
 	suppressed := l.suppressed
 	l.suppressed = 0
-	l.next = now.Add(packetWarningInterval)
+	interval := l.interval
+	if interval <= 0 {
+		interval = packetWarningInterval
+	}
+	l.next = now.Add(interval)
 	return true, suppressed
 }
 

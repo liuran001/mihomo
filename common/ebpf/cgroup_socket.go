@@ -780,7 +780,11 @@ func (b *CgroupBackend) LookupAndDeleteMode() string {
 	case mapLookupAndDeleteSupported:
 		return "atomic"
 	case mapLookupAndDeleteUnsupported:
-		return "lookup_delete_fallback"
+		// Not a fallback: there is no second code path. BPF_MAP_LOOKUP_AND_DELETE_ELEM
+		// only accepts hash maps from Linux 5.14, and without it deleteStaleRedirect
+		// declines to act rather than race a lookup against a concurrent refresh,
+		// so reclamation on such kernels is whatever the bounded LRU maps do.
+		return "unsupported_lru_only"
 	default:
 		return "unknown"
 	}
