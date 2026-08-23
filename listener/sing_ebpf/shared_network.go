@@ -7,6 +7,7 @@ import (
 	"time"
 
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
+	"github.com/metacubex/mihomo/component/resolver"
 	LC "github.com/metacubex/mihomo/listener/config"
 	"github.com/metacubex/mihomo/log"
 
@@ -58,6 +59,9 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 	if err := s.startListeners(); err != nil {
 		return E.Errors(err, s.closeListeners())
 	}
+	// Same reason as the cgroup path: a fake-ip destination carries no routable
+	// meaning, so it must be intercepted even when policy would bypass it.
+	fakeIPIPv4, fakeIPIPv6 := resolver.FakeIPRanges()
 	backend, err := ECommon.PrepareSharedNetwork(cgroupBackend, ECommon.SharedNetworkConfig{
 		ListenerPort:         s.listeners.selectedPort(),
 		EnableTCP:            s.inbound.enableTCP,
@@ -67,6 +71,8 @@ func (s *sharedNetwork) Start(cgroupBackend *ECommon.CgroupBackend) error {
 		BypassPrivateAddress: s.inbound.bypassPrivateAddress,
 		RedirectIPv4:         s.inbound.redirectIPv4Prefix,
 		RedirectIPv6:         s.inbound.sharedRedirectIPv6Prefix(),
+		FakeIPIPv4:           fakeIPIPv4,
+		FakeIPIPv6:           fakeIPIPv6,
 		IncludeSourceCIDR:    s.options.IncludeSourceCIDR,
 		ExcludeSourceCIDR:    s.options.ExcludeSourceCIDR,
 		IncludeSourceMAC:     s.inbound.sharedNetworkIncludeMAC,

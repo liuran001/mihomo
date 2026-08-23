@@ -73,6 +73,7 @@ type Inbound struct {
 	androidUIDOptions        *androidUIDOptions
 	udpTimeout               time.Duration
 	bypassPrivateAddress     bool
+	bypassTUNDirect          bool
 	sharedNetworkMapCapacity ECommon.SharedNetworkMapCapacities
 	sharedNetworkIncludeMAC  []ECommon.MACAddress
 	sharedNetworkExcludeMAC  []ECommon.MACAddress
@@ -93,6 +94,10 @@ type Inbound struct {
 
 	tcpRedirectPressure *mapPressureWatcher
 	udpRedirectPressure *mapPressureWatcher
+
+	localNetwork       *localNetworkMonitor
+	fakeIPRangeRemove  func()
+	tunOverlapWarnings warningLimiter
 
 	bypassRuleSetAccess   sync.Mutex
 	bypassRuleSet         []P.RuleProvider
@@ -182,6 +187,10 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 	}
 	udpTimeout := resolveUDPTimeout(options.UDPTimeout)
 	bypassPrivateAddress := options.BypassPrivateAddress == nil || *options.BypassPrivateAddress
+	// On by default: a destination this inbound bypasses is one the user asked
+	// to keep off the proxy, and letting TUN hand it to the rules instead is
+	// what makes a bypassed address unreachable.
+	bypassTUNDirect := options.BypassTUNDirect == nil || *options.BypassTUNDirect
 
 	inboundListener := &Inbound{
 		ctx:                      ctx,
@@ -202,6 +211,7 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		cgroupMapCapacity:        cgroupMapCapacity,
 		udpTimeout:               udpTimeout,
 		bypassPrivateAddress:     bypassPrivateAddress,
+		bypassTUNDirect:          bypassTUNDirect,
 		sharedNetworkMapCapacity: sharedNetworkMapCapacity,
 		sharedNetworkIncludeMAC:  sharedNetworkIncludeMAC,
 		sharedNetworkExcludeMAC:  sharedNetworkExcludeMAC,
@@ -218,6 +228,7 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		},
 		androidUIDOptions: newAndroidUIDOptions(options.Local),
 	}
+	inboundListener.tunOverlapWarnings.interval = tunOverlapWarningInterval
 
 	rp, ok := tunnel.(P.Tunnel)
 	if !ok {
@@ -273,6 +284,10 @@ func (i *Inbound) start() error {
 		}
 		policy := i.cgroupPolicy
 		policy.EnableBypassCIDR = true
+		// A fake-ip destination has to be intercepted even when it would
+		// otherwise be bypassed: the address only regains meaning once the
+		// tunnel maps it back to its domain.
+		fakeIPIPv4, fakeIPIPv6 := resolver.FakeIPRanges()
 		backend, err := ECommon.PrepareCgroup(ECommon.CgroupConfig{
 			Path:          i.cgroupPath,
 			EnableTCP:     i.enableTCP,
@@ -282,6 +297,8 @@ func (i *Inbound) start() error {
 			IPv6Available: i.cgroupIPv6Available,
 			RedirectIPv4:  i.redirectIPv4Prefix,
 			RedirectIPv6:  i.redirectIPv6Prefix,
+			FakeIPIPv4:    fakeIPIPv4,
+			FakeIPIPv6:    fakeIPIPv6,
 			MapCapacity:   i.cgroupMapCapacity,
 			UDPTimeout:    i.udpTimeout,
 			Policy:        policy,
@@ -363,6 +380,16 @@ func (i *Inbound) start() error {
 			}
 		}
 	}
+	if i.cgroupEnabled {
+		i.startLocalNetworkMonitor()
+	}
+	// Publish the bypass policy even when no bypass_rule_set refresh will ever
+	// run (shared-only mode, or no rule sets configured), so the TUN listener
+	// can still report an overlap with the private ranges.
+	i.bypassRuleSetAccess.Lock()
+	i.publishBypassPolicyLocked()
+	i.bypassRuleSetAccess.Unlock()
+	i.startFakeIPTracking()
 	reportKernelCapabilities(
 		i.kernelProbeMode(),
 		i.options.Network,
@@ -394,8 +421,12 @@ func (i *Inbound) Close() error {
 	var closeErr error
 	i.closeOnce.Do(func() {
 		i.stopUDPPeriodic()
+		i.stopFakeIPTracking()
+		i.stopLocalNetworkMonitor()
 		i.stopBypassRuleSets()
 		resolver.EBFPBypassIPSet.Store(nil)
+		resolver.EBPFBypassPolicyValue.Store(nil)
+		resolver.EBPFRouteExcludePrefixes.Store(nil)
 		if i.sharedNetwork != nil {
 			closeErr = i.sharedNetwork.Close()
 		}

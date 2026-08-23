@@ -12,6 +12,7 @@ type EBPF struct {
 	DNSMode              string     `json:"dns-mode" yaml:"dns-mode"`
 	BypassPrivateAddress *bool      `json:"bypass-private-address" yaml:"bypass-private-address" inbound:"bypass-private-address,omitempty"`
 	BypassRuleSet        []string   `json:"bypass-rule-set" yaml:"bypass-rule-set"`
+	BypassTUNDirect      *bool      `json:"bypass-tun-direct" yaml:"bypass-tun-direct" inbound:"bypass-tun-direct,omitempty"`
 	Local                EBPFLocal  `json:"local" yaml:"local" inbound:"local,omitempty"`
 	Shared               EBPFShared `json:"shared" yaml:"shared" inbound:"shared,omitempty"`
 }

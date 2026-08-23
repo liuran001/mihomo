@@ -183,6 +183,11 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 	if len(options.Inet6RouteExcludeAddress) > 0 {
 		routeExcludeAddress = append(routeExcludeAddress, options.Inet6RouteExcludeAddress...)
 	}
+	if ebpfExclude := ebpfRouteExcludeAddress(options.Inet4Address, options.Inet6Address); len(ebpfExclude) > 0 {
+		routeExcludeAddress = append(routeExcludeAddress, ebpfExclude...)
+		log.Infoln("[TUN] keeping %d prefix(es) off auto-route so the eBPF inbound bypass stays direct: %s",
+			len(ebpfExclude), prefixesText(ebpfExclude))
+	}
 	inet4RouteExcludeAddress := common.Filter(routeExcludeAddress, func(it netip.Prefix) bool {
 		return it.Addr().Is4()
 	})
@@ -538,6 +543,8 @@ func New(options LC.Tun, tunnel C.Tunnel, additions ...inbound.Addition) (l *Lis
 		resolver.ResetConnection()
 	}
 
+	publishTunRouteClaim(&tunOptions)
+
 	if options.FileDescriptor != 0 {
 		tunName = fmt.Sprintf("%s(fd=%d)", tunName, options.FileDescriptor)
 	}
@@ -667,6 +674,7 @@ func parseRange[T constraints.Integer](uidRanges []ranges.Range[T], rangeList []
 
 func (l *Listener) Close() error {
 	l.closed = true
+	clearTunRouteClaim()
 	resolver.RemoveSystemDnsBlacklist(l.dnsServerIp...)
 	if l.autoRedirectOutputMark != 0 {
 		dialer.DefaultRoutingMark.CompareAndSwap(l.autoRedirectOutputMark, 0)

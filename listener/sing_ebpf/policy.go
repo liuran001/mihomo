@@ -172,5 +172,6 @@ func (i *Inbound) applyBypassCIDRLocked() (bool, error) {
 	} else {
 		resolver.EBFPBypassIPSet.Store(nil)
 	}
+	i.publishBypassPolicyLocked()
 	return updated, nil
 }

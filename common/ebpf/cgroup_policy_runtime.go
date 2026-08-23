@@ -152,7 +152,16 @@ func (b *CgroupBackend) UpdateHostAddresses(addresses []netip.Addr) error {
 	}
 	b.hostIPv4 = slices.Clone(ipv4)
 	b.hostIPv6 = slices.Clone(ipv6)
-	return nil
+	// The packet program skips the host lookup entirely unless the control
+	// flags say the map is populated, so a set that only becomes non-empty
+	// after load -- an interface that appeared later, say -- has to move the
+	// flags with it or the new entries are never consulted.
+	return b.mutateCgroupControlLocked(b.applyHostAddressControlLocked)
+}
+
+func (b *CgroupBackend) applyHostAddressControlLocked(control *cgroupControl) {
+	control.Flags &^= cgroupFlagHostIPv4 | cgroupFlagHostIPv6
+	control.Flags |= b.hostAddressFlags()
 }
 
 type dualStackCIDRPrefixes struct {

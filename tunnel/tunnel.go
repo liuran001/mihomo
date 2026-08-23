@@ -285,6 +285,35 @@ func fixMetadata(metadata *C.Metadata) {
 	}
 }
 
+// ebpfBypassedDirect honours an eBPF bypass that TUN took over.
+//
+// A destination the eBPF inbound bypasses is one the kernel already let past
+// the redirect; it only arrives here because TUN auto-route pointed the routing
+// table at the TUN device. Matching it against the rules is what turns the
+// bypass into a black hole: the rules were written expecting these destinations
+// never to arrive, so they fall through to the final rule, and a LAN or
+// geo-restricted address handed to a remote proxy simply times out. Connecting
+// it directly is what the bypass asked for in the first place.
+//
+// Only TUN-sourced flows qualify. Every other inbound was addressed on purpose,
+// so its traffic is the user's explicit request to route something, not a side
+// effect of a route the eBPF policy tried to leave alone.
+func ebpfBypassedDirect(metadata *C.Metadata) (C.Proxy, bool) {
+	if metadata.Type != C.TUN || !metadata.DstIP.IsValid() {
+		return nil, false
+	}
+	if !resolver.EBPFBypassedDirect(metadata.DstIP) {
+		return nil, false
+	}
+	direct, exist := proxies["DIRECT"]
+	if !exist {
+		return nil, false
+	}
+	log.Debugln("[Rule] %s is bypassed by the eBPF inbound, connecting directly instead of matching rules",
+		metadata.RemoteAddress())
+	return direct, true
+}
+
 func needLookupIP(metadata *C.Metadata) bool {
 	return resolver.MappingEnabled() && metadata.Host == "" && metadata.DstIP.IsValid()
 }
@@ -325,6 +354,9 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 			err = fmt.Errorf("proxy %s not found", metadata.SpecialProxy)
 		}
 		return
+	}
+	if direct, ok := ebpfBypassedDirect(metadata); ok {
+		return direct, nil, nil
 	}
 	var (
 		resolved             bool
