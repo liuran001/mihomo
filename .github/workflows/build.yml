@@ -142,6 +142,18 @@ jobs:
         echo "BUILDTAG=-extldflags --static" >> $GITHUB_ENV
         echo "GOTOOLCHAIN=local" >> $GITHUB_ENV
 
+        # The eBPF inbound is gated behind with_ebpf, and the release builds
+        # never passed it -- so every published binary answered a configured
+        # eBPF listener with "eBPF inbound requires cgo and the with_ebpf build
+        # tag" and started without it. That also silently downgraded anyone who
+        # self-upgraded through POST /upgrade, which points at this repository.
+        # The tag only has an effect on linux and android; elsewhere it selects
+        # the same stub an untagged build already gets, so scope it.
+        case "${{matrix.jobs.goos}}" in
+          linux|android) echo "BUILDTAGS=with_gvisor,with_ebpf" >> $GITHUB_ENV ;;
+          *)             echo "BUILDTAGS=with_gvisor" >> $GITHUB_ENV ;;
+        esac
+
     - name: Setup NDK
       if: ${{ matrix.jobs.goos == 'android' }}
       uses: nttld/setup-ndk@v1
@@ -181,7 +193,7 @@ jobs:
         GOMIPS: ${{matrix.jobs.gomips}}
       run: |
         go env
-        go build -v -tags "with_gvisor" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
+        go build -v -tags "${BUILDTAGS}" -trimpath -ldflags "${BUILDTAG} -X 'github.com/metacubex/mihomo/constant.Version=${VERSION}' -X 'github.com/metacubex/mihomo/constant.BuildTime=${BUILDTIME}' -w -s -buildid="
         if [ "${{matrix.jobs.goos}}" = "windows" ]; then
           cp mihomo.exe mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe
           zip -r mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}-${VERSION}.zip mihomo-${{matrix.jobs.goos}}-${{matrix.jobs.output}}.exe

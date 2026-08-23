@@ -70,3 +70,13 @@ jobs:
 
       - name: Test with tag with_gvisor
         run: go test ./... -v -count=1 -tags "with_gvisor"
+
+      # The eBPF inbound is this branch's headline feature and no CI job had
+      # ever compiled it: both steps above leave with_ebpf off, so every test
+      # under common/ebpf and listener/sing_ebpf was skipped by the build
+      # constraint rather than run. Linux only -- the tag selects a stub
+      # everywhere else. The root-gated tests stay out of this; they need the
+      # separate ebpf_integration tag.
+      - name: Test with tag with_ebpf
+        if: ${{ runner.os == 'Linux' }}
+        run: go test ./... -v -count=1 -tags "with_gvisor,with_ebpf"
