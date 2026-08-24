@@ -230,6 +230,12 @@ TUN device. A bypassed destination TUN claims is therefore not direct: it enters
 the TUN stack and is routed by the rule engine, which black-holes it whenever no
 rule sends it direct and the matched proxy cannot reach the address.
 
+`auto-route` is not the whole story on Linux: sing-tun gates only the IPv4 route
+set on it, and builds the IPv6 route set for any device that has IPv6 addresses,
+which `setRoute` then installs along with a matching `ip rule`. A device
+configured with `auto-route: false` therefore still claims IPv6 destinations, and
+the overlap report covers them.
+
 Two mechanisms keep the bypass meaningful, split by set size:
 
 | Bypass source | Mechanism | Where |

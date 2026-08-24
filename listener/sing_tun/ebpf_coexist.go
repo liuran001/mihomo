@@ -80,10 +80,13 @@ func removePrefix(builder *netipx.IPSetBuilder, prefixes ...netip.Prefix) {
 // after all. The claim is the final route set, after every route-exclude option
 // has been applied.
 func publishTunRouteClaim(tunOptions *tun.Options) {
-	if !tunOptions.AutoRoute {
-		resolver.TunRouteClaimed.Store(nil)
-		return
-	}
+	// No auto-route gate of our own. sing-tun applies auto-route to the IPv4
+	// half only: BuildAutoRouteRanges builds the IPv6 half whenever the device
+	// has IPv6 addresses, and on Linux setRoute installs those routes -- with a
+	// matching ip rule -- whether or not auto-route is on. Asking the same
+	// function sing-tun asks is what keeps the claim equal to the routes that
+	// actually exist; deciding here instead under-reported every IPv6 claim of a
+	// device configured with auto-route off.
 	routeRanges, err := tunOptions.BuildAutoRouteRanges(false)
 	if err != nil || len(routeRanges) == 0 {
 		resolver.TunRouteClaimed.Store(nil)

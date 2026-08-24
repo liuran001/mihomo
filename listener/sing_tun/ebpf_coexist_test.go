@@ -109,8 +109,8 @@ func TestPublishTunRouteClaim(t *testing.T) {
 		netip.MustParsePrefix("198.51.100.0/24"),
 	}, nil, true)
 
-	// No auto-route: nothing is taken over, so a bypass reaches the routing
-	// table untouched.
+	// No auto-route and no IPv6 addresses: nothing is taken over, so a bypass
+	// reaches the routing table untouched.
 	publishTunRouteClaim(&tun.Options{
 		Inet4Address: []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")},
 	})
@@ -141,5 +141,34 @@ func TestPublishTunRouteClaim(t *testing.T) {
 	clearTunRouteClaim()
 	if claim := resolver.TunRouteClaimed.Load(); claim != nil {
 		t.Fatalf("expected the claim to be cleared, got %v", claim)
+	}
+}
+
+// Auto-route gates the IPv4 half only. sing-tun builds the IPv6 route set
+// whenever the device has IPv6 addresses, and on Linux installs it -- with a
+// matching ip rule -- whether or not auto-route is on. Those destinations are
+// taken over, so the claim has to say so, or an IPv6 bypass that TUN swallowed
+// is never reported.
+func TestPublishTunRouteClaimCoversIPv6WithoutAutoRoute(t *testing.T) {
+	publisher := restoreCoexistState(t)
+	publisher.Publish(nil, []netip.Prefix{netip.MustParsePrefix("2001:db8::/32")}, nil, true)
+
+	publishTunRouteClaim(&tun.Options{
+		Inet4Address: []netip.Prefix{netip.MustParsePrefix("198.18.0.1/30")},
+		Inet6Address: []netip.Prefix{netip.MustParsePrefix("fdfe:dcba:9876::1/126")},
+	})
+
+	claim := resolver.TunRouteClaimed.Load()
+	if claim == nil || claim.Claimed == nil {
+		t.Fatal("expected the IPv6 routes of a device without auto-route to still be claimed")
+	}
+	if !claim.Claimed.Contains(netip.MustParseAddr("2001:db8::1")) {
+		t.Fatal("expected the IPv6 route set to be claimed")
+	}
+	if claim.Claimed.Contains(netip.MustParseAddr("10.1.2.3")) {
+		t.Fatal("expected no IPv4 claim without auto-route")
+	}
+	if overlap := prefixTexts(resolver.TunClaimedBypassPrefixes()); len(overlap) != 1 || overlap[0] != "2001:db8::/32" {
+		t.Fatalf("expected the swallowed IPv6 bypass to be reported, got %v", overlap)
 	}
 }

@@ -2,9 +2,11 @@ package listener
 
 import (
 	"errors"
+	"net/netip"
 	"testing"
 
 	C "github.com/metacubex/mihomo/constant"
+	LC "github.com/metacubex/mihomo/listener/config"
 )
 
 type stubInboundConfig struct{ name string }
@@ -109,5 +111,27 @@ func TestPatchInboundListenersRebuildsAListenerItLeftAlone(t *testing.T) {
 	}
 	if running.closes != 1 || running.listens != 1 {
 		t.Fatalf("expected the running listener to be restarted for the state that moved, got %d close(s) and %d listen(s)", running.closes, running.listens)
+	}
+}
+
+// Cleanup tears the TUN device down, so the config that described it has to stop
+// answering for it. ReCreateTun compares against both of these, and a later call
+// with the same config would otherwise decide nothing changed and leave the
+// tunnel with no device at all.
+func TestCleanupClearsTheTunStateItInvalidated(t *testing.T) {
+	withInboundListeners(t, map[string]C.InboundListener{})
+
+	previousConf, previousExclude := LastTunConf, lastTunEBPFExclude
+	t.Cleanup(func() { LastTunConf, lastTunEBPFExclude = previousConf, previousExclude })
+	LastTunConf = LC.Tun{Enable: true, Device: "utun0"}
+	lastTunEBPFExclude = []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
+
+	Cleanup()
+
+	if LastTunConf.Enable || LastTunConf.Device != "" {
+		t.Fatalf("expected the tun config to be cleared, got %+v", LastTunConf)
+	}
+	if lastTunEBPFExclude != nil {
+		t.Fatalf("expected the recorded route exclusion to be cleared, got %v", lastTunEBPFExclude)
 	}
 }

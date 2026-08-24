@@ -2,10 +2,13 @@ package tunnel
 
 import (
 	"net/netip"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/metacubex/mihomo/component/resolver"
 	C "github.com/metacubex/mihomo/constant"
+	"github.com/metacubex/mihomo/log"
 )
 
 // stubProxy is the smallest thing that satisfies C.Proxy. ebpfBypassedDirect
@@ -55,11 +58,10 @@ func tunMetadata(addr string) *C.Metadata {
 }
 
 func TestEBPFBypassedDirectHonoursTheBypass(t *testing.T) {
-	setMode(t, Rule)
 	direct := installDirectProxy(t)
 	bypassPrefix(t, "10.0.0.0/8")
 
-	proxy, ok := ebpfBypassedDirect(tunMetadata("10.1.2.3"))
+	proxy, ok := ebpfBypassedDirect(tunMetadata("10.1.2.3"), Rule)
 	if !ok {
 		t.Fatal("expected a bypassed TUN destination to be connected directly")
 	}
@@ -68,7 +70,7 @@ func TestEBPFBypassedDirectHonoursTheBypass(t *testing.T) {
 	}
 
 	// A destination outside the policy still goes through the rules.
-	if _, ok = ebpfBypassedDirect(tunMetadata("203.0.113.7")); ok {
+	if _, ok = ebpfBypassedDirect(tunMetadata("203.0.113.7"), Rule); ok {
 		t.Fatal("expected a destination outside the bypass policy to be matched against the rules")
 	}
 }
@@ -82,8 +84,7 @@ func TestEBPFBypassedDirectOnlyAppliesInRuleMode(t *testing.T) {
 	bypassPrefix(t, "10.0.0.0/8")
 
 	for _, m := range []TunnelMode{Global, Direct} {
-		setMode(t, m)
-		if _, ok := ebpfBypassedDirect(tunMetadata("10.1.2.3")); ok {
+		if _, ok := ebpfBypassedDirect(tunMetadata("10.1.2.3"), m); ok {
 			t.Fatalf("expected %s mode to decide the proxy itself", m)
 		}
 	}
@@ -93,13 +94,12 @@ func TestEBPFBypassedDirectOnlyAppliesInRuleMode(t *testing.T) {
 // route something rather than a side effect of a route the bypass tried to
 // leave alone.
 func TestEBPFBypassedDirectRequiresATunSource(t *testing.T) {
-	setMode(t, Rule)
 	installDirectProxy(t)
 	bypassPrefix(t, "10.0.0.0/8")
 
 	metadata := tunMetadata("10.1.2.3")
 	metadata.Type = C.SOCKS5
-	if _, ok := ebpfBypassedDirect(metadata); ok {
+	if _, ok := ebpfBypassedDirect(metadata, Rule); ok {
 		t.Fatal("expected a non-TUN inbound to be matched against the rules")
 	}
 }
@@ -107,13 +107,12 @@ func TestEBPFBypassedDirectRequiresATunSource(t *testing.T) {
 // A config without a DIRECT proxy must fall through rather than return a nil
 // proxy that the dialer would then dereference.
 func TestEBPFBypassedDirectWithoutADirectProxy(t *testing.T) {
-	setMode(t, Rule)
 	previous := proxies
 	t.Cleanup(func() { proxies = previous })
 	proxies = map[string]C.Proxy{}
 	bypassPrefix(t, "10.0.0.0/8")
 
-	if _, ok := ebpfBypassedDirect(tunMetadata("10.1.2.3")); ok {
+	if _, ok := ebpfBypassedDirect(tunMetadata("10.1.2.3"), Rule); ok {
 		t.Fatal("expected no direct decision when the config has no DIRECT proxy")
 	}
 }
@@ -121,10 +120,34 @@ func TestEBPFBypassedDirectWithoutADirectProxy(t *testing.T) {
 // Without a running eBPF inbound nothing is bypassed, so the hook must stay out
 // of the way entirely.
 func TestEBPFBypassedDirectWithoutAPolicy(t *testing.T) {
-	setMode(t, Rule)
 	installDirectProxy(t)
 
-	if _, ok := ebpfBypassedDirect(tunMetadata("10.1.2.3")); ok {
+	if _, ok := ebpfBypassedDirect(tunMetadata("10.1.2.3"), Rule); ok {
 		t.Fatal("expected no direct decision without a published bypass policy")
+	}
+}
+
+// logMetadata names the mode the connection was decided under, not whichever one
+// is set by the time the line is written. Without that, flipping the mode from
+// the REST API renames connections that were already dialled -- and a bypassed
+// connection, which carries no rule, would be reported as "using GLOBAL" when it
+// went out through DIRECT.
+func TestLogMetadataNamesTheDecidedMode(t *testing.T) {
+	setMode(t, Global)
+
+	subscription := log.Subscribe()
+	defer log.UnSubscribe(subscription)
+
+	// rule is nil and the mode branches never touch the connection, so the
+	// remote conn a real caller would pass is not needed here.
+	logMetadata(tunMetadata("10.0.0.1"), nil, Direct, nil)
+
+	select {
+	case event := <-subscription:
+		if !strings.Contains(event.Payload, "using DIRECT") {
+			t.Fatalf("expected the line to name the mode the connection was decided under, got %q", event.Payload)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for the log line")
 	}
 }

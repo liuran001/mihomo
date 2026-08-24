@@ -772,7 +772,15 @@ func closeTunListener() {
 }
 
 func Cleanup() {
+	tunMux.Lock()
 	closeTunListener()
+	// The device is gone, so the config that described it must stop answering
+	// for it: a later ReCreateTun with the same config would otherwise decide
+	// nothing changed and leave the tunnel with no device at all.
+	LastTunConf = LC.Tun{}
+	lastTunEBPFExclude = nil
+	tunMux.Unlock()
+
 	inboundMux.Lock()
 	defer inboundMux.Unlock()
 	for name, current := range inboundListeners {

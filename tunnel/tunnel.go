@@ -306,12 +306,8 @@ func fixMetadata(metadata *C.Metadata) {
 // reports a nil rule under global mode as "using GLOBAL", which is exactly the
 // proxy such a connection did not use. Direct mode would pick DIRECT anyway, so
 // nothing is lost by leaving both to the mode switch below.
-//
-// The mode is read once, here. A flip that lands between this read and
-// logMetadata's own still mislabels that one line, but the window belongs to
-// every nil-rule connection and is not something this gate can close.
-func ebpfBypassedDirect(metadata *C.Metadata) (C.Proxy, bool) {
-	if mode.Load() != Rule {
+func ebpfBypassedDirect(metadata *C.Metadata, decidedMode TunnelMode) (C.Proxy, bool) {
+	if decidedMode != Rule {
 		return nil, false
 	}
 	// The address check is an early-out rather than a guard: a cleared DstIP --
@@ -364,7 +360,14 @@ func preHandleMetadata(metadata *C.Metadata) error {
 	return nil
 }
 
-func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err error) {
+// resolveMetadata reports the mode it decided under, so the log line for the
+// connection names the same mode the routing did. Reading the global again when
+// the line is written would let a mode change land in between and rename a
+// connection that was already dialled.
+func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, decidedMode TunnelMode, err error) {
+	// One read for the whole decision, reported back so the log line cannot name
+	// a different one.
+	decidedMode = mode.Load()
 	if metadata.SpecialProxy != "" {
 		var exist bool
 		proxy, exist = proxies[metadata.SpecialProxy]
@@ -373,8 +376,8 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		}
 		return
 	}
-	if direct, ok := ebpfBypassedDirect(metadata); ok {
-		return direct, nil, nil
+	if direct, ok := ebpfBypassedDirect(metadata, decidedMode); ok {
+		return direct, nil, decidedMode, nil
 	}
 	var (
 		resolved             bool
@@ -451,7 +454,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		helper.FindProcess = nil
 	}
 
-	switch mode.Load() {
+	switch decidedMode {
 	case Direct:
 		proxy = proxies["DIRECT"]
 	case Global:
@@ -510,7 +513,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 
 			_ = preHandleMetadata(metadata) // error was pre-checked
 
-			proxy, rule, err := resolveMetadata(metadata)
+			proxy, rule, decidedMode, err := resolveMetadata(metadata)
 			if err != nil {
 				log.Warnln("[UDP] Parse metadata failed: %s", err.Error())
 				return nil, nil, err
@@ -527,7 +530,7 @@ func handleUDPConn(packet C.PacketAdapter) {
 			if err != nil {
 				return nil, nil, err
 			}
-			logMetadata(metadata, rule, rawPc)
+			logMetadata(metadata, rule, decidedMode, rawPc)
 
 			// recover info to dialMetadata for smart
 			dialMetadata.Host = metadata.Host
@@ -610,7 +613,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 		}()
 	}
 
-	proxy, rule, err := resolveMetadata(metadata)
+	proxy, rule, decidedMode, err := resolveMetadata(metadata)
 	if err != nil {
 		log.Warnln("[Metadata] parse failed: %s", err.Error())
 		return
@@ -669,7 +672,7 @@ func handleTCPConn(connCtx C.ConnContext) {
 	if err != nil {
 		return
 	}
-	logMetadata(metadata, rule, remoteConn)
+	logMetadata(metadata, rule, decidedMode, remoteConn)
 
 	// recover info to dialMetadata for smart
 	dialMetadata.Host = metadata.Host
@@ -696,10 +699,7 @@ func logMetadataErr(metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err
 	}
 }
 
-func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
-	// Read once: two loads could straddle a mode change and leave both cases
-	// false for a connection that was dialled under one of them.
-	currentMode := mode.Load()
+func logMetadata(metadata *C.Metadata, rule C.Rule, decidedMode TunnelMode, remoteConn C.Connection) {
 	switch {
 	case metadata.SpecialProxy != "":
 		log.Infoln("[%s] %s --> %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
@@ -709,9 +709,9 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 		} else {
 			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), remoteConn.Chains().String())
 		}
-	case currentMode == Global:
+	case decidedMode == Global:
 		log.Infoln("[%s] %s --> %s using GLOBAL", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
-	case currentMode == Direct:
+	case decidedMode == Direct:
 		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	default:
 		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
@@ -760,7 +760,7 @@ func match(metadata *C.Metadata, helper C.RuleMatchHelper) (C.Proxy, C.Rule, err
 					}
 				}
 
-				if ! smart {
+				if !smart {
 					metadata.SmartTarget = ""
 				} else {
 					metadata.SmartBlock = "normal"

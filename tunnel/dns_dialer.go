@@ -33,6 +33,9 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 	proxyAdapter := d.proxyAdapter
 	var opts []dialer.Option
 	var rule C.Rule
+	// A dial that never reaches resolveMetadata -- a named proxy -- has no mode
+	// of its own, so the log keeps naming the live one, as it always did.
+	decidedMode := mode.Load()
 	metadata := &C.Metadata{
 		NetWork: C.TCP,
 		Type:    C.INNER,
@@ -63,7 +66,7 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 				}
 				metadata.DstIP = dstIP
 			}
-			proxyAdapter, rule, err = resolveMetadata(metadata)
+			proxyAdapter, rule, decidedMode, err = resolveMetadata(metadata)
 			if err != nil {
 				return nil, err
 			}
@@ -100,7 +103,7 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 			logMetadataErr(metadata, rule, proxyAdapter, err)
 			return nil, err
 		}
-		logMetadata(metadata, rule, conn)
+		logMetadata(metadata, rule, decidedMode, conn)
 
 		conn = statistic.NewTCPTracker(conn, statistic.DefaultManager, metadata, rule, 0, 0, false)
 
@@ -119,7 +122,7 @@ func (d *DNSDialer) DialContext(ctx context.Context, network, addr string) (net.
 			logMetadataErr(metadata, rule, proxyAdapter, err)
 			return nil, err
 		}
-		logMetadata(metadata, rule, packetConn)
+		logMetadata(metadata, rule, decidedMode, packetConn)
 
 		packetConn = statistic.NewUDPTracker(packetConn, statistic.DefaultManager, metadata, rule, 0, 0, false)
 
@@ -151,9 +154,12 @@ func (d *DNSDialer) ListenPacket(ctx context.Context, network, addr string) (net
 	}
 
 	var rule C.Rule
+	// A dial that never reaches resolveMetadata -- a named proxy -- has no mode
+	// of its own, so the log keeps naming the live one, as it always did.
+	decidedMode := mode.Load()
 	if proxyAdapter == nil {
 		if proxyName == DnsRespectRules {
-			proxyAdapter, rule, err = resolveMetadata(metadata)
+			proxyAdapter, rule, decidedMode, err = resolveMetadata(metadata)
 			if err != nil {
 				return nil, err
 			}
@@ -181,7 +187,7 @@ func (d *DNSDialer) ListenPacket(ctx context.Context, network, addr string) (net
 		logMetadataErr(metadata, rule, proxyAdapter, err)
 		return nil, err
 	}
-	logMetadata(metadata, rule, packetConn)
+	logMetadata(metadata, rule, decidedMode, packetConn)
 
 	packetConn = statistic.NewUDPTracker(packetConn, statistic.DefaultManager, metadata, rule, 0, 0, false)
 
