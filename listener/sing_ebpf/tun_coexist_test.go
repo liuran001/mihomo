@@ -12,22 +12,25 @@ import (
 	"go4.org/netipx"
 )
 
-func restorePublishedPolicy(t *testing.T) {
+// testInbound builds the smallest Inbound that can publish a policy, with its
+// own registry slot removed when the test ends.
+func testInbound(t *testing.T, inbound *Inbound) *Inbound {
 	t.Helper()
-	policy := resolver.EBPFBypassPolicyValue.Load()
-	excludes := resolver.EBPFRouteExcludePrefixes.Load()
+	inbound.bypassPublisher = resolver.NewEBPFBypassPublisher()
+	inbound.tunOverlapWarnings.interval = tunOverlapWarningInterval
 	claim := resolver.TunRouteClaimed.Load()
 	t.Cleanup(func() {
-		resolver.EBPFBypassPolicyValue.Store(policy)
-		resolver.EBPFRouteExcludePrefixes.Store(excludes)
+		inbound.bypassPublisher.Close()
 		resolver.TunRouteClaimed.Store(claim)
 	})
+	return inbound
 }
 
 func TestPublishBypassPolicyPrivateAddress(t *testing.T) {
-	restorePublishedPolicy(t)
 	resolver.TunRouteClaimed.Store(nil)
-	inbound := &Inbound{bypassPrivateAddress: true}
+	// bypassTUNDirect mirrors the option default, which is what puts the
+	// prefixes into the membership set asserted below.
+	inbound := testInbound(t, &Inbound{bypassPrivateAddress: true, bypassTUNDirect: true})
 	inbound.publishBypassPolicyLocked()
 
 	excludes := resolver.EBPFRouteExcludePrefixes.Load()
@@ -41,7 +44,7 @@ func TestPublishBypassPolicyPrivateAddress(t *testing.T) {
 	if published == nil || len(published.Prefixes) != len(ECommon.PrivateAddressPrefixes()) {
 		t.Fatalf("expected the private set to be published as the policy, got %v", published)
 	}
-	if published.Set == nil || !published.Set.Contains(netip.MustParseAddr("192.168.1.1")) {
+	if published.DirectSet == nil || !published.DirectSet.Contains(netip.MustParseAddr("192.168.1.1")) {
 		t.Fatal("expected a usable membership set")
 	}
 }
@@ -50,10 +53,9 @@ func TestPublishBypassPolicyPrivateAddress(t *testing.T) {
 // route-exclude list: they resolve after the TUN device already baked its route
 // set, and a rule set can hold thousands of prefixes.
 func TestPublishBypassPolicyRuleSetIsNotRouteExcluded(t *testing.T) {
-	restorePublishedPolicy(t)
 	resolver.TunRouteClaimed.Store(nil)
 	ruleSetPrefix := netip.MustParsePrefix("203.0.113.0/24")
-	inbound := &Inbound{bypassCIDR: []netip.Prefix{ruleSetPrefix}}
+	inbound := testInbound(t, &Inbound{bypassCIDR: []netip.Prefix{ruleSetPrefix}})
 	inbound.publishBypassPolicyLocked()
 
 	if excludes := resolver.EBPFRouteExcludePrefixes.Load(); excludes != nil {
@@ -66,12 +68,14 @@ func TestPublishBypassPolicyRuleSetIsNotRouteExcluded(t *testing.T) {
 }
 
 func TestPublishBypassPolicyNothingBypassed(t *testing.T) {
-	restorePublishedPolicy(t)
-	stale := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8")}
-	resolver.EBPFBypassPolicyValue.Store(&resolver.EBPFBypassPolicy{Prefixes: stale})
-	resolver.EBPFRouteExcludePrefixes.Store(&stale)
+	inbound := testInbound(t, &Inbound{bypassPrivateAddress: true, bypassTUNDirect: true})
+	inbound.publishBypassPolicyLocked()
+	if resolver.EBPFBypassPolicyValue.Load() == nil {
+		t.Fatal("expected a policy to be published first")
+	}
 
-	inbound := &Inbound{}
+	// Republishing with nothing to bypass must retract what this inbound had.
+	inbound.bypassPrivateAddress = false
 	inbound.publishBypassPolicyLocked()
 	if published := resolver.EBPFBypassPolicyValue.Load(); published != nil {
 		t.Fatalf("expected a stale policy to be cleared, got %v", published)
@@ -84,7 +88,6 @@ func TestPublishBypassPolicyNothingBypassed(t *testing.T) {
 // The whole point of the diagnostic: a bypassed prefix that TUN still routes is
 // not direct, so it has to be reported rather than silently black-holed.
 func TestPublishBypassPolicyReportsClaimedPrefixes(t *testing.T) {
-	restorePublishedPolicy(t)
 	var builder netipx.IPSetBuilder
 	builder.AddPrefix(netip.MustParsePrefix("0.0.0.0/0"))
 	claimed, err := builder.IPSet()
@@ -93,8 +96,7 @@ func TestPublishBypassPolicyReportsClaimedPrefixes(t *testing.T) {
 	}
 	resolver.TunRouteClaimed.Store(&resolver.TunRouteClaim{Claimed: claimed})
 
-	inbound := &Inbound{bypassCIDR: []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}}
-	inbound.tunOverlapWarnings.interval = tunOverlapWarningInterval
+	inbound := testInbound(t, &Inbound{bypassCIDR: []netip.Prefix{netip.MustParsePrefix("203.0.113.0/24")}})
 
 	var warnings []string
 	logged := func(format string, args ...any) {

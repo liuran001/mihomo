@@ -38,32 +38,26 @@ func prefixTexts(prefixes []netip.Prefix) []string {
 	return texts
 }
 
-func restoreClaimState(t *testing.T) {
+// publisher returns a registry slot that removes itself when the test ends, so
+// one test's policy never leaks into the next.
+func publisher(t *testing.T) *EBPFBypassPublisher {
 	t.Helper()
-	claim := TunRouteClaimed.Load()
-	policy := EBPFBypassPolicyValue.Load()
-	t.Cleanup(func() {
-		TunRouteClaimed.Store(claim)
-		EBPFBypassPolicyValue.Store(policy)
-	})
+	p := NewEBPFBypassPublisher()
+	t.Cleanup(p.Close)
+	return p
 }
 
-func storePolicy(t *testing.T, tunDirect bool, prefixes ...string) {
+func claimEverything(t *testing.T) {
 	t.Helper()
-	parsed := parsePrefixes(t, prefixes...)
-	var builder netipx.IPSetBuilder
-	for _, prefix := range parsed {
-		builder.AddPrefix(prefix)
-	}
-	set, err := builder.IPSet()
-	if err != nil {
-		t.Fatalf("build set: %s", err)
-	}
-	EBPFBypassPolicyValue.Store(&EBPFBypassPolicy{Prefixes: parsed, Set: set, TunDirect: tunDirect})
+	previous := TunRouteClaimed.Load()
+	TunRouteClaimed.Store(&TunRouteClaim{Claimed: prefixSet(t, "0.0.0.0/0")})
+	t.Cleanup(func() { TunRouteClaimed.Store(previous) })
 }
 
 func TestTunClaimedPrefixesNoClaim(t *testing.T) {
-	restoreClaimState(t)
+	previous := TunRouteClaimed.Load()
+	t.Cleanup(func() { TunRouteClaimed.Store(previous) })
+
 	TunRouteClaimed.Store(nil)
 	if claimed := TunClaimedPrefixes(parsePrefixes(t, "10.0.0.0/8")); claimed != nil {
 		t.Fatalf("expected no claim, got %v", claimed)
@@ -76,7 +70,9 @@ func TestTunClaimedPrefixesNoClaim(t *testing.T) {
 }
 
 func TestTunClaimedPrefixesIntersects(t *testing.T) {
-	restoreClaimState(t)
+	previous := TunRouteClaimed.Load()
+	t.Cleanup(func() { TunRouteClaimed.Store(previous) })
+
 	// auto-route claims everything except the LAN, which is what the eBPF
 	// route-exclude wiring is supposed to produce.
 	var builder netipx.IPSetBuilder
@@ -96,17 +92,144 @@ func TestTunClaimedPrefixesIntersects(t *testing.T) {
 }
 
 func TestTunClaimedBypassPrefixesUsesPublishedPolicy(t *testing.T) {
-	restoreClaimState(t)
-	TunRouteClaimed.Store(&TunRouteClaim{Claimed: prefixSet(t, "0.0.0.0/0")})
+	claimEverything(t)
 
-	EBPFBypassPolicyValue.Store(nil)
 	if claimed := TunClaimedBypassPrefixes(); claimed != nil {
 		t.Fatalf("expected nothing without a published policy, got %v", claimed)
 	}
 
-	storePolicy(t, true, "10.0.0.0/8")
+	publisher(t).Publish(nil, parsePrefixes(t, "10.0.0.0/8"), nil, true)
 	if texts := prefixTexts(TunClaimedBypassPrefixes()); len(texts) != 1 || texts[0] != "10.0.0.0/8" {
 		t.Fatalf("expected the bypassed prefix to be reported, got %v", texts)
+	}
+}
+
+// Several eBPF inbounds can run at once, so the published state is a union and
+// each publisher owns only its own contribution.
+func TestEBPFBypassPublisherUnion(t *testing.T) {
+	first := publisher(t)
+	second := publisher(t)
+
+	first.Publish(nil, parsePrefixes(t, "10.0.0.0/8"), parsePrefixes(t, "10.0.0.0/8"), true)
+	second.Publish(nil, parsePrefixes(t, "192.168.0.0/16"), parsePrefixes(t, "192.168.0.0/16"), true)
+
+	policy := EBPFBypassPolicyValue.Load()
+	if policy == nil || len(policy.Prefixes) != 2 {
+		t.Fatalf("expected both inbounds' prefixes, got %v", policy)
+	}
+	if !EBPFBypassedDirect(netip.MustParseAddr("10.1.2.3")) ||
+		!EBPFBypassedDirect(netip.MustParseAddr("192.168.1.1")) {
+		t.Fatal("expected both inbounds' destinations to be direct")
+	}
+	if excludes := EBPFRouteExcludePrefixes.Load(); excludes == nil || len(*excludes) != 2 {
+		t.Fatalf("expected both inbounds' route exclusions, got %v", excludes)
+	}
+
+	// Closing one must leave the other's policy standing. This is the case that
+	// broke before: an inbound that fails to start closes itself.
+	second.Close()
+	if !EBPFBypassedDirect(netip.MustParseAddr("10.1.2.3")) {
+		t.Fatal("expected the surviving inbound's policy to stay published")
+	}
+	if EBPFBypassedDirect(netip.MustParseAddr("192.168.1.1")) {
+		t.Fatal("expected the closed inbound's policy to be dropped")
+	}
+	if excludes := EBPFRouteExcludePrefixes.Load(); excludes == nil || len(*excludes) != 1 {
+		t.Fatalf("expected only the surviving route exclusion, got %v", excludes)
+	}
+
+	first.Close()
+	if EBPFBypassPolicyValue.Load() != nil || EBPFRouteExcludePrefixes.Load() != nil {
+		t.Fatal("expected everything to be cleared once the last inbound closed")
+	}
+}
+
+// A publisher that never published anything -- an inbound whose start failed
+// before it got that far -- must not disturb the others when it closes.
+func TestEBPFBypassPublisherCloseWithoutPublish(t *testing.T) {
+	running := publisher(t)
+	running.Publish(nil, parsePrefixes(t, "10.0.0.0/8"), nil, true)
+
+	NewEBPFBypassPublisher().Close()
+	if !EBPFBypassedDirect(netip.MustParseAddr("10.1.2.3")) {
+		t.Fatal("expected the running inbound's policy to survive")
+	}
+	// And closing twice stays harmless: Close is reached from an idempotent
+	// inbound Close.
+	running.Close()
+	running.Close()
+	if EBPFBypassPolicyValue.Load() != nil {
+		t.Fatal("expected the policy to be cleared")
+	}
+}
+
+// bypass_tun_direct is per inbound, so only the prefixes of the inbounds that
+// asked for it may be forced direct.
+func TestEBPFBypassPublisherTunDirectIsPerInbound(t *testing.T) {
+	direct := publisher(t)
+	split := publisher(t)
+	direct.Publish(nil, parsePrefixes(t, "10.0.0.0/8"), nil, true)
+	split.Publish(nil, parsePrefixes(t, "192.168.0.0/16"), nil, false)
+
+	if !EBPFBypassedDirect(netip.MustParseAddr("10.1.2.3")) {
+		t.Fatal("expected the opted-in inbound's destination to be direct")
+	}
+	if EBPFBypassedDirect(netip.MustParseAddr("192.168.1.1")) {
+		t.Fatal("expected bypass_tun_direct: false to be honoured for its own prefixes")
+	}
+	// Both are still reported as bypassed, since both are claimed by TUN.
+	claimEverything(t)
+	if texts := prefixTexts(TunClaimedBypassPrefixes()); len(texts) != 2 {
+		t.Fatalf("expected both inbounds' prefixes to be reported, got %v", texts)
+	}
+}
+
+// The DNS fake-ip middleware reads a union too, and only bypass_rule_set feeds
+// it: publishing the private ranges there would make every A/AAAA query
+// resolve for real before fake-ip could answer it.
+func TestEBPFBypassPublisherDNSSet(t *testing.T) {
+	withRuleSet := publisher(t)
+	privateOnly := publisher(t)
+
+	privateOnly.Publish(nil, parsePrefixes(t, "10.0.0.0/8"), nil, true)
+	if EBFPBypassIPSet.Load() != nil {
+		t.Fatal("expected no DNS set from an inbound without bypass_rule_set")
+	}
+
+	withRuleSet.Publish(prefixSet(t, "203.0.113.0/24"), parsePrefixes(t, "203.0.113.0/24"), nil, true)
+	dnsSet := EBFPBypassIPSet.Load()
+	if dnsSet == nil || !dnsSet.Contains(netip.MustParseAddr("203.0.113.1")) {
+		t.Fatal("expected the rule-set addresses in the DNS set")
+	}
+	if dnsSet.Contains(netip.MustParseAddr("10.1.2.3")) {
+		t.Fatal("expected the private ranges to stay out of the DNS set")
+	}
+
+	withRuleSet.Close()
+	if EBFPBypassIPSet.Load() != nil {
+		t.Fatal("expected the DNS set to be cleared with its inbound")
+	}
+}
+
+func TestEBPFBypassedDirect(t *testing.T) {
+	if EBPFBypassedDirect(netip.MustParseAddr("10.1.2.3")) {
+		t.Fatal("expected no direct decision without a policy")
+	}
+
+	p := publisher(t)
+	p.Publish(nil, parsePrefixes(t, "10.0.0.0/8"), nil, true)
+	if !EBPFBypassedDirect(netip.MustParseAddr("10.1.2.3")) {
+		t.Fatal("expected a bypassed destination to be direct")
+	}
+	if EBPFBypassedDirect(netip.MustParseAddr("198.51.100.1")) {
+		t.Fatal("expected an unbypassed destination to keep matching rules")
+	}
+	// A v4-in-v6 destination is the same address as far as the policy goes.
+	if !EBPFBypassedDirect(netip.MustParseAddr("::ffff:10.1.2.3")) {
+		t.Fatal("expected a v4-mapped address to match the v4 policy")
+	}
+	if EBPFBypassedDirect(netip.Addr{}) {
+		t.Fatal("expected an invalid address to be ignored")
 	}
 }
 
@@ -135,37 +258,6 @@ func TestTunBypassOverlapMessageShortList(t *testing.T) {
 	}
 	if !strings.Contains(message, "10.0.0.0/8") {
 		t.Fatalf("expected the prefix to be listed, got %q", message)
-	}
-}
-
-func TestEBPFBypassedDirect(t *testing.T) {
-	restoreClaimState(t)
-
-	EBPFBypassPolicyValue.Store(nil)
-	if EBPFBypassedDirect(netip.MustParseAddr("10.1.2.3")) {
-		t.Fatal("expected no direct decision without a policy")
-	}
-
-	// The mechanism has to stay switchable: a split setup can bypass a range in
-	// eBPF precisely so TUN handles it.
-	storePolicy(t, false, "10.0.0.0/8")
-	if EBPFBypassedDirect(netip.MustParseAddr("10.1.2.3")) {
-		t.Fatal("expected bypass_tun_direct: false to be honoured")
-	}
-
-	storePolicy(t, true, "10.0.0.0/8")
-	if !EBPFBypassedDirect(netip.MustParseAddr("10.1.2.3")) {
-		t.Fatal("expected a bypassed destination to be direct")
-	}
-	if EBPFBypassedDirect(netip.MustParseAddr("198.51.100.1")) {
-		t.Fatal("expected an unbypassed destination to keep matching rules")
-	}
-	// A v4-in-v6 destination is the same address as far as the policy goes.
-	if !EBPFBypassedDirect(netip.MustParseAddr("::ffff:10.1.2.3")) {
-		t.Fatal("expected a v4-mapped address to match the v4 policy")
-	}
-	if EBPFBypassedDirect(netip.Addr{}) {
-		t.Fatal("expected an invalid address to be ignored")
 	}
 }
 

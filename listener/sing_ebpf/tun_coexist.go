@@ -4,14 +4,11 @@ package sing_ebpf
 
 import (
 	"net/netip"
-	"slices"
 	"time"
 
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
 	"github.com/metacubex/mihomo/component/resolver"
 	"github.com/metacubex/mihomo/log"
-
-	"go4.org/netipx"
 )
 
 // A claimed-prefix overlap is a configuration condition, not a packet event:
@@ -38,42 +35,12 @@ const tunOverlapWarningInterval = 10 * time.Minute
 //
 // The caller holds bypassRuleSetAccess.
 func (i *Inbound) publishBypassPolicyLocked() {
+	var routeExclude []netip.Prefix
 	if i.bypassPrivateAddress {
-		excludes := ECommon.PrivateAddressPrefixes()
-		resolver.EBPFRouteExcludePrefixes.Store(&excludes)
-	} else {
-		resolver.EBPFRouteExcludePrefixes.Store(nil)
+		routeExclude = ECommon.PrivateAddressPrefixes()
 	}
 	prefixes := i.effectiveBypassPrefixesLocked()
-	if len(prefixes) == 0 {
-		resolver.EBPFBypassPolicyValue.Store(nil)
-		return
-	}
-	// An interface change republishes an unchanged policy, and building the
-	// membership set means sorting every prefix of a rule set that can hold
-	// thousands. Only the overlap report below has to run every time.
-	published := resolver.EBPFBypassPolicyValue.Load()
-	if published == nil ||
-		published.TunDirect != i.bypassTUNDirect ||
-		!slices.Equal(published.Prefixes, prefixes) {
-		var builder netipx.IPSetBuilder
-		for _, prefix := range prefixes {
-			builder.AddPrefix(prefix)
-		}
-		set, err := builder.IPSet()
-		if err != nil {
-			// Without the set there is no membership test, and publishing the
-			// policy without one would quietly disable bypass_tun_direct.
-			log.Warnln("[EBPF] compile the bypass policy for TUN coexistence: %s", err.Error())
-			resolver.EBPFBypassPolicyValue.Store(nil)
-			return
-		}
-		resolver.EBPFBypassPolicyValue.Store(&resolver.EBPFBypassPolicy{
-			Prefixes:  prefixes,
-			Set:       set,
-			TunDirect: i.bypassTUNDirect,
-		})
-	}
+	i.bypassPublisher.Publish(i.dnsBypassSet, prefixes, routeExclude, i.bypassTUNDirect)
 	claimed := resolver.TunClaimedPrefixes(prefixes)
 	if len(claimed) == 0 {
 		return

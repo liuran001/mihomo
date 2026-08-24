@@ -25,6 +25,8 @@ import (
 
 	E "github.com/metacubex/sing/common/exceptions"
 	"github.com/metacubex/sing/common/network"
+
+	"go4.org/netipx"
 )
 
 // minimumUDPTimeout bounds udp-timeout from below. The periodic sweeper derives
@@ -98,6 +100,8 @@ type Inbound struct {
 	localNetwork       *localNetworkMonitor
 	fakeIPRangeRemove  func()
 	tunOverlapWarnings warningLimiter
+	bypassPublisher    *resolver.EBPFBypassPublisher
+	dnsBypassSet       *netipx.IPSet
 
 	bypassRuleSetAccess   sync.Mutex
 	bypassRuleSet         []P.RuleProvider
@@ -229,6 +233,10 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		androidUIDOptions: newAndroidUIDOptions(options.Local),
 	}
 	inboundListener.tunOverlapWarnings.interval = tunOverlapWarningInterval
+	// Several eBPF inbounds can run at once, so each keeps its own slot in the
+	// coexistence registry: closing one -- including this one, if start fails
+	// below -- must not drop what the others published.
+	inboundListener.bypassPublisher = resolver.NewEBPFBypassPublisher()
 
 	rp, ok := tunnel.(P.Tunnel)
 	if !ok {
@@ -424,9 +432,7 @@ func (i *Inbound) Close() error {
 		i.stopFakeIPTracking()
 		i.stopLocalNetworkMonitor()
 		i.stopBypassRuleSets()
-		resolver.EBFPBypassIPSet.Store(nil)
-		resolver.EBPFBypassPolicyValue.Store(nil)
-		resolver.EBPFRouteExcludePrefixes.Store(nil)
+		i.bypassPublisher.Close()
 		if i.sharedNetwork != nil {
 			closeErr = i.sharedNetwork.Close()
 		}

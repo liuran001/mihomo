@@ -7,30 +7,27 @@ import (
 	"github.com/metacubex/mihomo/component/resolver"
 
 	tun "github.com/metacubex/sing-tun"
-
-	"go4.org/netipx"
 )
 
-func restoreCoexistState(t *testing.T) {
+func restoreCoexistState(t *testing.T) *resolver.EBPFBypassPublisher {
 	t.Helper()
-	excludes := resolver.EBPFRouteExcludePrefixes.Load()
 	claim := resolver.TunRouteClaimed.Load()
-	policy := resolver.EBPFBypassPolicyValue.Load()
 	ipv4, ipv6 := resolver.FakeIPRanges()
+	publisher := resolver.NewEBPFBypassPublisher()
 	t.Cleanup(func() {
-		resolver.EBPFRouteExcludePrefixes.Store(excludes)
+		publisher.Close()
 		resolver.TunRouteClaimed.Store(claim)
-		resolver.EBPFBypassPolicyValue.Store(policy)
 		resolver.StoreFakeIPRanges(ipv4, ipv6)
 	})
+	return publisher
 }
 
-func publishExcludes(prefixes ...string) {
+func publishExcludes(publisher *resolver.EBPFBypassPublisher, prefixes ...string) {
 	parsed := make([]netip.Prefix, 0, len(prefixes))
 	for _, text := range prefixes {
 		parsed = append(parsed, netip.MustParsePrefix(text))
 	}
-	resolver.EBPFRouteExcludePrefixes.Store(&parsed)
+	publisher.Publish(nil, parsed, parsed, true)
 }
 
 func prefixTexts(prefixes []netip.Prefix) []string {
@@ -46,22 +43,20 @@ func prefixTexts(prefixes []netip.Prefix) []string {
 // carries an eBPF listener the kernel refused to load must not quietly change
 // how traffic is routed.
 func TestEBPFRouteExcludeAddressNothingPublished(t *testing.T) {
-	restoreCoexistState(t)
-	resolver.EBPFRouteExcludePrefixes.Store(nil)
+	publisher := restoreCoexistState(t)
 	resolver.StoreFakeIPRanges(netip.Prefix{}, netip.Prefix{})
 	if excluded := ebpfRouteExcludeAddress(nil, nil); excluded != nil {
 		t.Fatalf("expected no exclusions, got %v", excluded)
 	}
-	empty := []netip.Prefix{}
-	resolver.EBPFRouteExcludePrefixes.Store(&empty)
+	// An inbound that bypasses nothing publishes nothing to exclude.
+	publisher.Publish(nil, nil, nil, true)
 	if excluded := ebpfRouteExcludeAddress(nil, nil); excluded != nil {
 		t.Fatalf("expected no exclusions for an empty policy, got %v", excluded)
 	}
 }
 
 func TestEBPFRouteExcludeAddressPassesPolicyThrough(t *testing.T) {
-	restoreCoexistState(t)
-	publishExcludes("10.0.0.0/8", "192.168.0.0/16")
+	publishExcludes(restoreCoexistState(t), "10.0.0.0/8", "192.168.0.0/16")
 	resolver.StoreFakeIPRanges(netip.Prefix{}, netip.Prefix{})
 	texts := prefixTexts(ebpfRouteExcludeAddress(nil, nil))
 	if len(texts) != 2 || texts[0] != "10.0.0.0/8" || texts[1] != "192.168.0.0/16" {
@@ -73,8 +68,7 @@ func TestEBPFRouteExcludeAddressPassesPolicyThrough(t *testing.T) {
 // address only means something to mihomo, and the eBPF program forces
 // interception for it rather than bypassing it.
 func TestEBPFRouteExcludeAddressKeepsFakeIPRange(t *testing.T) {
-	restoreCoexistState(t)
-	publishExcludes("100.64.0.0/10")
+	publishExcludes(restoreCoexistState(t), "100.64.0.0/10")
 	resolver.StoreFakeIPRanges(netip.MustParsePrefix("100.64.0.0/16"), netip.Prefix{})
 	texts := prefixTexts(ebpfRouteExcludeAddress(nil, nil))
 	for _, text := range texts {
@@ -98,8 +92,7 @@ func TestEBPFRouteExcludeAddressKeepsFakeIPRange(t *testing.T) {
 }
 
 func TestEBPFRouteExcludeAddressKeepsTunAddresses(t *testing.T) {
-	restoreCoexistState(t)
-	publishExcludes("fc00::/7")
+	publishExcludes(restoreCoexistState(t), "fc00::/7")
 	resolver.StoreFakeIPRanges(netip.Prefix{}, netip.Prefix{})
 	tunIPv6 := []netip.Prefix{netip.MustParsePrefix("fdfe:dcba:9876::1/126")}
 	for _, prefix := range ebpfRouteExcludeAddress(nil, tunIPv6) {
@@ -110,19 +103,11 @@ func TestEBPFRouteExcludeAddressKeepsTunAddresses(t *testing.T) {
 }
 
 func TestPublishTunRouteClaim(t *testing.T) {
-	restoreCoexistState(t)
-	bypassed := []netip.Prefix{netip.MustParsePrefix("10.0.0.0/8"), netip.MustParsePrefix("198.51.100.0/24")}
-	var builder netipx.IPSetBuilder
-	for _, prefix := range bypassed {
-		builder.AddPrefix(prefix)
-	}
-	bypassSet, err := builder.IPSet()
-	if err != nil {
-		t.Fatalf("build set: %s", err)
-	}
-	resolver.EBPFBypassPolicyValue.Store(&resolver.EBPFBypassPolicy{
-		Prefixes: bypassed, Set: bypassSet, TunDirect: true,
-	})
+	publisher := restoreCoexistState(t)
+	publisher.Publish(nil, []netip.Prefix{
+		netip.MustParsePrefix("10.0.0.0/8"),
+		netip.MustParsePrefix("198.51.100.0/24"),
+	}, nil, true)
 
 	// No auto-route: nothing is taken over, so a bypass reaches the routing
 	// table untouched.

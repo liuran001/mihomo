@@ -245,6 +245,13 @@ always kept on the routes.
 With `bypass-tun-direct: false` the overlap is only reported, not handled. Both
 listeners report it, because either one can be the second to start.
 
+Several eBPF inbounds can run at once -- the listener parser only rejects
+duplicate names -- so the published state is a union keyed by publishing
+inbound, and `bypass-tun-direct` stays per inbound: only the prefixes of the
+inbounds that asked for it are connected directly. Closing one inbound removes
+only its own contribution, which matters because an inbound whose start fails
+closes itself.
+
 Beyond that, avoid attaching multiple transparent inbound mechanisms to the same
 cgroup or interface unless you intentionally split traffic with UID, CIDR, and
 `bypass-rule-set` policies. In particular do not enable shared mode and TUN

@@ -6,7 +6,6 @@ import (
 	"net/netip"
 	"slices"
 
-	"github.com/metacubex/mihomo/component/resolver"
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
 	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
@@ -157,20 +156,20 @@ func (i *Inbound) applyBypassCIDRLocked() (bool, error) {
 			}
 		}
 	}
-	// Publish the effective bypass CIDR set to the DNS fake-ip middleware so
-	// domains whose real addresses fall inside it keep their real IP and the
-	// kernel eBPF bypass can engage. Only publish when bypass_rule_set is used.
+	// Recompute the set the DNS fake-ip middleware consults, so domains whose
+	// real addresses fall inside it keep their real IP and the kernel eBPF
+	// bypass can engage. Only bypass_rule_set feeds it; publishing the private
+	// ranges here would make every A/AAAA query resolve for real before
+	// fake-ip could answer it.
+	i.dnsBypassSet = nil
 	if len(i.bypassRuleSet) > 0 {
 		var builder netipx.IPSetBuilder
 		for _, prefix := range i.bypassCIDR {
 			builder.AddPrefix(prefix)
 		}
-		bypassSet, buildErr := builder.IPSet()
-		if buildErr == nil {
-			resolver.EBFPBypassIPSet.Store(bypassSet)
+		if bypassSet, buildErr := builder.IPSet(); buildErr == nil {
+			i.dnsBypassSet = bypassSet
 		}
-	} else {
-		resolver.EBFPBypassIPSet.Store(nil)
 	}
 	i.publishBypassPolicyLocked()
 	return updated, nil
