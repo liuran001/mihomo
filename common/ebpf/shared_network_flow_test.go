@@ -2,7 +2,10 @@
 
 package ebpf
 
-import "testing"
+import (
+	"testing"
+	"time"
+)
 
 func TestSharedNetworkFlowReferences(t *testing.T) {
 	backend := new(SharedNetworkBackend)
@@ -27,5 +30,23 @@ func TestSharedNetworkFlowReferences(t *testing.T) {
 	}
 	if backend.releaseFlowReferenceLocked(flow) {
 		t.Fatal("duplicate release selected an already released flow for cleanup")
+	}
+}
+
+func TestSharedNetworkTCPReleaseGrace(t *testing.T) {
+	backend := new(SharedNetworkBackend)
+	flow := SharedNetworkFlowHandle{
+		originalKey: sharedNetworkOriginalKey{InterfaceIndex: 7, Protocol: ProtocolTCP},
+		listenerKey: sharedNetworkListenerKey{Protocol: ProtocolTCP, ListenerPort: 1234},
+		generation:  11,
+	}
+	backend.retainFlowLocked(flow)
+	if !backend.releaseFlowReferenceLocked(flow) {
+		t.Fatal("last release did not select TCP flow for grace period")
+	}
+	backend.deferTCPFlowReleaseLocked(flow, time.Now())
+	backend.retainFlowLocked(flow)
+	if _, loaded := backend.flowReleases[flow]; loaded {
+		t.Fatal("retained TCP flow remained pending for release")
 	}
 }

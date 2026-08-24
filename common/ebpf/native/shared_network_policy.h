@@ -90,6 +90,18 @@ INLINE bool shared_fakeip_ipv6(const __u8 destination[16], const struct sb_share
             control->fakeip_ipv6_mask);
 }
 
+NOINLINE __u8 shared_dns_policy(
+    __u8 protocol,
+    __u16 source_port,
+    __u16 destination_port,
+    const struct sb_shared_control *control) {
+    if (dhcp_packet(protocol, source_port, destination_port)) return SB_SHARED_POLICY_BYPASS;
+    if (destination_port != 53U) return SB_SHARED_POLICY_CONTINUE;
+    if (control->dns_mode == SB_SHARED_DNS_MODE_OFF) return SB_SHARED_POLICY_BYPASS;
+    if (control->dns_mode == SB_SHARED_DNS_MODE_HIJACK) return SB_SHARED_POLICY_PROXY;
+    return SB_SHARED_POLICY_CONTINUE;
+}
+
 NOINLINE __u8 ipv4_policy(
     const __u8 destination[4],
     __u8 protocol,
@@ -97,10 +109,6 @@ NOINLINE __u8 ipv4_policy(
     __u16 destination_port,
     const struct sb_shared_control *control) {
     if (dhcp_packet(protocol, source_port, destination_port)) return SB_SHARED_POLICY_BYPASS;
-    if (destination_port == 53U) {
-        if ((control->flags & SB_SHARED_FLAG_DNS_HIJACK) == 0U) return SB_SHARED_POLICY_BYPASS;
-        if ((control->flags & SB_SHARED_FLAG_DNS_RESPECT_BYPASS) == 0U) return SB_SHARED_POLICY_PROXY;
-    }
     if (sb_ebpf_ipv4_safety_bypass(destination)) return SB_SHARED_POLICY_BYPASS;
     __u32 map_policy_flags = control->flags &
         (SB_SHARED_FLAG_HOST_IPV4 | SB_SHARED_FLAG_BYPASS_IPV4);
@@ -125,10 +133,6 @@ NOINLINE __u8 ipv6_policy(
     __u16 destination_port,
     const struct sb_shared_control *control) {
     if (dhcp_packet(protocol, source_port, destination_port)) return SB_SHARED_POLICY_BYPASS;
-    if (destination_port == 53U) {
-        if ((control->flags & SB_SHARED_FLAG_DNS_HIJACK) == 0U) return SB_SHARED_POLICY_BYPASS;
-        if ((control->flags & SB_SHARED_FLAG_DNS_RESPECT_BYPASS) == 0U) return SB_SHARED_POLICY_PROXY;
-    }
     if (sb_ebpf_ipv6_safety_bypass(destination)) return SB_SHARED_POLICY_BYPASS;
     __u32 map_policy_flags = control->flags &
         (SB_SHARED_FLAG_HOST_IPV6 | SB_SHARED_FLAG_BYPASS_IPV6);
@@ -145,6 +149,38 @@ NOINLINE __u8 ipv6_policy(
     return map_lookup(&shared_bypass_ipv6, &key) == 0
         ? SB_SHARED_POLICY_PROXY
         : SB_SHARED_POLICY_CACHE_BYPASS;
+}
+
+INLINE bool ipv4_policy_selected(
+    const __u8 source_mac[6],
+    const __u8 source[4],
+    const __u8 destination[4],
+    __u8 protocol,
+    __u16 source_port,
+    __u16 destination_port,
+    const struct sb_shared_control *control) {
+    __u8 dns_policy = shared_dns_policy(
+        protocol, source_port, destination_port, control);
+    if (dns_policy != SB_SHARED_POLICY_CONTINUE) return dns_policy == SB_SHARED_POLICY_PROXY;
+    if (!ipv4_client_selected(source_mac, source, control)) return false;
+    return ipv4_policy(destination, protocol, source_port, destination_port, control) ==
+        SB_SHARED_POLICY_PROXY;
+}
+
+INLINE bool ipv6_policy_selected(
+    const __u8 source_mac[6],
+    const __u8 source[16],
+    const __u8 destination[16],
+    __u8 protocol,
+    __u16 source_port,
+    __u16 destination_port,
+    const struct sb_shared_control *control) {
+    __u8 dns_policy = shared_dns_policy(
+        protocol, source_port, destination_port, control);
+    if (dns_policy != SB_SHARED_POLICY_CONTINUE) return dns_policy == SB_SHARED_POLICY_PROXY;
+    if (!ipv6_client_selected(source_mac, source, control)) return false;
+    return ipv6_policy(destination, protocol, source_port, destination_port, control) ==
+        SB_SHARED_POLICY_PROXY;
 }
 
 #endif

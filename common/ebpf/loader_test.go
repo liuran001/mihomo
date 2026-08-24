@@ -72,11 +72,13 @@ func TestEmbeddedCgroupObjectLayout(t *testing.T) {
 
 func TestEmbeddedSharedNetworkObjectLayout(t *testing.T) {
 	testEmbeddedObjectLayout(t, loadSharedNetwork, map[string]objectMapLayout{
-		"shared_control":             {4, 80},
+		"shared_control":             {4, 88},
 		"shared_stats":               {4, 8},
 		"shared_flow_by_original":    {44, 40},
 		"shared_bypass_flow":         {44, 16},
 		"shared_flow_by_token":       {40, 40},
+		"shared_listener_sockets":    {4, 4},
+		"shared_assign_metadata":     {40, 12},
 		"shared_fragment":            {44, 32},
 		"shared_host_ipv4":           {8, 1},
 		"shared_host_ipv6":           {20, 1},
@@ -91,7 +93,19 @@ func TestEmbeddedSharedNetworkObjectLayout(t *testing.T) {
 		"shared_scratch":             {4, 272},
 	}, []string{
 		"classifier/ingress",
+		"classifier/assign",
 		"classifier/egress",
+	})
+}
+
+func TestEmbeddedSpliceObjectLayout(t *testing.T) {
+	testEmbeddedObjectLayout(t, loadSplice, map[string]objectMapLayout{
+		"splice_sockets": {40, 4},
+		"splice_peers":   {40, 48},
+		"splice_stats":   {4, 8},
+	}, []string{
+		"sk_skb/stream_parser",
+		"sk_skb/stream_verdict",
 	})
 }
 

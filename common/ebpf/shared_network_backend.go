@@ -7,6 +7,7 @@ import (
 	"net/netip"
 	"sync"
 	"sync/atomic"
+	"time"
 	"unsafe"
 
 	E "github.com/metacubex/sing/common/exceptions"
@@ -18,7 +19,14 @@ import (
 const (
 	sharedNetworkProgramIngress = iota
 	sharedNetworkProgramEgress
+	sharedNetworkProgramRewriteIngress
 	sharedNetworkProgramCount
+)
+
+const (
+	SharedNetworkDataPlaneAuto         = "auto"
+	SharedNetworkDataPlaneSocketAssign = "socket_assign"
+	SharedNetworkDataPlaneRewrite      = "rewrite"
 )
 
 type sharedNetworkRuntime struct {
@@ -41,8 +49,15 @@ type sharedNetworkRuntime struct {
 	fallback_bypass_ipv4_map_fd int
 	fallback_bypass_ipv6_map_fd int
 	scratch_map_fd              int
+	listener_socket_map_fd      int
+	assign_metadata_map_fd      int
 	ingress_prog_fd             int
 	egress_prog_fd              int
+	data_plane                  string
+	assignment_fallback_reason  string
+	udp_assignment              bool
+	udp_assignment_fallback     string
+	non_common_lru              bool
 }
 
 type SharedNetworkBackend struct {
@@ -51,6 +66,11 @@ type SharedNetworkBackend struct {
 	flowAccess          sync.Mutex
 	replyTokenSequence  atomic.Uint64
 	flowReferences      map[SharedNetworkFlowHandle]uint32
+	flowReleases        map[SharedNetworkFlowHandle]time.Time
+	flowReleaseWake     chan struct{}
+	tokenLookupMisses   atomic.Uint64
+	generationMisses    atomic.Uint64
+	generationMismatch  atomic.Uint64
 	flowSweepAccess     sync.Mutex
 	flowSweepScratch    mapScanScratch[sharedNetworkOriginalKey, sharedNetworkTokenValue]
 	flowSweepCandidates []sharedNetworkFlowEntry
@@ -141,6 +161,9 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		fallback_bypass_ipv6_map_fd: -1,
 		ingress_prog_fd:             -1,
 		egress_prog_fd:              -1,
+		listener_socket_map_fd:      -1,
+		assign_metadata_map_fd:      -1,
+		non_common_lru:              probeNonCommonLRU(),
 	}
 	var bypassIPv4Map *CiliumEBPF.Map
 	var bypassIPv6Map *CiliumEBPF.Map
@@ -160,6 +183,7 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		len(config.ExcludeSourceMAC),
 		bypassIPv4Map,
 		bypassIPv6Map,
+		config.DataPlane,
 	)
 	if cgroupBackend != nil {
 		cgroupBackend.access.RUnlock()
@@ -200,20 +224,23 @@ func PrepareSharedNetwork(cgroupBackend *CgroupBackend, config SharedNetworkConf
 		bypassIPv6Map:   bypassIPv6Map,
 		bypassIPv4MapFD: bypassIPv4MapFD,
 		bypassIPv6MapFD: bypassIPv6MapFD,
+		flowReleaseWake: make(chan struct{}, 1),
 	}
 	backend.control.ListenerPort = config.ListenerPort
+	backend.control.DNSMode = config.DNSMode
 	backend.control.UDPTimeoutSeconds = udpTimeoutSeconds
+	backend.control.RoutingMark = config.RoutingMark
+	if runtimeState.data_plane == SharedNetworkDataPlaneSocketAssign {
+		backend.control.Flags |= sharedNetworkFlagSocketAssignTCP
+		if runtimeState.udp_assignment && config.EnableUDP {
+			backend.control.Flags |= sharedNetworkFlagSocketAssignUDP
+		}
+	}
 	if config.EnableTCP {
 		backend.control.Flags |= sharedNetworkFlagTCP
 	}
 	if config.EnableUDP {
 		backend.control.Flags |= sharedNetworkFlagUDP
-	}
-	if config.HijackDNS {
-		backend.control.Flags |= sharedNetworkFlagDNSHijack
-	}
-	if config.DNSRespectBypass {
-		backend.control.Flags |= sharedNetworkFlagDNSRespectBypass
 	}
 	if config.BypassPrivateAddress {
 		backend.control.Flags |= sharedNetworkFlagBypassPrivateAddress
@@ -260,15 +287,20 @@ func prepareSharedNetworkRuntime(
 	excludeSourceMACEntries int,
 	bypassIPv4Map *CiliumEBPF.Map,
 	bypassIPv6Map *CiliumEBPF.Map,
+	dataPlane string,
 ) error {
+	cacheLRUFlags := uint32(0)
+	if runtimeState.non_common_lru {
+		cacheLRUFlags = unix.BPF_F_NO_COMMON_LRU
+	}
 	var err error
 	runtimeState.maps, err = loadObjectMaps(loadSharedNetwork, map[string]mapSpecOverride{
 		"shared_control":             {name: "sb_sh_control", mapType: CiliumEBPF.Array, maxEntries: 1},
-		"shared_stats":               {name: "sb_sh_stats", mapType: CiliumEBPF.Array, maxEntries: 1},
+		"shared_stats":               {name: "sb_sh_stats", mapType: CiliumEBPF.PerCPUArray, maxEntries: 8},
 		"shared_flow_by_original":    {name: "sb_sh_orig", mapType: CiliumEBPF.Hash, maxEntries: capacity.Proxy, flags: bpfFlagNoPrealloc},
-		"shared_bypass_flow":         {name: "sb_sh_bypass", mapType: CiliumEBPF.LRUHash, maxEntries: capacity.Bypass},
+		"shared_bypass_flow":         {name: "sb_sh_bypass", mapType: CiliumEBPF.LRUHash, maxEntries: capacity.Bypass, flags: cacheLRUFlags},
 		"shared_flow_by_token":       {name: "sb_sh_token", mapType: CiliumEBPF.Hash, maxEntries: capacity.Proxy, flags: bpfFlagNoPrealloc},
-		"shared_fragment":            {name: "sb_sh_fragment", mapType: CiliumEBPF.LRUHash, maxEntries: capacity.Fragment},
+		"shared_fragment":            {name: "sb_sh_fragment", mapType: CiliumEBPF.LRUHash, maxEntries: capacity.Fragment, flags: cacheLRUFlags},
 		"shared_host_ipv4":           {name: "sb_sh_host4", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
 		"shared_host_ipv6":           {name: "sb_sh_host6", mapType: CiliumEBPF.Hash, maxEntries: maxHostAddressPolicyEntries, flags: bpfFlagNoPrealloc},
 		"shared_include_source_ipv4": {name: "sb_sh_inc4", mapType: CiliumEBPF.LPMTrie, maxEntries: maxSharedSourceCIDRPolicyEntries, flags: bpfFlagNoPrealloc},
@@ -302,14 +334,80 @@ func prepareSharedNetworkRuntime(
 	}
 	replacements["shared_bypass_ipv4"] = bypassIPv4Map
 	replacements["shared_bypass_ipv6"] = bypassIPv6Map
-	programs, err := loadObjectPrograms(loadSharedNetwork, replacements, []programSelection{
-		{section: "classifier/ingress", name: "sb_share_in"},
-		{section: "classifier/egress", name: "sb_share_out"},
-	})
-	if err != nil {
-		return err
+	wantAssignment := dataPlane != SharedNetworkDataPlaneRewrite
+	if wantAssignment {
+		listenerMap, listenerErr := newRuntimeMap("sb_sh_listen", CiliumEBPF.SockMap, 4, 4, 2, 0)
+		if listenerErr == nil {
+			runtimeState.maps["shared_listener_sockets"] = listenerMap
+			replacements["shared_listener_sockets"] = listenerMap
+			metadataMap, metadataErr := newRuntimeMap(
+				"sb_sh_assign", CiliumEBPF.LRUHash, 40, 12, capacity.Proxy, 0,
+			)
+			if metadataErr == nil {
+				runtimeState.maps["shared_assign_metadata"] = metadataMap
+				replacements["shared_assign_metadata"] = metadataMap
+				assignmentSection := "classifier/assign"
+				assignmentName := "sb_sh_assign"
+				if dataPlane == SharedNetworkDataPlaneSocketAssign {
+					assignmentSection = "classifier/assign_udp"
+					assignmentName = "sb_sh_as_udp"
+				}
+				programs, programErr := loadObjectPrograms(loadSharedNetwork, replacements, []programSelection{
+					{section: assignmentSection, name: assignmentName},
+					{section: "classifier/egress", name: "sb_share_out"},
+					{section: "classifier/ingress", name: "sb_share_in"},
+				})
+				if programErr == nil && dataPlane == SharedNetworkDataPlaneSocketAssign {
+					runtimeState.udp_assignment = true
+				} else if programErr != nil && dataPlane == SharedNetworkDataPlaneSocketAssign {
+					runtimeState.udp_assignment_fallback = programErr.Error()
+					programs, programErr = loadObjectPrograms(loadSharedNetwork, replacements, []programSelection{
+						{section: "classifier/assign", name: "sb_sh_assign"},
+						{section: "classifier/egress", name: "sb_share_out"},
+						{section: "classifier/ingress", name: "sb_share_in"},
+					})
+				}
+				if programErr == nil {
+					runtimeState.programs = programs
+					runtimeState.data_plane = SharedNetworkDataPlaneSocketAssign
+				} else {
+					runtimeState.assignment_fallback_reason = programErr.Error()
+				}
+			} else {
+				runtimeState.assignment_fallback_reason = metadataErr.Error()
+			}
+		} else {
+			runtimeState.assignment_fallback_reason = listenerErr.Error()
+		}
+		if runtimeState.data_plane != SharedNetworkDataPlaneSocketAssign {
+			if dataPlane == SharedNetworkDataPlaneSocketAssign {
+				return E.New("shared-network socket assignment is unavailable: ", runtimeState.assignment_fallback_reason)
+			}
+			if listener := runtimeState.maps["shared_listener_sockets"]; listener != nil {
+				_ = listener.Close()
+				delete(runtimeState.maps, "shared_listener_sockets")
+				delete(replacements, "shared_listener_sockets")
+			}
+			if metadata := runtimeState.maps["shared_assign_metadata"]; metadata != nil {
+				_ = metadata.Close()
+				delete(runtimeState.maps, "shared_assign_metadata")
+				delete(replacements, "shared_assign_metadata")
+			}
+		}
 	}
-	runtimeState.programs = programs
+	if runtimeState.data_plane == "" {
+		programs, loadErr := loadObjectPrograms(loadSharedNetwork, replacements, []programSelection{
+			{section: "classifier/ingress", name: "sb_share_in"},
+			{section: "classifier/egress", name: "sb_share_out"},
+		})
+		if loadErr != nil {
+			return loadErr
+		}
+		runtimeState.programs = make([]*CiliumEBPF.Program, sharedNetworkProgramCount)
+		runtimeState.programs[sharedNetworkProgramIngress] = programs[0]
+		runtimeState.programs[sharedNetworkProgramEgress] = programs[1]
+		runtimeState.data_plane = SharedNetworkDataPlaneRewrite
+	}
 	runtimeState.control_map_fd = runtimeState.maps["shared_control"].FD()
 	runtimeState.stats_map_fd = runtimeState.maps["shared_stats"].FD()
 	runtimeState.flow_by_original_map_fd = runtimeState.maps["shared_flow_by_original"].FD()
@@ -325,8 +423,14 @@ func prepareSharedNetworkRuntime(
 	runtimeState.include_source_mac_map_fd = runtimeState.maps["shared_include_source_mac"].FD()
 	runtimeState.exclude_source_mac_map_fd = runtimeState.maps["shared_exclude_source_mac"].FD()
 	runtimeState.scratch_map_fd = runtimeState.maps["shared_scratch"].FD()
-	runtimeState.ingress_prog_fd = programs[sharedNetworkProgramIngress].FD()
-	runtimeState.egress_prog_fd = programs[sharedNetworkProgramEgress].FD()
+	if listenerMap := runtimeState.maps["shared_listener_sockets"]; listenerMap != nil {
+		runtimeState.listener_socket_map_fd = listenerMap.FD()
+	}
+	if metadataMap := runtimeState.maps["shared_assign_metadata"]; metadataMap != nil {
+		runtimeState.assign_metadata_map_fd = metadataMap.FD()
+	}
+	runtimeState.ingress_prog_fd = runtimeState.programs[sharedNetworkProgramIngress].FD()
+	runtimeState.egress_prog_fd = runtimeState.programs[sharedNetworkProgramEgress].FD()
 	return nil
 }
 
@@ -426,6 +530,154 @@ func (b *SharedNetworkBackend) IngressProgramFD() int {
 	return b.runtime.ingress_prog_fd
 }
 
+func (b *SharedNetworkBackend) DataPlane() string {
+	if b == nil {
+		return SharedNetworkDataPlaneRewrite
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil || b.runtime.data_plane == "" {
+		return SharedNetworkDataPlaneRewrite
+	}
+	return b.runtime.data_plane
+}
+
+func (b *SharedNetworkBackend) TCPAssignmentEnabled() bool {
+	return b.DataPlane() == SharedNetworkDataPlaneSocketAssign
+}
+
+func (b *SharedNetworkBackend) UDPAssignmentEnabled() bool {
+	if b == nil {
+		return false
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	return b.runtime != nil && b.runtime.data_plane == SharedNetworkDataPlaneSocketAssign && b.runtime.udp_assignment
+}
+
+func (b *SharedNetworkBackend) UDPAssignmentFallbackReason() string {
+	if b == nil {
+		return ""
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return ""
+	}
+	return b.runtime.udp_assignment_fallback
+}
+
+func (b *SharedNetworkBackend) AssignmentFallbackReason() string {
+	if b == nil {
+		return ""
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return ""
+	}
+	return b.runtime.assignment_fallback_reason
+}
+
+func (b *SharedNetworkBackend) RegisterTCPAssignmentSocket(key uint32, fd int) error {
+	if b == nil || key >= 2 || fd < 0 {
+		return E.New("invalid shared-network TCP assignment listener")
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil || b.runtime.listener_socket_map_fd < 0 {
+		return errBackendClosed
+	}
+	value := uint32(fd)
+	return updateMap(
+		b.runtime.listener_socket_map_fd,
+		unsafe.Pointer(&key),
+		unsafe.Pointer(&value),
+	)
+}
+
+func (b *SharedNetworkBackend) FallbackToRewrite() error {
+	if b == nil {
+		return errBackendClosed
+	}
+	b.access.Lock()
+	defer b.access.Unlock()
+	if err := b.requireUsableLocked(); err != nil {
+		return err
+	}
+	if b.runtime.data_plane != SharedNetworkDataPlaneSocketAssign {
+		return nil
+	}
+	rewrite := b.runtime.programs[sharedNetworkProgramRewriteIngress]
+	if rewrite == nil {
+		return E.New("shared-network rewrite fallback program is unavailable")
+	}
+	assignment := b.runtime.programs[sharedNetworkProgramIngress]
+	b.runtime.programs[sharedNetworkProgramIngress] = rewrite
+	b.runtime.programs[sharedNetworkProgramRewriteIngress] = nil
+	if assignment != nil {
+		_ = assignment.Close()
+	}
+	b.runtime.ingress_prog_fd = rewrite.FD()
+	b.runtime.data_plane = SharedNetworkDataPlaneRewrite
+	b.control.Flags &^= sharedNetworkFlagSocketAssignTCP
+	b.control.Flags &^= sharedNetworkFlagSocketAssignUDP
+	b.control.RoutingMark = 0
+	return b.updateControl()
+}
+
+func (b *SharedNetworkBackend) TakeTCPAssignmentMetadata(
+	client netip.AddrPort,
+	destination netip.AddrPort,
+) (uint32, MACAddress, error) {
+	var sourceMAC MACAddress
+	key, err := makeSharedNetworkAssignKey(ProtocolTCP, client, destination)
+	if err != nil {
+		return 0, sourceMAC, err
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil || b.runtime.assign_metadata_map_fd < 0 {
+		return 0, sourceMAC, errBackendClosed
+	}
+	var value sharedNetworkAssignValue
+	if err = lookupAndDeleteMap(
+		b.runtime.assign_metadata_map_fd,
+		unsafe.Pointer(&key),
+		unsafe.Pointer(&value),
+	); err != nil {
+		return 0, sourceMAC, err
+	}
+	copy(sourceMAC[:], value.SourceMAC[:])
+	return value.InterfaceIndex, sourceMAC, nil
+}
+
+func (b *SharedNetworkBackend) LookupUDPAssignmentMetadata(
+	client netip.AddrPort,
+	destination netip.AddrPort,
+) (uint32, MACAddress, error) {
+	var sourceMAC MACAddress
+	key, err := makeSharedNetworkAssignKey(ProtocolUDP, client, destination)
+	if err != nil {
+		return 0, sourceMAC, err
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil || b.runtime.assign_metadata_map_fd < 0 {
+		return 0, sourceMAC, errBackendClosed
+	}
+	var value sharedNetworkAssignValue
+	if err = lookupMap(
+		b.runtime.assign_metadata_map_fd,
+		unsafe.Pointer(&key),
+		unsafe.Pointer(&value),
+	); err != nil {
+		return 0, sourceMAC, err
+	}
+	copy(sourceMAC[:], value.SourceMAC[:])
+	return value.InterfaceIndex, sourceMAC, nil
+}
+
 func (b *SharedNetworkBackend) EgressProgramFD() int {
 	if b == nil {
 		return -1
@@ -443,23 +695,53 @@ func (b *SharedNetworkBackend) RuntimeStatus() SharedNetworkRuntimeStatus {
 		return SharedNetworkRuntimeStatus{}
 	}
 	b.access.RLock()
-	defer b.access.RUnlock()
 	if b.runtime == nil {
+		b.access.RUnlock()
 		return SharedNetworkRuntimeStatus{}
 	}
 	status := SharedNetworkRuntimeStatus{
-		Maps: b.statusCollector.collect(b.runtime.maps),
+		DataPlane:                   b.runtime.data_plane,
+		NonCommonLRU:                b.runtime.non_common_lru,
+		UDPAssignment:               b.runtime.udp_assignment,
+		UDPAssignmentFallbackReason: b.runtime.udp_assignment_fallback,
+		Maps:                        b.statusCollector.collect(b.runtime.maps),
 	}
 	for slot, program := range b.runtime.programs {
+		if program == nil {
+			continue
+		}
 		name := "sb_share_in"
 		section := "classifier/ingress"
+		if slot == sharedNetworkProgramIngress && b.runtime.data_plane == SharedNetworkDataPlaneSocketAssign {
+			name = "sb_sh_assign"
+			section = "classifier/assign"
+			if b.runtime.udp_assignment {
+				name = "sb_sh_as_udp"
+				section = "classifier/assign_udp"
+			}
+		}
 		if slot == sharedNetworkProgramEgress {
 			name = "sb_share_out"
 			section = "classifier/egress"
+		} else if slot == sharedNetworkProgramRewriteIngress {
+			name = "sb_share_fallback"
 		}
 		status.Programs = append(status.Programs, runtimeProgramStatus(program, name, section))
 	}
+	b.access.RUnlock()
+	var statsErr error
+	status.Statistics, statsErr = b.SharedNetworkStatistics()
+	if statsErr != nil {
+		status.StatsError = statsErr.Error()
+	}
 	return status
+}
+
+func (b *SharedNetworkBackend) MapCapacity() SharedNetworkMapCapacities {
+	if b == nil {
+		return SharedNetworkMapCapacities{}
+	}
+	return b.mapCapacity
 }
 
 func (b *SharedNetworkBackend) Close() error {

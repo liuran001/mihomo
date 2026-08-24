@@ -256,14 +256,8 @@ func (b *CgroupBackend) updateCgroupControl(listenerPort uint16, selfTGID uint32
 	if b.enableIPv6 {
 		flags |= cgroupFlagIPv6
 	}
-	if b.hijackDNS {
-		flags |= cgroupFlagHijackDNS
-	}
 	if b.bypassPrivateAddress {
 		flags |= cgroupFlagBypassPrivateAddress
-	}
-	if b.dnsRespectBypass {
-		flags |= cgroupFlagDNSRespectBypass
 	}
 	if b.runtime.uid_policy {
 		flags |= cgroupFlagUIDPolicy
@@ -295,6 +289,7 @@ func (b *CgroupBackend) updateCgroupControl(listenerPort uint16, selfTGID uint32
 		Flags:                flags,
 		SelfTGID:             selfTGID,
 		UDPTimeoutSeconds:    b.udpTimeoutSeconds,
+		DNSMode:              b.dnsMode,
 		RedirectIPv4Prefix:   ipv4Prefix,
 		RedirectIPv4HostMask: ipv4HostMask,
 		ListenerPort:         listenerPort,

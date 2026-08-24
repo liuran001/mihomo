@@ -49,21 +49,24 @@ func (b *SharedNetworkBackend) lookupFlow(
 	if b.runtime == nil {
 		return OriginalDestination{}, nil, errBackendClosed
 	}
-	if retain {
-		b.flowAccess.Lock()
-		defer b.flowAccess.Unlock()
-	}
 	var value sharedNetworkOriginalValue
 	if err = lookupMap(
 		int(b.runtime.flow_by_token_map_fd),
 		unsafe.Pointer(&key),
 		unsafe.Pointer(&value),
 	); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			b.tokenLookupMisses.Add(1)
+		}
 		return OriginalDestination{}, nil, E.Cause(err, "lookup shared-network original destination")
 	}
 	address, err := sharedNetworkOriginalAddress(value)
 	if err != nil {
 		return OriginalDestination{}, nil, err
+	}
+	if retain {
+		b.flowAccess.Lock()
+		defer b.flowAccess.Unlock()
 	}
 	flow := makeSharedNetworkFlowHandle(key, value)
 	if err = b.validateFlowGenerationLocked(flow); err != nil {
@@ -273,8 +276,48 @@ func (b *SharedNetworkBackend) ReleaseFlow(flow *SharedNetworkFlowHandle) error 
 	if !b.releaseFlowReferenceLocked(*flow) {
 		return nil
 	}
+	if flow.originalKey.Protocol == ProtocolTCP {
+		b.deferTCPFlowReleaseLocked(*flow, time.Now())
+		return nil
+	}
 	_, err := b.deleteFlowGenerationLocked(*flow)
 	return err
+}
+
+func (b *SharedNetworkBackend) deferTCPFlowReleaseLocked(flow SharedNetworkFlowHandle, now time.Time) {
+	if b.flowReleases == nil {
+		b.flowReleases = make(map[SharedNetworkFlowHandle]time.Time)
+	}
+	b.flowReleases[flow] = now.Add(sharedNetworkTCPReleaseGrace)
+	select {
+	case b.flowReleaseWake <- struct{}{}:
+	default:
+	}
+}
+
+func (b *SharedNetworkBackend) TCPFlowReleaseWake() <-chan struct{} {
+	if b == nil {
+		return nil
+	}
+	return b.flowReleaseWake
+}
+
+func (b *SharedNetworkBackend) NextTCPFlowReleaseDelay(now time.Time) (time.Duration, bool) {
+	if b == nil {
+		return 0, false
+	}
+	b.flowAccess.Lock()
+	defer b.flowAccess.Unlock()
+	var earliest time.Time
+	for _, deadline := range b.flowReleases {
+		if earliest.IsZero() || deadline.Before(earliest) {
+			earliest = deadline
+		}
+	}
+	if earliest.IsZero() {
+		return 0, false
+	}
+	return max(earliest.Sub(now), 0), true
 }
 
 func (b *SharedNetworkBackend) validateFlowGenerationLocked(flow SharedNetworkFlowHandle) error {
@@ -284,9 +327,13 @@ func (b *SharedNetworkBackend) validateFlowGenerationLocked(flow SharedNetworkFl
 		unsafe.Pointer(&flow.originalKey),
 		unsafe.Pointer(&current),
 	); err != nil {
+		if errors.Is(err, unix.ENOENT) {
+			b.generationMisses.Add(1)
+		}
 		return E.Cause(err, "validate shared-network flow generation")
 	}
 	if current.Generation != flow.generation || current.TokenAddr != flow.listenerKey.TokenAddr {
+		b.generationMismatch.Add(1)
 		return E.Cause(unix.ENOENT, "shared-network flow generation changed")
 	}
 	return nil
@@ -338,10 +385,50 @@ func (b *SharedNetworkBackend) deleteTokenGenerationLocked(flow SharedNetworkFlo
 }
 
 func (b *SharedNetworkBackend) retainFlowLocked(flow SharedNetworkFlowHandle) {
+	delete(b.flowReleases, flow)
 	if b.flowReferences == nil {
 		b.flowReferences = make(map[SharedNetworkFlowHandle]uint32)
 	}
 	b.flowReferences[flow]++
+}
+
+func (b *SharedNetworkBackend) FlushReleasedTCPFlows(now time.Time, budget uint32) (uint32, error) {
+	if b == nil {
+		return 0, errBackendClosed
+	}
+	if budget == 0 {
+		return 0, unix.EINVAL
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return 0, errBackendClosed
+	}
+	b.flowAccess.Lock()
+	defer b.flowAccess.Unlock()
+	var processed uint32
+	var removed uint32
+	var flushErr error
+	for flow, deadline := range b.flowReleases {
+		if processed >= budget || now.Before(deadline) {
+			continue
+		}
+		processed++
+		if b.flowReferences[flow] > 0 {
+			delete(b.flowReleases, flow)
+			continue
+		}
+		delete(b.flowReleases, flow)
+		flowRemoved, err := b.deleteFlowGenerationLocked(flow)
+		if err != nil {
+			flushErr = E.Errors(flushErr, err)
+			continue
+		}
+		if flowRemoved {
+			removed++
+		}
+	}
+	return removed, flushErr
 }
 
 func (b *SharedNetworkBackend) releaseFlowReferenceLocked(flow SharedNetworkFlowHandle) bool {
@@ -449,6 +536,55 @@ func (b *SharedNetworkBackend) SweepOrphanedFlows(
 	return result, sweepErr
 }
 
+// PurgeInterfaceFlows removes state belonging to an interface generation that
+// is about to be detached. It is intentionally a control-plane operation.
+func (b *SharedNetworkBackend) PurgeInterfaceFlows(interfaceIndex uint32, budget uint32) (uint32, bool, error) {
+	if b == nil {
+		return 0, false, errBackendClosed
+	}
+	if interfaceIndex == 0 || budget == 0 {
+		return 0, false, unix.EINVAL
+	}
+	b.flowSweepAccess.Lock()
+	defer b.flowSweepAccess.Unlock()
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return 0, false, errBackendClosed
+	}
+	b.flowSweepCandidates = b.flowSweepCandidates[:0]
+	scan, err := b.flowSweepScratch.scan(
+		b.runtime.maps["shared_flow_by_original"],
+		b.mapCapacity.Proxy,
+		budget,
+		func(key sharedNetworkOriginalKey, value sharedNetworkTokenValue) {
+			if key.InterfaceIndex == interfaceIndex {
+				b.flowSweepCandidates = append(b.flowSweepCandidates, sharedNetworkFlowEntry{key: key, value: value})
+			}
+		},
+	)
+	if err != nil {
+		return 0, scan.Complete, err
+	}
+	var removed uint32
+	for _, entry := range b.flowSweepCandidates {
+		flow := makeSharedNetworkFlowHandleFromOriginal(
+			entry.key,
+			entry.value.TokenAddr,
+			b.control.ListenerPort,
+			entry.value.Generation,
+		)
+		b.flowAccess.Lock()
+		_, removeErr := b.deleteFlowGenerationLocked(flow)
+		b.flowAccess.Unlock()
+		if removeErr != nil {
+			return removed, scan.Complete, removeErr
+		}
+		removed++
+	}
+	return removed, scan.Complete, nil
+}
+
 func (b *SharedNetworkBackend) removeOrphanedFlowCandidate(
 	mapFD int,
 	entry sharedNetworkFlowEntry,
@@ -514,10 +650,53 @@ func (b *SharedNetworkBackend) TokenReservationFailures() (uint64, error) {
 	if b.runtime == nil {
 		return 0, errBackendClosed
 	}
-	key := uint32(sharedNetworkStatTokenReservationFailure)
-	var failures uint64
-	if err := lookupMap(b.statsMapFD, unsafe.Pointer(&key), unsafe.Pointer(&failures)); err != nil {
+	return b.sharedNetworkStatisticLocked(sharedNetworkStatTokenReservationFailure)
+}
+
+func (b *SharedNetworkBackend) sharedNetworkStatisticLocked(index uint32) (uint64, error) {
+	statsMap := b.runtime.maps["shared_stats"]
+	if statsMap == nil {
+		return 0, errBackendClosed
+	}
+	var perCPU []uint64
+	if err := statsMap.Lookup(&index, &perCPU); err != nil {
 		return 0, err
 	}
-	return failures, nil
+	var total uint64
+	for _, value := range perCPU {
+		total += value
+	}
+	return total, nil
+}
+
+func (b *SharedNetworkBackend) SharedNetworkStatistics() (SharedNetworkStatistics, error) {
+	if b == nil {
+		return SharedNetworkStatistics{}, errBackendClosed
+	}
+	b.access.RLock()
+	defer b.access.RUnlock()
+	if b.runtime == nil {
+		return SharedNetworkStatistics{}, errBackendClosed
+	}
+	var values [8]uint64
+	for index := range values {
+		value, err := b.sharedNetworkStatisticLocked(uint32(index))
+		if err != nil {
+			return SharedNetworkStatistics{}, err
+		}
+		values[index] = value
+	}
+	return SharedNetworkStatistics{
+		TokenReservationFailures: values[sharedNetworkStatTokenReservationFailure],
+		TokenPublishRetries:      values[sharedNetworkStatTokenPublishRetry],
+		OriginalPublishFailures:  values[sharedNetworkStatOriginalPublishFailure],
+		EgressFlowMisses:         values[sharedNetworkStatEgressFlowMiss],
+		SocketAssignments:        values[sharedNetworkStatSocketAssignment],
+		SocketAssignFailures:     values[sharedNetworkStatSocketAssignFailure],
+		UDPSocketAssignments:     values[sharedNetworkStatUDPSocketAssignment],
+		UDPSocketAssignFailures:  values[sharedNetworkStatUDPSocketAssignFailure],
+		TokenLookupMisses:        b.tokenLookupMisses.Load(),
+		GenerationLookupMisses:   b.generationMisses.Load(),
+		GenerationMismatches:     b.generationMismatch.Load(),
+	}, nil
 }

@@ -108,6 +108,17 @@ func normalizeDNSMode(mode string) (string, error) {
 	}
 }
 
+func commonDNSMode(mode string) ECommon.DNSMode {
+	switch mode {
+	case dnsModeRespectBypass:
+		return ECommon.DNSModeRespectPolicy
+	case dnsModeOff:
+		return ECommon.DNSModeOff
+	default:
+		return ECommon.DNSModeHijack
+	}
+}
+
 func normalizeCgroupIPv6Mode(mode string) (string, error) {
 	switch mode {
 	case "", cgroupIPv6ModeAuto:

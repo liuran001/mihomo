@@ -11,7 +11,7 @@ var (
 	redirectIPv6Range = netip.MustParsePrefix("fc00::/7")
 )
 
-func normalizeAddressPrefix(name string, prefix netip.Prefix, ipv4 bool) (netip.Prefix, error) {
+func normalizeAddressPrefix(name string, prefix netip.Prefix, ipv4 bool) (netip.Prefix, error) { //nolint:unused // Used by eBPF-tagged backends.
 	if !prefix.IsValid() {
 		return netip.Prefix{}, nil
 	}

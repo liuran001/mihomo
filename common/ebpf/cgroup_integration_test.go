@@ -84,7 +84,7 @@ func TestCgroupBackendProgramLoadIntegration(t *testing.T) {
 			expectedSelfBypass:   "tgid",
 		})
 	})
-	t.Run("dns_respect_bypass", func(t *testing.T) {
+	t.Run("dns_respect_policy", func(t *testing.T) {
 		testCgroupBackendProgramLoad(t, cgroupProgramLoadOptions{
 			enableTCP:          true,
 			enableUDP:          true,
@@ -105,7 +105,7 @@ func TestCgroupConnectedUDPRecoveryIntegration(t *testing.T) {
 		RedirectIPv4: netip.MustParsePrefix("127.128.0.0/9"),
 		MapCapacity:  DefaultCgroupMapCapacity(),
 		UDPTimeout:   5 * time.Minute,
-		Policy:       CgroupPolicy{HijackDNS: true},
+		Policy:       CgroupPolicy{DNSMode: DNSModeHijack},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -189,7 +189,7 @@ func TestCgroupUDPRecoveryConsumptionIntegration(t *testing.T) {
 		RedirectIPv4: netip.MustParsePrefix("127.128.0.0/9"),
 		MapCapacity:  DefaultCgroupMapCapacity(),
 		UDPTimeout:   5 * time.Minute,
-		Policy:       CgroupPolicy{HijackDNS: true},
+		Policy:       CgroupPolicy{DNSMode: DNSModeHijack},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -276,7 +276,7 @@ func TestCgroupUDPReplyRedirectIntegration(t *testing.T) {
 		RedirectIPv6: netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
 		MapCapacity:  DefaultCgroupMapCapacity(),
 		UDPTimeout:   5 * time.Minute,
-		Policy:       CgroupPolicy{HijackDNS: true},
+		Policy:       CgroupPolicy{DNSMode: DNSModeHijack},
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -313,6 +313,16 @@ func TestCgroupUDPReplyRedirectIntegration(t *testing.T) {
 	}
 }
 
+func integrationDNSMode(hijackDNS bool, dnsRespectBypass bool) DNSMode {
+	if !hijackDNS {
+		return DNSModeOff
+	}
+	if dnsRespectBypass {
+		return DNSModeRespectPolicy
+	}
+	return DNSModeHijack
+}
+
 type cgroupProgramLoadOptions struct {
 	enableTCP            bool
 	enableUDP            bool
@@ -338,9 +348,8 @@ func testCgroupBackendProgramLoad(t *testing.T, options cgroupProgramLoadOptions
 		MapCapacity:   DefaultCgroupMapCapacity(),
 		UDPTimeout:    5 * time.Minute,
 		Policy: CgroupPolicy{
-			HijackDNS:            options.hijackDNS,
+			DNSMode:              integrationDNSMode(options.hijackDNS, options.dnsRespectBypass),
 			BypassPrivateAddress: options.bypassPrivateAddress,
-			DNSRespectBypass:     options.dnsRespectBypass,
 		},
 	})
 	if err != nil {
@@ -507,7 +516,7 @@ func TestSharedNetworkSharedMapProgramLoadIntegration(t *testing.T) {
 			prepareSharedNetworkProgramLoad(t, backend, hijackDNS, false, true)
 		})
 	}
-	t.Run("respect_bypass", func(t *testing.T) {
+	t.Run("respect_policy", func(t *testing.T) {
 		prepareSharedNetworkProgramLoad(t, backend, true, true, true)
 	})
 	t.Run("proxy_private", func(t *testing.T) {
@@ -607,8 +616,7 @@ func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend,
 		ListenerPort:         65531,
 		EnableTCP:            true,
 		EnableUDP:            true,
-		HijackDNS:            hijackDNS,
-		DNSRespectBypass:     dnsRespectBypass,
+		DNSMode:              integrationDNSMode(hijackDNS, dnsRespectBypass),
 		BypassPrivateAddress: bypassPrivateAddress,
 		RedirectIPv4:         netip.MustParsePrefix("127.128.0.0/9"),
 		RedirectIPv6:         netip.MustParsePrefix("fd53:696e:672d:626f::/64"),
@@ -654,11 +662,8 @@ func prepareSharedNetworkProgramLoad(t *testing.T, cgroupBackend *CgroupBackend,
 	if sharedBackend.IngressProgramFD() < 0 || sharedBackend.EgressProgramFD() < 0 {
 		t.Fatal("shared-network token programs were not loaded")
 	}
-	if hasDNSHijack := sharedBackend.control.Flags&sharedNetworkFlagDNSHijack != 0; hasDNSHijack != hijackDNS {
-		t.Fatalf("unexpected shared-network DNS hijack flag: %t", hasDNSHijack)
-	}
-	if respectsDNSBypass := sharedBackend.control.Flags&sharedNetworkFlagDNSRespectBypass != 0; respectsDNSBypass != dnsRespectBypass {
-		t.Fatalf("unexpected shared-network DNS respect-bypass flag: %t", respectsDNSBypass)
+	if dnsMode := integrationDNSMode(hijackDNS, dnsRespectBypass); sharedBackend.control.DNSMode != dnsMode {
+		t.Fatalf("unexpected shared-network DNS mode: %d", sharedBackend.control.DNSMode)
 	}
 	if hasBypassPrivateAddress := sharedBackend.control.Flags&sharedNetworkFlagBypassPrivateAddress != 0; hasBypassPrivateAddress != bypassPrivateAddress {
 		t.Fatalf("unexpected shared-network private-address bypass flag: %t", hasBypassPrivateAddress)
@@ -765,7 +770,7 @@ func TestCgroupBackendTrafficIntegration(t *testing.T) {
 		UDPTimeout:   5 * time.Minute,
 		Policy: CgroupPolicy{
 			EnableBypassCIDR: true,
-			HijackDNS:        true,
+			DNSMode:          DNSModeHijack,
 		},
 	})
 	if err != nil {

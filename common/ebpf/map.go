@@ -15,6 +15,28 @@ import (
 	"golang.org/x/sys/unix"
 )
 
+func probeNonCommonLRU() bool {
+	capacity := max(uint32(64), uint32(runtime.NumCPU()*2))
+	mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+		Name:       "sb_lru_probe",
+		Type:       CiliumEBPF.LRUHash,
+		KeySize:    4,
+		ValueSize:  4,
+		MaxEntries: capacity,
+		Flags:      unix.BPF_F_NO_COMMON_LRU,
+	})
+	if err != nil {
+		return false
+	}
+	_ = mapInstance.Close()
+	return true
+}
+
+func lruMapFlagUnsupported(err error) bool {
+	return errors.Is(err, unix.EINVAL) || errors.Is(err, unix.ENOTSUP) ||
+		errors.Is(err, unix.EOPNOTSUPP) || errors.Is(err, linuxErrnoNotSupported)
+}
+
 const (
 	bpfMapLookupElem          = 1
 	bpfMapUpdateElem          = 2

@@ -5,7 +5,7 @@ import (
 	"slices"
 )
 
-func compileHostPrefixes(addresses []netip.Addr) ([]netip.Prefix, []netip.Prefix) {
+func compileHostPrefixes(addresses []netip.Addr) ([]netip.Prefix, []netip.Prefix) { //nolint:unused // Used by eBPF-tagged policy runtimes.
 	ipv4Set := make(map[netip.Prefix]struct{})
 	ipv6Set := make(map[netip.Prefix]struct{})
 	for _, address := range addresses {

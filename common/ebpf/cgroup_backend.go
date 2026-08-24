@@ -129,9 +129,8 @@ type CgroupBackend struct {
 	autoIPv6                       bool
 	ipv6Available                  bool
 	enableUDP                      bool
-	hijackDNS                      bool
+	dnsMode                        DNSMode
 	bypassPrivateAddress           bool
-	dnsRespectBypass               bool
 	udpTimeoutSeconds              uint32
 }
 
@@ -277,9 +276,8 @@ func PrepareCgroup(config CgroupConfig) (*CgroupBackend, error) {
 		enableIPv6:           config.EnableIPv6,
 		autoIPv6:             config.AutoIPv6,
 		enableUDP:            config.EnableUDP,
-		hijackDNS:            policy.HijackDNS,
+		dnsMode:              policy.DNSMode,
 		bypassPrivateAddress: policy.BypassPrivateAddress,
-		dnsRespectBypass:     policy.DNSRespectBypass,
 		udpTimeoutSeconds:    udpTimeoutSeconds,
 	}
 	if config.AutoIPv6 {

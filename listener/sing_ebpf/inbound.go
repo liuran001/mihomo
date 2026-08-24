@@ -201,8 +201,7 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		sharedNetworkIncludeMAC:  sharedNetworkIncludeMAC,
 		sharedNetworkExcludeMAC:  sharedNetworkExcludeMAC,
 		cgroupPolicy: ECommon.CgroupPolicy{
-			HijackDNS:            dnsMode != dnsModeOff,
-			DNSRespectBypass:     dnsMode == dnsModeRespectBypass,
+			DNSMode:              commonDNSMode(dnsMode),
 			BypassPrivateAddress: bypassPrivateAddress,
 			IncludeUIDConfigured: len(options.Local.IncludeUID) > 0 ||
 				len(options.Local.IncludeUIDRange) > 0 || len(options.Local.IncludePackage) > 0,

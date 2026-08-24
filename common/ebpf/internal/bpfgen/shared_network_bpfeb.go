@@ -16,25 +16,29 @@ import (
 //
 // Used for safe lookups in a Collection or CollectionSpec.
 const (
-	SharedNetworkMapSharedBypassFlow        = "shared_bypass_flow"
-	SharedNetworkMapSharedBypassIpv4        = "shared_bypass_ipv4"
-	SharedNetworkMapSharedBypassIpv6        = "shared_bypass_ipv6"
-	SharedNetworkMapSharedControl           = "shared_control"
-	SharedNetworkMapSharedExcludeSourceIpv4 = "shared_exclude_source_ipv4"
-	SharedNetworkMapSharedExcludeSourceIpv6 = "shared_exclude_source_ipv6"
-	SharedNetworkMapSharedExcludeSourceMac  = "shared_exclude_source_mac"
-	SharedNetworkMapSharedFlowByOriginal    = "shared_flow_by_original"
-	SharedNetworkMapSharedFlowByToken       = "shared_flow_by_token"
-	SharedNetworkMapSharedFragment          = "shared_fragment"
-	SharedNetworkMapSharedHostIpv4          = "shared_host_ipv4"
-	SharedNetworkMapSharedHostIpv6          = "shared_host_ipv6"
-	SharedNetworkMapSharedIncludeSourceIpv4 = "shared_include_source_ipv4"
-	SharedNetworkMapSharedIncludeSourceIpv6 = "shared_include_source_ipv6"
-	SharedNetworkMapSharedIncludeSourceMac  = "shared_include_source_mac"
-	SharedNetworkMapSharedScratch           = "shared_scratch"
-	SharedNetworkMapSharedStats             = "shared_stats"
-	SharedNetworkProgSingboxSharedEgress    = "singbox_shared_egress"
-	SharedNetworkProgSingboxSharedIngress   = "singbox_shared_ingress"
+	SharedNetworkMapSharedAssignMetadata           = "shared_assign_metadata"
+	SharedNetworkMapSharedBypassFlow               = "shared_bypass_flow"
+	SharedNetworkMapSharedBypassIpv4               = "shared_bypass_ipv4"
+	SharedNetworkMapSharedBypassIpv6               = "shared_bypass_ipv6"
+	SharedNetworkMapSharedControl                  = "shared_control"
+	SharedNetworkMapSharedExcludeSourceIpv4        = "shared_exclude_source_ipv4"
+	SharedNetworkMapSharedExcludeSourceIpv6        = "shared_exclude_source_ipv6"
+	SharedNetworkMapSharedExcludeSourceMac         = "shared_exclude_source_mac"
+	SharedNetworkMapSharedFlowByOriginal           = "shared_flow_by_original"
+	SharedNetworkMapSharedFlowByToken              = "shared_flow_by_token"
+	SharedNetworkMapSharedFragment                 = "shared_fragment"
+	SharedNetworkMapSharedHostIpv4                 = "shared_host_ipv4"
+	SharedNetworkMapSharedHostIpv6                 = "shared_host_ipv6"
+	SharedNetworkMapSharedIncludeSourceIpv4        = "shared_include_source_ipv4"
+	SharedNetworkMapSharedIncludeSourceIpv6        = "shared_include_source_ipv6"
+	SharedNetworkMapSharedIncludeSourceMac         = "shared_include_source_mac"
+	SharedNetworkMapSharedListenerSockets          = "shared_listener_sockets"
+	SharedNetworkMapSharedScratch                  = "shared_scratch"
+	SharedNetworkMapSharedStats                    = "shared_stats"
+	SharedNetworkProgSingboxSharedAssignIngress    = "singbox_shared_assign_ingress"
+	SharedNetworkProgSingboxSharedAssignUdpIngress = "singbox_shared_assign_udp_ingress"
+	SharedNetworkProgSingboxSharedEgress           = "singbox_shared_egress"
+	SharedNetworkProgSingboxSharedIngress          = "singbox_shared_ingress"
 )
 
 // LoadSharedNetwork returns the embedded CollectionSpec for SharedNetwork.
@@ -79,14 +83,17 @@ type SharedNetworkSpecs struct {
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type SharedNetworkProgramSpecs struct {
-	SingboxSharedEgress  *ebpf.ProgramSpec `ebpf:"singbox_shared_egress"`
-	SingboxSharedIngress *ebpf.ProgramSpec `ebpf:"singbox_shared_ingress"`
+	SingboxSharedAssignIngress    *ebpf.ProgramSpec `ebpf:"singbox_shared_assign_ingress"`
+	SingboxSharedAssignUdpIngress *ebpf.ProgramSpec `ebpf:"singbox_shared_assign_udp_ingress"`
+	SingboxSharedEgress           *ebpf.ProgramSpec `ebpf:"singbox_shared_egress"`
+	SingboxSharedIngress          *ebpf.ProgramSpec `ebpf:"singbox_shared_ingress"`
 }
 
 // SharedNetworkMapSpecs contains maps before they are loaded into the kernel.
 //
 // It can be passed ebpf.CollectionSpec.Assign.
 type SharedNetworkMapSpecs struct {
+	SharedAssignMetadata    *ebpf.MapSpec `ebpf:"shared_assign_metadata"`
 	SharedBypassFlow        *ebpf.MapSpec `ebpf:"shared_bypass_flow"`
 	SharedBypassIpv4        *ebpf.MapSpec `ebpf:"shared_bypass_ipv4"`
 	SharedBypassIpv6        *ebpf.MapSpec `ebpf:"shared_bypass_ipv6"`
@@ -102,6 +109,7 @@ type SharedNetworkMapSpecs struct {
 	SharedIncludeSourceIpv4 *ebpf.MapSpec `ebpf:"shared_include_source_ipv4"`
 	SharedIncludeSourceIpv6 *ebpf.MapSpec `ebpf:"shared_include_source_ipv6"`
 	SharedIncludeSourceMac  *ebpf.MapSpec `ebpf:"shared_include_source_mac"`
+	SharedListenerSockets   *ebpf.MapSpec `ebpf:"shared_listener_sockets"`
 	SharedScratch           *ebpf.MapSpec `ebpf:"shared_scratch"`
 	SharedStats             *ebpf.MapSpec `ebpf:"shared_stats"`
 }
@@ -132,6 +140,7 @@ func (o *SharedNetworkObjects) Close() error {
 //
 // It can be passed to LoadSharedNetworkObjects or ebpf.CollectionSpec.LoadAndAssign.
 type SharedNetworkMaps struct {
+	SharedAssignMetadata    *ebpf.Map `ebpf:"shared_assign_metadata"`
 	SharedBypassFlow        *ebpf.Map `ebpf:"shared_bypass_flow"`
 	SharedBypassIpv4        *ebpf.Map `ebpf:"shared_bypass_ipv4"`
 	SharedBypassIpv6        *ebpf.Map `ebpf:"shared_bypass_ipv6"`
@@ -147,12 +156,14 @@ type SharedNetworkMaps struct {
 	SharedIncludeSourceIpv4 *ebpf.Map `ebpf:"shared_include_source_ipv4"`
 	SharedIncludeSourceIpv6 *ebpf.Map `ebpf:"shared_include_source_ipv6"`
 	SharedIncludeSourceMac  *ebpf.Map `ebpf:"shared_include_source_mac"`
+	SharedListenerSockets   *ebpf.Map `ebpf:"shared_listener_sockets"`
 	SharedScratch           *ebpf.Map `ebpf:"shared_scratch"`
 	SharedStats             *ebpf.Map `ebpf:"shared_stats"`
 }
 
 func (m *SharedNetworkMaps) Close() error {
 	return _SharedNetworkClose(
+		m.SharedAssignMetadata,
 		m.SharedBypassFlow,
 		m.SharedBypassIpv4,
 		m.SharedBypassIpv6,
@@ -168,6 +179,7 @@ func (m *SharedNetworkMaps) Close() error {
 		m.SharedIncludeSourceIpv4,
 		m.SharedIncludeSourceIpv6,
 		m.SharedIncludeSourceMac,
+		m.SharedListenerSockets,
 		m.SharedScratch,
 		m.SharedStats,
 	)
@@ -183,12 +195,16 @@ type SharedNetworkVariables struct {
 //
 // It can be passed to LoadSharedNetworkObjects or ebpf.CollectionSpec.LoadAndAssign.
 type SharedNetworkPrograms struct {
-	SingboxSharedEgress  *ebpf.Program `ebpf:"singbox_shared_egress"`
-	SingboxSharedIngress *ebpf.Program `ebpf:"singbox_shared_ingress"`
+	SingboxSharedAssignIngress    *ebpf.Program `ebpf:"singbox_shared_assign_ingress"`
+	SingboxSharedAssignUdpIngress *ebpf.Program `ebpf:"singbox_shared_assign_udp_ingress"`
+	SingboxSharedEgress           *ebpf.Program `ebpf:"singbox_shared_egress"`
+	SingboxSharedIngress          *ebpf.Program `ebpf:"singbox_shared_ingress"`
 }
 
 func (p *SharedNetworkPrograms) Close() error {
 	return _SharedNetworkClose(
+		p.SingboxSharedAssignIngress,
+		p.SingboxSharedAssignUdpIngress,
 		p.SingboxSharedEgress,
 		p.SingboxSharedIngress,
 	)

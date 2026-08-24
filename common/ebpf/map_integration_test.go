@@ -5,12 +5,53 @@ package ebpf
 import (
 	"errors"
 	"runtime"
+	"sync/atomic"
 	"testing"
 	"unsafe"
 
 	CiliumEBPF "github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
+
+func BenchmarkLRUContention(b *testing.B) {
+	requireEBPFIntegration(b, "benchmark shared LRU cache contention")
+	for _, testCase := range []struct {
+		name  string
+		flags uint32
+	}{
+		{name: "common"},
+		{name: "per-cpu", flags: unix.BPF_F_NO_COMMON_LRU},
+	} {
+		b.Run(testCase.name, func(b *testing.B) {
+			mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+				Type:       CiliumEBPF.LRUHash,
+				KeySize:    uint32(unsafe.Sizeof(uint64(0))),
+				ValueSize:  uint32(unsafe.Sizeof(uint64(0))),
+				MaxEntries: 16384,
+				Flags:      testCase.flags,
+			})
+			if err != nil {
+				if testCase.flags != 0 && lruMapFlagUnsupported(err) {
+					b.Skip("BPF_F_NO_COMMON_LRU is unavailable: ", err)
+				}
+				b.Fatal(err)
+			}
+			b.Cleanup(func() { _ = mapInstance.Close() })
+			var sequence atomic.Uint64
+			b.ResetTimer()
+			b.RunParallel(func(pb *testing.PB) {
+				for pb.Next() {
+					key := sequence.Add(1) & 0x7fff
+					value := key + 1
+					if updateErr := updateMap(mapInstance.FD(), unsafe.Pointer(&key), unsafe.Pointer(&value)); updateErr != nil {
+						b.Error(updateErr)
+						return
+					}
+				}
+			})
+		})
+	}
+}
 
 func TestMapBatchIntegration(t *testing.T) {
 	requireEBPFIntegration(t, "test BPF map batch operations")
@@ -157,6 +198,33 @@ func TestLRUFallbackBoundedIntegration(t *testing.T) {
 	}
 	if entries != maxEntries {
 		t.Fatalf("unexpected bounded LRU entry count: %d", entries)
+	}
+}
+
+func TestNonCommonLRUProbeIntegration(t *testing.T) {
+	requireEBPFIntegration(t, "probe per-CPU LRU eviction lists")
+	supported := probeNonCommonLRU()
+	flags := uint32(0)
+	if supported {
+		flags = unix.BPF_F_NO_COMMON_LRU
+	}
+	mapInstance, err := CiliumEBPF.NewMap(&CiliumEBPF.MapSpec{
+		Type:       CiliumEBPF.LRUHash,
+		KeySize:    4,
+		ValueSize:  4,
+		MaxEntries: 8,
+		Flags:      flags,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mapInstance.Close() })
+	info, err := mapInstance.Info()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if info.Flags != flags {
+		t.Fatalf("unexpected LRU flags: got=%#x want=%#x", info.Flags, flags)
 	}
 }
 

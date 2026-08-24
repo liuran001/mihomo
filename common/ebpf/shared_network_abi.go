@@ -11,7 +11,32 @@ import (
 	E "github.com/metacubex/sing/common/exceptions"
 )
 
-const sharedNetworkStatTokenReservationFailure = 0
+const (
+	sharedNetworkStatTokenReservationFailure = 0
+	sharedNetworkStatTokenPublishRetry       = 1
+	sharedNetworkStatOriginalPublishFailure  = 2
+	sharedNetworkStatEgressFlowMiss          = 3
+	sharedNetworkStatSocketAssignment        = 4
+	sharedNetworkStatSocketAssignFailure     = 5
+	sharedNetworkStatUDPSocketAssignment     = 6
+	sharedNetworkStatUDPSocketAssignFailure  = 7
+)
+
+type SharedNetworkStatistics struct {
+	TokenReservationFailures uint64 `json:"token_reservation_failures"`
+	TokenPublishRetries      uint64 `json:"token_publish_retries"`
+	OriginalPublishFailures  uint64 `json:"original_publish_failures"`
+	EgressFlowMisses         uint64 `json:"egress_flow_misses"`
+	SocketAssignments        uint64 `json:"socket_assignments"`
+	SocketAssignFailures     uint64 `json:"socket_assign_failures"`
+	UDPSocketAssignments     uint64 `json:"udp_socket_assignments"`
+	UDPSocketAssignFailures  uint64 `json:"udp_socket_assign_failures"`
+	TokenLookupMisses        uint64 `json:"token_lookup_misses"`
+	GenerationLookupMisses   uint64 `json:"generation_lookup_misses"`
+	GenerationMismatches     uint64 `json:"generation_mismatches"`
+}
+
+const sharedNetworkTCPReleaseGrace = time.Second
 
 const (
 	sharedNetworkScratchSize         = 272
@@ -24,8 +49,7 @@ type SharedNetworkConfig struct {
 	ListenerPort         uint16
 	EnableTCP            bool
 	EnableUDP            bool
-	HijackDNS            bool
-	DNSRespectBypass     bool
+	DNSMode              DNSMode
 	BypassPrivateAddress bool
 	RedirectIPv4         netip.Prefix
 	RedirectIPv6         netip.Prefix
@@ -37,6 +61,8 @@ type SharedNetworkConfig struct {
 	ExcludeSourceMAC     []MACAddress
 	MapCapacity          SharedNetworkMapCapacities
 	UDPTimeout           time.Duration
+	DataPlane            string
+	RoutingMark          uint32
 }
 
 type MACAddress [6]byte
@@ -50,7 +76,7 @@ type sharedNetworkControl struct {
 	Enabled             uint32
 	Flags               uint32
 	ListenerPort        uint16
-	Reserved            uint16
+	DNSMode             DNSMode
 	TokenIPv4Prefix     [4]byte
 	TokenIPv4PrefixBits uint8
 	TokenIPv6PrefixBits uint8
@@ -61,6 +87,42 @@ type sharedNetworkControl struct {
 	FakeIPIPv4Mask      [4]byte
 	FakeIPIPv6Prefix    [16]byte
 	FakeIPIPv6Mask      [16]byte
+	RoutingMark         uint32
+	Reserved3           uint32
+}
+
+type sharedNetworkAssignKey struct {
+	Family       uint8
+	Protocol     uint8
+	ClientPort   uint16
+	OriginalPort uint16
+	Reserved     uint16
+	ClientAddr   [16]byte
+	OriginalAddr [16]byte
+}
+
+type sharedNetworkAssignValue struct {
+	InterfaceIndex uint32
+	SourceMAC      [6]byte
+	Reserved       [2]byte
+}
+
+func makeSharedNetworkAssignKey(protocol uint8, client, destination netip.AddrPort) (sharedNetworkAssignKey, error) {
+	var key sharedNetworkAssignKey
+	key.Protocol = protocol
+	key.ClientPort = client.Port()
+	key.OriginalPort = destination.Port()
+	if err := encodeAddress(&key.Family, &key.ClientAddr, client.Addr()); err != nil {
+		return key, E.Cause(err, "invalid shared-network assignment client")
+	}
+	var destinationFamily uint8
+	if err := encodeAddress(&destinationFamily, &key.OriginalAddr, destination.Addr()); err != nil {
+		return key, E.Cause(err, "invalid shared-network assignment destination")
+	}
+	if destinationFamily != key.Family {
+		return key, E.New("shared-network assignment address families do not match")
+	}
+	return key, nil
 }
 
 func sharedNetworkUDPTimeoutSeconds(timeout time.Duration) (uint32, error) {
@@ -143,7 +205,7 @@ const (
 	sharedNetworkFlagIPv6
 	sharedNetworkFlagTCP
 	sharedNetworkFlagUDP
-	sharedNetworkFlagDNSHijack
+	_
 	sharedNetworkFlagHostIPv4
 	sharedNetworkFlagHostIPv6
 	sharedNetworkFlagBypassIPv4
@@ -154,9 +216,11 @@ const (
 	sharedNetworkFlagExcludeSourceMAC
 	sharedNetworkFlagBypassPrivateAddress
 	sharedNetworkFlagBypassFlowCache
-	sharedNetworkFlagDNSRespectBypass
+	_
 	sharedNetworkFlagFakeIPIPv4
 	sharedNetworkFlagFakeIPIPv6
+	sharedNetworkFlagSocketAssignTCP
+	sharedNetworkFlagSocketAssignUDP
 )
 
 const sharedNetworkPolicyFlags = sharedNetworkFlagHostIPv4 |
