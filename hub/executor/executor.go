@@ -240,7 +240,27 @@ func updateNTP(c *config.NTP) {
 	}
 }
 
+// storeFakeIPRanges publishes the ranges of the pools that are actually in use.
+// A family without a pool is published as a zero prefix so a consumer stops
+// treating that range as synthetic.
+func storeFakeIPRanges(c *config.DNS) {
+	var ipv4, ipv6 netip.Prefix
+	if c.Enable {
+		if c.FakeIPPool != nil {
+			ipv4 = c.FakeIPPool.IPNet()
+		}
+		if c.FakeIPPool6 != nil {
+			ipv6 = c.FakeIPPool6.IPNet()
+		}
+	}
+	resolver.StoreFakeIPRanges(ipv4, ipv6)
+}
+
 func updateDNS(c *config.DNS, generalIPv6 bool) {
+	// Publish the fake-ip ranges before anything can read them back: the eBPF
+	// inbound compiles them into a kernel policy when it starts, and listeners
+	// are (re)created right after this.
+	storeFakeIPRanges(c)
 	if !c.Enable {
 		resolver.DefaultResolver = nil
 		resolver.DefaultHostMapper = nil

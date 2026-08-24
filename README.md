@@ -44,7 +44,7 @@ listeners:
     shared:
       interface: [br0]        # 换成你的下联网卡名
 
-# 用 eBPF 就不要再开 TUN，两者会打架，见下面「注意事项」
+# TUN 可以一起开，见下面「和 TUN 共存」。只用 eBPF 的话关掉就行
 tun:
   enable: false
 ```
@@ -86,20 +86,47 @@ listeners:
 
 ## 注意事项（这几条不看会踩坑）
 
-**必须关掉 TUN。** 这条最重要。TUN 的 `auto-route` 会装一条策略路由，把转发流量整个抓进 TUN 设备。这条规则在 eBPF 之后生效，结果就是：你配了 `bypass-rule-set`，包也确实被 eBPF 放行了，但转头就被策略路由捞进 TUN 又送回 mihomo——白配，而且国内网站会直接不通。
-
-已经有 eBPF 了就不需要 TUN，直接：
-
-```yaml
-tun:
-  enable: false
-```
-
 **DNS 永远走核心，不受 bypass 影响。** `dns-mode: hijack` 时所有 53 端口的流量无条件劫持进核心，内核里对端口 53 的判断排在所有 CIDR 判断之前。所以基于 DNS 的广告拦截（`nameserver-policy` 里配 `rcode://success` 那种）照常工作，不会因为开了 CN IP 直连就失效。
+
+**fake-ip 段永远不会被放行。** fake IP 只对核心有意义，所以内核里对 fake-ip 段的判断优先于所有 bypass 判断——就算你把 `fake-ip-range` 设成 `100.64.0.0/10`（落在私网表里），这些地址也照样进核心。改了 `fake-ip-range` 热重载即可生效，不用重启。
 
 **只有 `behavior: ipcidr` 的规则集会被采纳。** 写成 `domain` 不会报错，会被安静地跳过，然后你会以为没生效。
 
 **下联网卡要填对。** `shared.interface` 填的是下联那张卡（热点是 `wlan0`、桥接是 `br0`），填成上联网卡不会生效。
+
+## 和 TUN 共存
+
+以前这里写的是「必须关掉 TUN」，原因是：eBPF 的放行只发生在 socket 层，包该走的路由一点没变；而 TUN 的 `auto-route` 会把路由表整个指向 TUN 设备。于是你配了 `bypass-rule-set`，包确实被内核放行了，转头又被策略路由捞进 TUN 送回核心——白配，而且这些地址在规则里往往没有对应的直连规则，会被丢给远端代理，表现就是国内网站直接不通。
+
+现在两边可以一起开，靠两个机制，按集合大小分工：
+
+**私网地址走路由排除。** 开着 `bypass-private-address: true`（默认）时，eBPF 入站启动后会把私网网段（`10/8`、`172.16/12`、`192.168/16`、`100.64/10`、`169.254/16`、`fc00::/7`、`fe80::/10`）报给 TUN，TUN 建设备时就把它们从 auto-route 的路由集合里摘掉。这些流量根本不进 TUN，是真正的直连。fake-ip 段和 TUN 自己的地址会被排除在外——它们必须留在 TUN 的路由里。启动日志里能看到：
+
+```
+[TUN] keeping 7 prefix(es) off auto-route so the eBPF inbound bypass stays direct: 10.0.0.0/8, ...
+```
+
+**`bypass-rule-set` 走到达即直连。** 规则集不能用路由排除：它要等 rule-provider 加载完才知道内容，而那已经是 TUN 建完设备之后了；而且 `cn.mrs` 这种上万条前缀灌进路由表也不现实。所以走另一条路——这些目标被 TUN 抓进来之后，不进规则引擎，直接按直连处理（`bypass-tun-direct`，默认开）。代价是多一次用户态转发，比不通好，也比让规则把它丢给代理好。想彻底零开销就还是别开 TUN，或者把这些网段手写进 `tun.route-exclude-address`。
+
+不想要这个行为（比如你就是故意放行某些网段交给 TUN 处理）就关掉它：
+
+```yaml
+listeners:
+  - name: ebpf-in
+    type: ebpf
+    bypass-tun-direct: false
+```
+
+关掉之后，被 TUN 接管的 bypass 网段会在日志里报出来，让你自己决定怎么处理：
+
+```
+[EBPF] TUN auto-route claims 3 destination prefix(es) the eBPF inbound bypasses (...)
+```
+
+还有两条和 TUN 同开时要注意：
+
+- **`strict-route: true` 建议关掉。** 它会重排策略路由并阻断绕过 TUN 的流量，和 eBPF 的 lo 重定向、核心自己的直连出站都可能互斥。
+- **同一张网卡上不要同时开 `shared` 和 TUN 的 `auto-redirect`。** eBPF 在 TC ingress（netfilter 之前）改写目的地址，`auto-redirect` 是 nftables prerouting，两套透明代理叠在一张网卡上顺序难保证。用 `shared.interface` 和 TUN 的 `include-interface` / `exclude-interface` 把网卡分开。
 
 ## 完整参数表
 
@@ -136,6 +163,10 @@ listeners:
     # 是否放行私网地址（10/8、192.168/16 等），默认 true
     # 做旁路网关时通常设 false，否则下联互访会被放行、拿不到统计
     bypass-private-address: false
+
+    # TUN 也开着时，被 TUN 的 auto-route 抓进来的 bypass 目标是否直接直连，
+    # 不再进规则引擎。默认 true。见上面「和 TUN 共存」
+    bypass-tun-direct: true
 
     # ---- local：本机进程 ----
     local:
@@ -290,9 +321,9 @@ proxies:
 
 ## 如果你还在用 TUN
 
-用 eBPF 就不需要 TUN 了，可以跳过这一节。
+只用 eBPF 的话可以跳过这一节；TUN 和 eBPF 一起开见上面「和 TUN 共存」。
 
-仍然用 TUN 的话，Tailscale 的 magicsock 会有一个问题：它的 UDP socket 出站源地址不定，会被 TUN 的 auto-route 策略路由抓走，导致 magicsock 流量绕回 mihomo 自己。两种解法选一个：
+用 TUN 的话，Tailscale 的 magicsock 会有一个问题：它的 UDP socket 出站源地址不定，会被 TUN 的 auto-route 策略路由抓走，导致 magicsock 流量绕回 mihomo 自己。两种解法选一个：
 
 ```yaml
 # 解法一：固定端口 + sing-tun 原生豁免（推荐，纯配置）
@@ -385,7 +416,7 @@ listeners:
       interface: [br0]
       ipv6-mode: always
 
-# 用 eBPF 就别开 TUN
+# 只用 eBPF 的话关掉 TUN；一起开见「和 TUN 共存」
 tun:
   enable: false
 

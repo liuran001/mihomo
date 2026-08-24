@@ -217,9 +217,53 @@ have:
 ## Relationship with TUN, TProxy, and Redir
 
 The eBPF inbound intercepts sockets inside the selected cgroup; it is not a
-full TUN device and does not route all host traffic by itself. It can coexist
-with TUN, TProxy, and Redir, but avoid attaching multiple transparent inbound
-mechanisms to the same cgroup or interface unless you intentionally split
-traffic with UID, CIDR, and `bypass-rule-set` policies. The shared-network mode
-uses TC on named downstream interfaces and can be used for hotspot forwarding
-while the cgroup path handles local apps.
+full TUN device and does not route all host traffic by itself. The shared-network
+mode uses TC on named downstream interfaces and can be used for hotspot
+forwarding while the cgroup path handles local apps.
+
+### Coexisting with TUN
+
+A bypass decision and a route exclusion live at different layers. Bypassing a
+destination here only means the socket keeps its original destination; the packet
+still follows the routing table, and TUN `auto-route` points that table at the
+TUN device. A bypassed destination TUN claims is therefore not direct: it enters
+the TUN stack and is routed by the rule engine, which black-holes it whenever no
+rule sends it direct and the matched proxy cannot reach the address.
+
+Two mechanisms keep the bypass meaningful, split by set size:
+
+| Bypass source | Mechanism | Where |
+|---------------|-----------|-------|
+| `bypass-private-address` | the fixed private prefixes are published for route exclusion, so `auto-route` never claims them | `listener/sing_tun` reads `resolver.EBPFRouteExcludePrefixes` while building `tun.Options` |
+| `bypass-rule-set` | the destination is connected directly on arrival instead of being matched against the rules (`bypass-tun-direct`, default true) | `tunnel.resolveMetadata` consults `resolver.EBPFBypassedDirect` for `C.TUN` flows |
+
+A rule set cannot use route exclusion: it resolves after the TUN device already
+baked its route set, and excluding a country-sized IP set would install tens of
+thousands of routes. The fake-ip ranges and the TUN device's own addresses are
+always kept on the routes.
+
+With `bypass-tun-direct: false` the overlap is only reported, not handled. Both
+listeners report it, because either one can be the second to start.
+
+Several eBPF inbounds can run at once -- the listener parser only rejects
+duplicate names -- so the published state is a union keyed by publishing
+inbound, and `bypass-tun-direct` stays per inbound: only the prefixes of the
+inbounds that asked for it are connected directly. Closing one inbound removes
+only its own contribution, which matters because an inbound whose start fails
+closes itself.
+
+Beyond that, avoid attaching multiple transparent inbound mechanisms to the same
+cgroup or interface unless you intentionally split traffic with UID, CIDR, and
+`bypass-rule-set` policies. In particular do not enable shared mode and TUN
+`auto-redirect` on the same interface: TC ingress rewrites the destination
+before netfilter sees the packet. `strict-route` is best left off, since it
+reorders the policy routing the redirect address depends on.
+
+### FakeIP
+
+The fake-ip ranges are pushed into the kernel policy so a fake destination is
+intercepted even when it would otherwise be bypassed -- the address only regains
+meaning once the tunnel maps it back to its domain. This matters when the
+configured range sits inside a bypassed range, as `fake-ip-range: 100.64.0.0/10`
+does. The ranges follow `dns.fake-ip-range`/`fake-ip-range6` at runtime, so a
+config reload that changes them reaches a running inbound.
