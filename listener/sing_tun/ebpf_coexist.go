@@ -12,6 +12,20 @@ import (
 	"go4.org/netipx"
 )
 
+// EBPFRouteExcludeAddress reports the prefixes ebpfRouteExcludeAddress would
+// keep off the routes for a device with these addresses.
+//
+// Both entry points that build a TUN device compare it against what the live
+// device was built with. These prefixes are derived from the running eBPF
+// inbounds and the fake-ip pools, not from the tun config, so an inbound that
+// starts, stops, or changes its policy while the tun section stays
+// byte-identical would otherwise never reach sing_tun.New() -- and the device
+// would keep routing exactly the destinations the bypass was meant to leave
+// alone.
+func EBPFRouteExcludeAddress(inet4Address []netip.Prefix, inet6Address []netip.Prefix) []netip.Prefix {
+	return ebpfRouteExcludeAddress(inet4Address, inet6Address)
+}
+
 // ebpfRouteExcludeAddress returns the extra route-exclude prefixes a running
 // eBPF inbound needs.
 //

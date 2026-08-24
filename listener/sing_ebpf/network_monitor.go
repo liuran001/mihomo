@@ -28,9 +28,24 @@ import (
 type localNetworkMonitor struct {
 	monitor  tun.NetworkUpdateMonitor
 	callback *list.Element[tun.NetworkUpdateCallback]
+	// owned is false when the subscription belongs to the shared TC manager. In
+	// that case this inbound detaches only its own callback and leaves the
+	// monitor to its owner.
+	owned bool
 }
 
 func (i *Inbound) startLocalNetworkMonitor() {
+	// In hybrid mode the shared TC manager is already subscribed. Hanging a
+	// second callback off that subscription is free, whereas a second monitor
+	// would hold another netlink socket and another set of goroutines for the
+	// lifetime of the process.
+	if shared := i.sharedNetwork.networkMonitorInstance(); shared != nil {
+		i.localNetwork = &localNetworkMonitor{
+			monitor:  shared,
+			callback: shared.RegisterCallback(i.InterfaceUpdated),
+		}
+		return
+	}
 	monitor, err := tun.NewNetworkUpdateMonitor(log.SingLogger)
 	if err != nil {
 		log.Debugln("[EBPF] local interface monitor unavailable, host addresses keep their startup value: %s", err.Error())
@@ -44,6 +59,7 @@ func (i *Inbound) startLocalNetworkMonitor() {
 	i.localNetwork = &localNetworkMonitor{
 		monitor:  monitor,
 		callback: monitor.RegisterCallback(i.InterfaceUpdated),
+		owned:    true,
 	}
 }
 
@@ -56,5 +72,7 @@ func (i *Inbound) stopLocalNetworkMonitor() {
 	if local.callback != nil {
 		local.monitor.UnregisterCallback(local.callback)
 	}
-	_ = local.monitor.Close()
+	if local.owned {
+		_ = local.monitor.Close()
+	}
 }

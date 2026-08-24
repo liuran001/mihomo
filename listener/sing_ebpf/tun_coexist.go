@@ -39,7 +39,7 @@ func (i *Inbound) publishBypassPolicyLocked() {
 	if i.bypassPrivateAddress {
 		routeExclude = ECommon.PrivateAddressPrefixes()
 	}
-	prefixes := i.effectiveBypassPrefixesLocked()
+	prefixes := i.effectiveBypassPrefixesLocked(routeExclude)
 	i.bypassPublisher.Publish(i.dnsBypassSet, prefixes, routeExclude, i.bypassTUNDirect)
 	claimed := resolver.TunClaimedPrefixes(prefixes)
 	if len(claimed) == 0 {
@@ -61,10 +61,17 @@ func tunOverlapLogger(tunDirect bool) warningLogger {
 	return log.Warnln
 }
 
-func (i *Inbound) effectiveBypassPrefixesLocked() []netip.Prefix {
-	var prefixes []netip.Prefix
-	if i.bypassPrivateAddress {
-		prefixes = append(prefixes, ECommon.PrivateAddressPrefixes()...)
-	}
-	return append(prefixes, i.bypassCIDR...)
+// effectiveBypassPrefixesLocked joins the private ranges the caller already
+// materialised with the resolved bypass_rule_set CIDRs, so the fixed list is
+// cloned once per publish rather than once per use.
+//
+// The full slice expression caps privateRanges at its own length, so appending a
+// CIDR always allocates rather than writing into an array the caller still holds
+// and hands to Publish itself. Today's private list has no spare capacity to
+// write into anyway, so that cap is a guard against the list growing, not a
+// saving. With no CIDRs to add the result aliases privateRanges instead, which
+// is safe only because the registry treats every slice it is handed as
+// read-only.
+func (i *Inbound) effectiveBypassPrefixesLocked(privateRanges []netip.Prefix) []netip.Prefix {
+	return append(privateRanges[:len(privateRanges):len(privateRanges)], i.bypassCIDR...)
 }

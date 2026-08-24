@@ -57,8 +57,9 @@ var (
 	udpQueue  chan C.PacketAdapter
 	udpInOnce sync.Once
 
-	// Outbound Rule
-	mode = Rule
+	// Outbound Rule. SetMode writes it from the REST API and the executor while
+	// connection goroutines read it, so it is atomic like findProcessMode below.
+	mode = atomic.NewInt32Enum(Rule)
 
 	// default timeout for UDP session
 	udpTimeout = 60 * time.Second
@@ -252,12 +253,12 @@ func UpdateSniffer(dispatcher *sniffer.Dispatcher) {
 
 // Mode return current mode
 func Mode() TunnelMode {
-	return mode
+	return mode.Load()
 }
 
 // SetMode change the mode of tunnel
 func SetMode(m TunnelMode) {
-	mode = m
+	mode.Store(m)
 }
 
 func FindProcessMode() process.FindProcessMode {
@@ -298,7 +299,24 @@ func fixMetadata(metadata *C.Metadata) {
 // Only TUN-sourced flows qualify. Every other inbound was addressed on purpose,
 // so its traffic is the user's explicit request to route something, not a side
 // effect of a route the eBPF policy tried to leave alone.
+//
+// And only in rule mode. Global and direct mode are standing instructions about
+// where every flow goes, so overriding them here would contradict the user --
+// and silently, because a bypassed connection carries no rule and logMetadata
+// reports a nil rule under global mode as "using GLOBAL", which is exactly the
+// proxy such a connection did not use. Direct mode would pick DIRECT anyway, so
+// nothing is lost by leaving both to the mode switch below.
+//
+// The mode is read once, here. A flip that lands between this read and
+// logMetadata's own still mislabels that one line, but the window belongs to
+// every nil-rule connection and is not something this gate can close.
 func ebpfBypassedDirect(metadata *C.Metadata) (C.Proxy, bool) {
+	if mode.Load() != Rule {
+		return nil, false
+	}
+	// The address check is an early-out rather than a guard: a cleared DstIP --
+	// what preHandleMetadata leaves behind once a fake-ip maps back to its domain
+	// -- carries no address family, so the lookup below could not match it anyway.
 	if metadata.Type != C.TUN || !metadata.DstIP.IsValid() {
 		return nil, false
 	}
@@ -433,7 +451,7 @@ func resolveMetadata(metadata *C.Metadata) (proxy C.Proxy, rule C.Rule, err erro
 		helper.FindProcess = nil
 	}
 
-	switch mode {
+	switch mode.Load() {
 	case Direct:
 		proxy = proxies["DIRECT"]
 	case Global:
@@ -679,6 +697,9 @@ func logMetadataErr(metadata *C.Metadata, rule C.Rule, proxy C.ProxyAdapter, err
 }
 
 func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
+	// Read once: two loads could straddle a mode change and leave both cases
+	// false for a connection that was dialled under one of them.
+	currentMode := mode.Load()
 	switch {
 	case metadata.SpecialProxy != "":
 		log.Infoln("[%s] %s --> %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())
@@ -688,9 +709,9 @@ func logMetadata(metadata *C.Metadata, rule C.Rule, remoteConn C.Connection) {
 		} else {
 			log.Infoln("[%s] %s --> %s match %s using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), rule.RuleType().String(), remoteConn.Chains().String())
 		}
-	case mode == Global:
+	case currentMode == Global:
 		log.Infoln("[%s] %s --> %s using GLOBAL", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
-	case mode == Direct:
+	case currentMode == Direct:
 		log.Infoln("[%s] %s --> %s using DIRECT", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress())
 	default:
 		log.Infoln("[%s] %s --> %s doesn't match any rule using %s", strings.ToUpper(metadata.NetWork.String()), metadata.SourceDetail(), metadata.RemoteAddress(), remoteConn.Chains().String())

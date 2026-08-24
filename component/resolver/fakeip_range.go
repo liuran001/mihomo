@@ -7,7 +7,9 @@ import (
 
 // FakeIPRangeObserver is notified whenever the published ranges change. It is
 // invoked without the registry lock held, so an observer is free to read the
-// ranges back or to touch the registry again.
+// ranges back or to touch the registry again. It must not call
+// StoreFakeIPRanges itself: notifications are serialised, so that would
+// deadlock.
 type FakeIPRangeObserver = func(ipv4 netip.Prefix, ipv6 netip.Prefix)
 
 // The fake-ip ranges are published here for consumers that need the prefixes
@@ -24,12 +26,27 @@ var (
 	fakeIPRangeIPv6      netip.Prefix
 	fakeIPRangeObservers map[int64]FakeIPRangeObserver
 	fakeIPRangeNextID    int64
+	// fakeIPRangeNotify serialises a whole store, so that observers are notified
+	// in publication order. It is always taken before fakeIPRangeAccess and
+	// never while holding it.
+	fakeIPRangeNotify sync.Mutex
 )
 
 // StoreFakeIPRanges publishes the active fake-ip ranges and notifies observers
 // when they changed. A family without an active pool must be published as a
 // zero prefix so consumers stop forcing interception for it.
+//
+// A whole store is serialised, so observers are notified in publication order.
+// Two concurrent stores are otherwise free to reach the observers in the
+// opposite order, and a consumer that skips a range equal to the one it already
+// holds -- which is what the eBPF backends do -- would then keep the stale range
+// until the next config change. The only caller today is already serialised by
+// the executor; this keeps the guarantee in the registry rather than resting on
+// that.
 func StoreFakeIPRanges(ipv4 netip.Prefix, ipv6 netip.Prefix) {
+	fakeIPRangeNotify.Lock()
+	defer fakeIPRangeNotify.Unlock()
+
 	fakeIPRangeAccess.Lock()
 	if ipv4 == fakeIPRangeIPv4 && ipv6 == fakeIPRangeIPv6 {
 		fakeIPRangeAccess.Unlock()
@@ -42,6 +59,7 @@ func StoreFakeIPRanges(ipv4 netip.Prefix, ipv6 netip.Prefix) {
 		observers = append(observers, observer)
 	}
 	fakeIPRangeAccess.Unlock()
+
 	for _, observer := range observers {
 		observer(ipv4, ipv6)
 	}

@@ -235,7 +235,7 @@ Two mechanisms keep the bypass meaningful, split by set size:
 | Bypass source | Mechanism | Where |
 |---------------|-----------|-------|
 | `bypass-private-address` | the fixed private prefixes are published for route exclusion, so `auto-route` never claims them | `listener/sing_tun` reads `resolver.EBPFRouteExcludePrefixes` while building `tun.Options` |
-| `bypass-rule-set` | the destination is connected directly on arrival instead of being matched against the rules (`bypass-tun-direct`, default true) | `tunnel.resolveMetadata` consults `resolver.EBPFBypassedDirect` for `C.TUN` flows |
+| `bypass-rule-set` | the destination is connected directly on arrival instead of being matched against the rules (`bypass-tun-direct`, default true) | `tunnel.resolveMetadata` consults `resolver.EBPFBypassedDirect` for `C.TUN` flows in rule mode |
 
 A rule set cannot use route exclusion: it resolves after the TUN device already
 baked its route set, and excluding a country-sized IP set would install tens of
@@ -244,6 +244,32 @@ always kept on the routes.
 
 With `bypass-tun-direct: false` the overlap is only reported, not handled. Both
 listeners report it, because either one can be the second to start.
+
+The exclusion is baked into the device's route set at build time, so a TUN
+device that already exists has to be rebuilt when it changes -- an eBPF inbound
+starting, stopping, or changing its bypass policy, none of which the `tun`
+section describes. Both entry points handle it: `ReCreateTun` compares the
+exclusion alongside the config, and a TUN declared under `listeners:` is
+restarted by `rebuildStaleListeners`, which runs after every inbound has been
+started. That ordering matters on startup as much as on reload, because the
+patch loop walks a map and can otherwise build the device before the eBPF
+inbound has published anything at all. A restart logs:
+
+```
+Listener tun-in restarting: the eBPF route exclusion changed under it
+```
+
+Direct handling applies in rule mode only. Global and direct mode are standing
+instructions about where every flow goes, so the bypass leaves them to decide --
+under global mode the connection would otherwise be dialled through `DIRECT`
+while the log still named `GLOBAL`. Route exclusion is unaffected: it keeps the
+destinations off the TUN device in every mode.
+
+The gate governs this one handler, not the feature. Traffic that takes the eBPF
+fast path never reaches the tunnel to be gated, so the kernel keeps bypassing it
+under global mode, and the DNS middleware still answers a bypassed destination
+with its real address rather than a fake one in every mode. What the gate buys is
+that a flow arriving through TUN is routed by the mode the user selected.
 
 Several eBPF inbounds can run at once -- the listener parser only rejects
 duplicate names -- so the published state is a union keyed by publishing

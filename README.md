@@ -106,7 +106,7 @@ listeners:
 [TUN] keeping 7 prefix(es) off auto-route so the eBPF inbound bypass stays direct: 10.0.0.0/8, ...
 ```
 
-**`bypass-rule-set` 走到达即直连。** 规则集不能用路由排除：它要等 rule-provider 加载完才知道内容，而那已经是 TUN 建完设备之后了；而且 `cn.mrs` 这种上万条前缀灌进路由表也不现实。所以走另一条路——这些目标被 TUN 抓进来之后，不进规则引擎，直接按直连处理（`bypass-tun-direct`，默认开）。代价是多一次用户态转发，比不通好，也比让规则把它丢给代理好。想彻底零开销就还是别开 TUN，或者把这些网段手写进 `tun.route-exclude-address`。
+**`bypass-rule-set` 走到达即直连。** 规则集不能用路由排除：它要等 rule-provider 加载完才知道内容，而那已经是 TUN 建完设备之后了；而且 `cn.mrs` 这种上万条前缀灌进路由表也不现实。所以走另一条路——这些目标被 TUN 抓进来之后，不进规则引擎，直接按直连处理（`bypass-tun-direct`，默认开，仅在 rule 模式下生效；global/direct 模式是对所有流量的明确指令，交给模式自己决定。注意这只管 TUN 抓进来的流量，走 eBPF 快路径的流量根本到不了这一步，内核侧该绕过还是绕过）。代价是多一次用户态转发，比不通好，也比让规则把它丢给代理好。想彻底零开销就还是别开 TUN，或者把这些网段手写进 `tun.route-exclude-address`。
 
 不想要这个行为（比如你就是故意放行某些网段交给 TUN 处理）就关掉它：
 

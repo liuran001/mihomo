@@ -120,6 +120,12 @@ func recomputeEBPFBypassLocked() {
 			anyDNS = true
 		}
 		for _, prefix := range entry.prefixes {
+			// An invalid prefix is recorded as a builder error and discards the
+			// whole set, so one bad entry from a single publisher would void the
+			// union for every other inbound. Skip it instead.
+			if !prefix.IsValid() {
+				continue
+			}
 			policyBuilder.AddPrefix(prefix)
 			anyPolicy = true
 			if entry.tunDirect {
@@ -127,6 +133,9 @@ func recomputeEBPFBypassLocked() {
 			}
 		}
 		for _, prefix := range entry.routeExclude {
+			if !prefix.IsValid() {
+				continue
+			}
 			excludeBuilder.AddPrefix(prefix)
 			anyExclude = true
 		}
@@ -159,6 +168,12 @@ func buildOptionalSet(builder *netipx.IPSetBuilder, present bool) *netipx.IPSet 
 	if !present {
 		return nil
 	}
+	// The builder only records an error for an input it could not turn into a
+	// range, and every prefix that reaches it was checked with IsValid first, so
+	// this cannot fire today. It stays as a guard rather than a report because a
+	// nil set disables this half of the coexistence handling for every publisher
+	// in the union, and saying so from here would mean logging while holding
+	// ebpfBypassAccess -- log.Warnln blocks on an unbuffered channel.
 	set, err := builder.IPSet()
 	if err != nil {
 		return nil

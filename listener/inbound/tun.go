@@ -3,6 +3,7 @@ package inbound
 import (
 	"encoding"
 	"net/netip"
+	"slices"
 
 	C "github.com/metacubex/mihomo/constant"
 	LC "github.com/metacubex/mihomo/listener/config"
@@ -79,6 +80,10 @@ type Tun struct {
 	config *TunOption
 	l      *sing_tun.Listener
 	tun    LC.Tun
+	// ebpfExclude is the eBPF-derived route exclusion the running device was
+	// built with. It is published by the eBPF inbounds rather than described by
+	// this config, so Config().Equal cannot speak for it.
+	ebpfExclude []netip.Prefix
 }
 
 func NewTun(options *TunOption) (*Tun, error) {
@@ -158,12 +163,31 @@ func (t *Tun) Address() string {
 // Listen implements constant.InboundListener
 func (t *Tun) Listen(tunnel C.Tunnel) error {
 	var err error
+	// Read before building, so a publish that lands in between is recorded as
+	// the older value and asks for one more rebuild. Recording it afterwards
+	// would claim a device carries an exclusion it was never built with, and
+	// that mistake is never noticed again.
+	exclude := t.currentEBPFExclude()
 	t.l, err = sing_tun.New(t.tun, tunnel, t.Additions()...)
 	if err != nil {
 		return err
 	}
+	t.ebpfExclude = exclude
 	log.Infoln("Tun[%s] proxy listening at: %s", t.Name(), t.Address())
 	return nil
+}
+
+// Stale implements listener.staleListener. sing_tun bakes the eBPF route
+// exclusion into the device's route set at build time, so an eBPF inbound that
+// started, stopped, or changed its bypass policy leaves this device routing
+// exactly the destinations the bypass was meant to keep off it -- while the tun
+// section that describes the device has not changed a byte.
+func (t *Tun) Stale() bool {
+	return !slices.Equal(t.ebpfExclude, t.currentEBPFExclude())
+}
+
+func (t *Tun) currentEBPFExclude() []netip.Prefix {
+	return sing_tun.EBPFRouteExcludeAddress(t.tun.Inet4Address, t.tun.Inet6Address)
 }
 
 // Close implements constant.InboundListener

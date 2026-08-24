@@ -3,6 +3,8 @@ package listener
 import (
 	"fmt"
 	"net"
+	"net/netip"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -62,6 +64,13 @@ var (
 
 	LastTunConf  LC.Tun
 	LastTuicConf LC.TuicServer
+
+	// lastTunEBPFExclude is the eBPF-derived route exclusion the last ReCreateTun
+	// call saw. It is not part of LC.Tun, so LastTunConf cannot speak for it, and
+	// like LastTunConf it is recorded even when that call built no device at all
+	// -- the two have to stay in step, and the worst that costs is one extra
+	// no-op rebuild. Guarded by tunMux.
+	lastTunEBPFExclude []netip.Prefix
 )
 
 type Ports struct {
@@ -499,8 +508,15 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
 	tunConf.Sort()
 
 	tunMux.Lock()
+	// The eBPF inbounds publish their route exclusion as they start, which on
+	// the config-apply path is updateListeners, just before this. Reading it
+	// here rather than only inside sing_tun.New is what lets an unchanged tun
+	// section still be rebuilt when an inbound started, stopped, or changed its
+	// bypass policy.
+	ebpfExclude := sing_tun.EBPFRouteExcludeAddress(tunConf.Inet4Address, tunConf.Inet6Address)
 	defer func() {
 		LastTunConf = tunConf
+		lastTunEBPFExclude = ebpfExclude
 		tunMux.Unlock()
 	}()
 
@@ -512,7 +528,7 @@ func ReCreateTun(tunConf LC.Tun, tunnel C.Tunnel) {
 		}
 	}()
 
-	if tunConf.Equal(LastTunConf) {
+	if tunConf.Equal(LastTunConf) && slices.Equal(ebpfExclude, lastTunEBPFExclude) {
 		if tunLister != nil { // some default value in dialer maybe changed when config reload, reset at here
 			tunLister.OnReload()
 		}
@@ -649,6 +665,37 @@ func PatchInboundListeners(newListenerMap map[string]C.InboundListener, tunnel C
 				_ = oldListener.Close()
 				delete(inboundListeners, name)
 			}
+		}
+	}
+
+	rebuildStaleListeners(tunnel)
+}
+
+// staleListener is a listener built from state that lives outside its own
+// config, so comparing configs cannot tell whether it is still current. The tun
+// listener is one: sing_tun bakes the route exclusion the eBPF inbounds
+// published into the device's route set.
+type staleListener interface {
+	Stale() bool
+}
+
+// rebuildStaleListeners restarts the listeners whose build inputs moved under
+// them. It runs once every listener has been (re)started, which is what also
+// makes it the fix for startup order: the loop above walks a map, so a tun
+// listener can be built before the eBPF inbound whose bypass it has to keep off
+// the routes has published anything at all -- and an unchanged tun section would
+// never rebuild it again.
+func rebuildStaleListeners(tunnel C.Tunnel) {
+	for name, inboundListener := range inboundListeners {
+		stale, ok := inboundListener.(staleListener)
+		if !ok || !stale.Stale() {
+			continue
+		}
+		log.Infoln("Listener %s restarting: the eBPF route exclusion changed under it", name)
+		_ = inboundListener.Close()
+		if err := inboundListener.Listen(tunnel); err != nil {
+			log.Errorln("Listener %s listen err: %s", name, err.Error())
+			delete(inboundListeners, name)
 		}
 	}
 }

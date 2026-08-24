@@ -186,6 +186,27 @@ func (s *sharedNetwork) udpPeriodicLoop(stop <-chan struct{}, done chan<- struct
 	}
 }
 
+// networkMonitorInstance returns the netlink subscription the TC manager owns,
+// or nil when it has none -- either because this inbound runs no shared network
+// or because creating the monitor failed. The manager keeps ownership: a
+// borrower may register a callback but must not close it.
+//
+// The read lock is what Close needs, since it nils the manager out. The
+// assignments in Start are unlocked and stay that way: a borrower only exists
+// once Start has returned, and taking the write lock there would deadlock on
+// Start's own error path, which calls Close.
+func (s *sharedNetwork) networkMonitorInstance() tun.NetworkUpdateMonitor {
+	if s == nil {
+		return nil
+	}
+	s.lifecycleAccess.RLock()
+	defer s.lifecycleAccess.RUnlock()
+	if s.tcManager == nil {
+		return nil
+	}
+	return s.tcManager.networkMonitor
+}
+
 func (s *sharedNetwork) InterfaceUpdated() {
 	s.udpClientTable.sweep(time.Now(), 0, s.releaseFlows)
 	s.lifecycleAccess.RLock()
