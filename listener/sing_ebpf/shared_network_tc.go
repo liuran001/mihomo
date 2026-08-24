@@ -266,3 +266,13 @@ func (m *sharedTCManager) closeAttachments() error {
 	}
 	return closeErr
 }
+
+func (m *sharedTCManager) isEnabled() bool {
+	if m == nil {
+		return false
+	}
+	m.access.Lock()
+	enabled := m.enabled
+	m.access.Unlock()
+	return enabled
+}

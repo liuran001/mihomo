@@ -3,6 +3,7 @@
 package sing_ebpf
 
 import (
+	"encoding/binary"
 	"errors"
 	"net"
 	"net/netip"
@@ -29,6 +30,12 @@ func (i *Inbound) NewConnection(conn net.Conn) {
 		return
 	}
 	original, err := backend.TakeOriginal(ECommon.ProtocolTCP, localAddr)
+	if errors.Is(err, unix.ENOENT) {
+		i.wakeTCPRedirectJanitor()
+		i.logWarn("[EBPF] lookup TCP original destination: %s", err)
+		_ = conn.Close()
+		return
+	}
 	if err != nil {
 		i.logWarn("[EBPF] lookup TCP original destination: %s", err)
 		_ = conn.Close()
@@ -100,7 +107,7 @@ func (i *Inbound) NewPacket(data []byte, oob []byte, source netip.AddrPort) {
 
 	clientState := i.udpClientTable.loadOrCreate(client)
 	if original.ConnectedUDP {
-		clientState.setConnected(true)
+		clientState.setConnected(true, original.Destination)
 	}
 	if i.hijackDNS(original.Destination) {
 		i.relayUDPDNS(data, client, clientState, original.Destination)
@@ -209,4 +216,46 @@ func redirectAddressFromOOB(oob []byte) (netip.Addr, error) {
 		oob = remainder
 	}
 	return netip.Addr{}, E.New("IP packet info is missing")
+}
+
+// packetDestinationsFromOOB extracts the token address (IP_PKTINFO) and, when
+// present, the preserved original destination (IP_RECVORIGDSTADDR) used by the
+// shared-network socket-assignment data plane.
+func packetDestinationsFromOOB(oob []byte) (tokenAddress netip.Addr, originalDestination netip.AddrPort, err error) {
+	var packetAddress netip.Addr
+	for len(oob) > 0 {
+		header, data, remainder, parseErr := unix.ParseOneSocketControlMessage(oob)
+		if parseErr != nil {
+			return netip.Addr{}, netip.AddrPort{}, E.Cause(parseErr, "parse IP packet info")
+		}
+		switch {
+		case header.Level == unix.IPPROTO_IP && header.Type == unix.IP_PKTINFO:
+			if len(data) < unix.SizeofInet4Pktinfo {
+				return netip.Addr{}, netip.AddrPort{}, E.New("invalid IPv4 packet info length: ", len(data))
+			}
+			var address [4]byte
+			copy(address[:], data[8:12])
+			packetAddress = netip.AddrFrom4(address)
+		case header.Level == unix.IPPROTO_IPV6 && header.Type == unix.IPV6_PKTINFO:
+			if len(data) < unix.SizeofInet6Pktinfo {
+				return netip.Addr{}, netip.AddrPort{}, E.New("invalid IPv6 packet info length: ", len(data))
+			}
+			var address [16]byte
+			copy(address[:], data[:16])
+			packetAddress = netip.AddrFrom16(address)
+		case header.Level == unix.SOL_IP && header.Type == unix.IP_RECVORIGDSTADDR && len(data) >= 8:
+			var address [4]byte
+			copy(address[:], data[4:8])
+			originalDestination = netip.AddrPortFrom(netip.AddrFrom4(address), binary.BigEndian.Uint16(data[2:4]))
+		case header.Level == unix.SOL_IPV6 && header.Type == unix.IPV6_RECVORIGDSTADDR && len(data) >= 24:
+			var address [16]byte
+			copy(address[:], data[8:24])
+			originalDestination = netip.AddrPortFrom(netip.AddrFrom16(address), binary.BigEndian.Uint16(data[2:4]))
+		}
+		oob = remainder
+	}
+	if !packetAddress.IsValid() {
+		return netip.Addr{}, netip.AddrPort{}, E.New("IP packet info is missing")
+	}
+	return packetAddress, originalDestination, nil
 }

@@ -6,8 +6,8 @@ import (
 	"net/netip"
 	"slices"
 
-	"github.com/metacubex/mihomo/component/resolver"
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
+	"github.com/metacubex/mihomo/component/resolver"
 	P "github.com/metacubex/mihomo/constant/provider"
 	"github.com/metacubex/mihomo/log"
 

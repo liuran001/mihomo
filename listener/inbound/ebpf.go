@@ -17,6 +17,7 @@ type EBPFOption struct {
 	DNSMode              string        `inbound:"dns-mode,omitempty"`
 	BypassPrivateAddress *bool         `inbound:"bypass-private-address,omitempty"`
 	BypassRuleSet        []string      `inbound:"bypass-rule-set,omitempty"`
+	TCPSplice            bool          `inbound:"tcp-splice,omitempty"`
 	Local                LC.EBPFLocal  `inbound:"local,omitempty"`
 	Shared               LC.EBPFShared `inbound:"shared,omitempty"`
 }
@@ -47,6 +48,7 @@ func NewEBPF(options *EBPFOption) (*EBPF, error) {
 			DNSMode:              options.DNSMode,
 			BypassPrivateAddress: options.BypassPrivateAddress,
 			BypassRuleSet:        options.BypassRuleSet,
+			TCPSplice:            options.TCPSplice,
 			Local:                options.Local,
 			Shared:               options.Shared,
 		},
