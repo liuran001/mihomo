@@ -1214,7 +1214,7 @@ func (s *Store) GetAllNodesForGroup(group, config string) ([]string, error) {
 }
 
 // 域名失败屏蔽
-func (s *Store) GetHostStatus(group, config, wildcardTarget string, extraTargets ...string) (failNodes map[string]int, lastCheck int64, lastFailure int64, blocked bool) {
+func (s *Store) GetHostStatus(group, config, wildcardTarget string, hostFailLimit int, extraTargets ...string) (failNodes map[string]int, lastCheck int64, lastFailure int64, blocked bool) {
 	now := time.Now().Unix()
 
 	lookup := func(pathPrefix string) (nodes map[string]int, lastCheck int64, lastFailure int64, blocked bool) {
@@ -1230,6 +1230,7 @@ func (s *Store) GetHostStatus(group, config, wildcardTarget string, extraTargets
 		})
 		hs.mu.RLock()
 		defer hs.mu.RUnlock()
+		blockingCount := 0
 		for code, codeSet := range hs.Codes {
 			if codeSet == nil {
 				continue
@@ -1243,9 +1244,13 @@ func (s *Store) GetHostStatus(group, config, wildcardTarget string, extraTargets
 						nodes[nodeName] = code
 					}
 				}
+				if code != 1 && nodeEntry > now {
+					blockingCount++
+				}
 			}
 		}
-		return nodes, hs.LastCheck, hs.LastFailure, hs.Blocked
+		blocked = blockingCount > hostFailLimit
+		return nodes, hs.LastCheck, hs.LastFailure, blocked
 	}
 
 	failNodes, lastCheck, lastFailure, blocked = lookup(FormatDBKey(KeyTypeHostFailures, config, group, wildcardTarget))

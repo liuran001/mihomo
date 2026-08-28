@@ -580,7 +580,7 @@ func uniqueProxiesByName(proxies []C.Proxy) map[string]C.Proxy {
 
 func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names []string, weights []float64, all []C.Proxy, minCount int, isUDP bool) []C.Proxy {
 	blockedNodes := s.store.GetBlockedNodes(s.Name(), s.configName)
-	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, metadata.SmartTarget)
+	wtFailNodes, _, _, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, s.hostFailLimit, metadata.SmartTarget)
 
 	var proxyByName map[string]C.Proxy
 	if len(names) > 0 {
@@ -590,7 +590,6 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 	checkNodeUsed := make(map[string]bool, len(names))
 
 	selected := make([]C.Proxy, 0, minCount+1)
-	var failedSelected []C.Proxy
 
 	for i, name := range names {
 		proxy := proxyByName[name]
@@ -606,12 +605,11 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 			continue
 		}
 		if wtFailNodes[name] != 0 {
-			if wtBlocked {
-				failedSelected = append(failedSelected, proxy)
+			if !wtBlocked || wtFailNodes[name] == 1 {
+				continue
 			}
-		} else {
-			selected = append(selected, proxy)
 		}
+		selected = append(selected, proxy)
 	}
 
 	// Unwrap result should not filled
@@ -682,8 +680,13 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 
 	for _, p := range all {
 		name := p.Name()
-		if checkNodeUsed[adapter.ProxyIdentity(p)] || wtFailNodes[name] != 0 {
+		if checkNodeUsed[adapter.ProxyIdentity(p)] {
 			continue
+		}
+		if wtFailNodes[name] != 0 {
+			if !wtBlocked || wtFailNodes[name] == 1 {
+				continue
+			}
 		}
 		if blockedNodes[name] {
 			continue
@@ -731,21 +734,10 @@ func (s *Smart) filterProxies(metadata *C.Metadata, wildcardTarget string, names
 		}
 	}
 
-	if wtBlocked && len(selected) < minCount {
-		for _, p := range failedSelected {
-			if wtFailNodes[p.Name()] != 1 {
-				selected = append(selected, p)
-			}
-			if len(selected) >= minCount {
-				break
-			}
-		}
-	}
-
 	if len(selected) == 0 {
 		fallbackAll := defaultSort(slices.Clone(all))
 		for _, p := range fallbackAll {
-			if wtFailNodes[p.Name()] == 0 && p.AliveForTestUrl(s.testUrl) && (!isUDP || p.SupportUDP()) {
+			if (wtFailNodes[p.Name()] == 0 || (wtBlocked && wtFailNodes[p.Name()] != 1)) && p.AliveForTestUrl(s.testUrl) && (!isUDP || p.SupportUDP()) {
 				selected = append(selected, p)
 			}
 			if len(selected) >= minCount {
@@ -868,7 +860,7 @@ func (s *Smart) InitSmart() {
 	s.startTimedTask(5*time.Minute, rankingInterval, "Group nodes Ranking", s.updateNodeRanking, false)
 	s.startTimedTask(5*time.Minute, recoveryCheckInterval, "Group nodes recovery check", s.checkBlockedNodes, false)
 	s.startTimedTask(15*time.Minute, hostStatusCheckInterval, "Group host status check", s.checkHostStatus, false)
-	s.startTimedTask(1*time.Minute, prefetchInterval, "Group maxFailedTimes refresh", s.applyMaxFailedTimes, false)
+	s.startTimedTask(1*time.Minute, prefetchInterval, "Group hostFailLimit refresh", s.applyHostFailLimit, false)
 	s.startTimedTask(10*time.Minute, cleanupInterval, "Group old records clean up", func() {
 		s.store.CleanupOldRecords(s.Name(), s.configName)
 	}, false)
@@ -1724,7 +1716,7 @@ func (s *Smart) checkNodeQuality(
 		return oldWeight, false, false, 0
 	}
 
-	wtFailNodes, wtLastCheck, wtLastFailure, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget)
+	wtFailNodes, wtLastCheck, wtLastFailure, wtBlocked := s.store.GetHostStatus(s.Name(), s.configName, wildcardTarget, s.hostFailLimit)
 
 	if wtBlocked {
 		return newWeight, false, false, 0
@@ -1922,7 +1914,7 @@ func (s *Smart) getPriorityFactor(proxyName string) float64 {
 	return factor
 }
 
-func (s *Smart) applyMaxFailedTimes() {
+func (s *Smart) applyHostFailLimit() {
 	if proxyCount := len(s.GetProxies(true)); proxyCount > 0 {
 		hostFailLimit := proxyCount / 3
 		if hostFailLimit < 2 {
