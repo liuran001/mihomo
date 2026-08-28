@@ -218,5 +218,10 @@ func closeAllLocalCoon(lAddr string) {
 }
 
 func handleSocket(inbound, outbound net.Conn) {
+	if hook := N.LoadTCPSplicer(); hook != nil && hook(inbound, outbound) {
+		// Both endpoints are now owned by the kernel splice data plane; the
+		// hook is responsible for closing them when the pair ends.
+		return
+	}
 	N.Relay(inbound, outbound)
 }

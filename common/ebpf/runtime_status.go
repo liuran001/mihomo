@@ -55,8 +55,14 @@ type CgroupRuntimeStatus struct {
 }
 
 type SharedNetworkRuntimeStatus struct {
-	Maps     []RuntimeMapStatus     `json:"maps"`
-	Programs []RuntimeProgramStatus `json:"programs"`
+	DataPlane                   string                  `json:"data_plane"`
+	NonCommonLRU                bool                    `json:"non_common_lru"`
+	UDPAssignment               bool                    `json:"udp_assignment"`
+	UDPAssignmentFallbackReason string                  `json:"udp_assignment_fallback_reason,omitempty"`
+	Maps                        []RuntimeMapStatus      `json:"maps"`
+	Programs                    []RuntimeProgramStatus  `json:"programs"`
+	Statistics                  SharedNetworkStatistics `json:"statistics"`
+	StatsError                  string                  `json:"stats_error,omitempty"`
 }
 
 type runtimeStatusCollector struct {

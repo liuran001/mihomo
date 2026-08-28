@@ -10,8 +10,14 @@ import (
 )
 
 func TestSharedNetworkABI(t *testing.T) {
-	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 80 {
+	if size := unsafe.Sizeof(sharedNetworkControl{}); size != 88 {
 		t.Fatalf("unexpected shared-network control size: %d", size)
+	}
+	if size := unsafe.Sizeof(sharedNetworkAssignKey{}); size != 40 {
+		t.Fatalf("unexpected shared-network assignment key size: %d", size)
+	}
+	if size := unsafe.Sizeof(sharedNetworkAssignValue{}); size != 12 {
+		t.Fatalf("unexpected shared-network assignment value size: %d", size)
 	}
 	if size := unsafe.Sizeof(sharedNetworkListenerKey{}); size != 40 {
 		t.Fatalf("unexpected shared-network listener key size: %d", size)
@@ -28,17 +34,11 @@ func TestSharedNetworkABI(t *testing.T) {
 	if size := unsafe.Sizeof(sharedNetworkTokenValue{}); size != 40 {
 		t.Fatalf("unexpected shared-network token value size: %d", size)
 	}
-	if sharedNetworkFlagDNSHijack != 1<<4 {
-		t.Fatalf("unexpected shared-network DNS flag: %#x", sharedNetworkFlagDNSHijack)
-	}
 	if sharedNetworkFlagBypassPrivateAddress != 1<<13 {
 		t.Fatalf("unexpected shared-network private-address flag: %#x", sharedNetworkFlagBypassPrivateAddress)
 	}
 	if sharedNetworkFlagBypassFlowCache != 1<<14 {
 		t.Fatalf("unexpected shared-network bypass-flow-cache flag: %#x", sharedNetworkFlagBypassFlowCache)
-	}
-	if sharedNetworkFlagDNSRespectBypass != 1<<15 {
-		t.Fatalf("unexpected shared-network DNS respect-bypass flag: %#x", sharedNetworkFlagDNSRespectBypass)
 	}
 	if sharedNetworkFlagFakeIPIPv4 != 1<<16 || sharedNetworkFlagFakeIPIPv6 != 1<<17 {
 		t.Fatalf(

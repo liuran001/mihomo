@@ -13,6 +13,7 @@ type EBPF struct {
 	BypassPrivateAddress *bool      `json:"bypass-private-address" yaml:"bypass-private-address" inbound:"bypass-private-address,omitempty"`
 	BypassRuleSet        []string   `json:"bypass-rule-set" yaml:"bypass-rule-set"`
 	BypassTUNDirect      *bool      `json:"bypass-tun-direct" yaml:"bypass-tun-direct" inbound:"bypass-tun-direct,omitempty"`
+	TCPSplice            bool       `json:"tcp-splice" yaml:"tcp-splice" inbound:"tcp-splice,omitempty"`
 	Local                EBPFLocal  `json:"local" yaml:"local" inbound:"local,omitempty"`
 	Shared               EBPFShared `json:"shared" yaml:"shared" inbound:"shared,omitempty"`
 }
@@ -42,7 +43,10 @@ type EBPFShared struct {
 }
 
 type EBPFSharedAdvanced struct {
-	TCPriority uint16 `json:"tc-priority" yaml:"tc-priority" inbound:"tc-priority,omitempty"`
+	TCPriority   uint16 `json:"tc-priority" yaml:"tc-priority" inbound:"tc-priority,omitempty"`
+	DataPlane    string `json:"data-plane" yaml:"data-plane" inbound:"data-plane,omitempty"`
+	RoutingMark  uint32 `json:"routing-mark" yaml:"routing-mark" inbound:"routing-mark,omitempty"`
+	RoutingTable uint32 `json:"routing-table" yaml:"routing-table" inbound:"routing-table,omitempty"`
 }
 
 type EBPFMapCapacity struct {

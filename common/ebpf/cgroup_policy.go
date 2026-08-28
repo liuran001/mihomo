@@ -19,10 +19,17 @@ const (
 	maxHostAddressPolicyEntries = 4096
 )
 
+type DNSMode uint16
+
+const (
+	DNSModeHijack DNSMode = iota
+	DNSModeRespectPolicy
+	DNSModeOff
+)
+
 type CgroupPolicy struct {
 	EnableBypassCIDR     bool
-	HijackDNS            bool
-	DNSRespectBypass     bool
+	DNSMode              DNSMode
 	BypassPrivateAddress bool
 	IncludeUIDConfigured bool
 	IncludeUID           []UIDRange

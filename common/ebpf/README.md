@@ -35,28 +35,64 @@ token. recvmsg hooks restore connected UDP peer addresses. The userspace
 listener uses the token to recover the original destination and then enters the
 normal sing-box routing pipeline.
 
+One sing-box process supports one local backend owner, including hybrid mode,
+because protection for sing-box-created sockets is registered process-wide.
+
 TCP state is short-lived bounded LRU state removed by the listener when the
-original destination is consumed. UDP redirect, token, and peer state also use
-bounded LRU maps. When
-available, an attached `cgroup/sock_release` program performs exact
-socket-cookie cleanup; the LRU policy remains as a last-resort guard for
-unconnected sendmsg flows that have no token to clean up. Kernels without a
-usable release hook additionally use connected-peer recovery and conservative
-userspace cleanup.
+original destination is consumed, or by the stale-state janitor. UDP redirect,
+token, and peer state also use bounded LRU maps, with two capability-selected
+cleanup paths:
+
+- `socket_release`: an attached `cgroup/sock_release` program performs exact
+  socket-cookie cleanup; the LRU policy remains as a last-resort guard for
+  unconnected sendmsg flows that have no token to clean up.
+- `lru_fallback`: kernels without a usable release hook rely on the LRU policy,
+  connected-peer recovery, and conservative userspace cleanup.
 
 The BPF hot path uses direct helpers. Go hot-path map access uses fixed ABI
 structs and raw typed `bpf(2)` calls to avoid reflection and allocation.
 Cilium APIs are used for object loading, probes, links, metadata, and cold-path
 batch operations.
 
+TCP splice programs prefer fd-owned BPF link attachments when the kernel
+supports them. Older kernels transparently retain raw `BPF_PROG_ATTACH`, and
+runtime status reports which attachment mode was selected.
+
+The peer lookup value also accumulates directional byte counts without another
+map lookup. Counts are reconciled with the existing traffic-control tracker
+when a splice pair closes, so kernel-relayed DIRECT traffic is included in
+Clash/API totals. Active splice connections therefore report their final byte
+count at close rather than on every userspace refresh.
+
 ### Shared TC path
 
 The shared backend attaches ingress and egress classifiers to each selected
-downstream interface. Ingress parses Ethernet/VLAN and IPv4/IPv6, applies
-source and destination policy, reserves a token address, and rewrites the
-destination to the internal listener. Egress finds the same flow by client and
-token, restores the original source, and updates checksums. Fragment state is
-kept separately in a bounded LRU map.
+downstream interface. Ingress parses Ethernet/VLAN and IPv4/IPv6 and applies
+source and destination policy. For TCP, `shared.advanced.data_plane: auto`
+first tries a modern socket-assignment path: `bpf_skc_lookup_tcp` locates an
+established transparent socket, and `bpf_sk_assign` sends a new flow to the
+listener through a SOCKMAP. The selected route uses a dedicated fwmark and
+local policy-routing table. Assignment metadata preserves the ingress source
+MAC for the userspace routing context.
+
+The assignment path is an optimization, not a compatibility requirement. If
+the SOCKMAP, helpers, program verifier, listener registration, or policy route
+is unavailable, `auto` attaches the destination-rewrite path described below.
+`socket_assign` makes assignment mandatory, while `rewrite` skips its probes.
+TCP or UDP parsing, helper, or assignment failure inside the modern classifier also
+continues through the rewrite classifier in the same program instead of
+silently bypassing the proxy. UDP assignment is experimental and attempted only
+when `data_plane: socket_assign` is explicit. It is independently
+verifier-probed; when `bpf_sk_lookup_udp` is unavailable, TCP keeps its
+assignment path while UDP alone uses rewrite state. The default `auto` mode
+continues to use UDP rewrite.
+
+The rewrite ingress path reserves a token address and rewrites the destination
+to the internal listener. Egress finds the same flow by client and token,
+restores the original source, and updates checksums. Fragment state is kept
+separately in a bounded LRU map. The rewrite programs retain the Linux 4.19
+4096-instruction ceiling; the optional assignment classifier has a separate
+8192-instruction ceiling and is verifier-probed before fallback.
 
 Proxy flow state has two authoritative lookup directions:
 
@@ -90,6 +126,36 @@ metadata plus the generation. Total key/value payload per logical flow falls
 from 224 to 164 bytes before allocator and bucket overhead. The per-CPU shared
 scratch value also falls from 352 to 272 bytes.
 
+### Experimental DIRECT TCP splice
+
+`tcp_splice: true` prepares an independent SOCKHASH and attaches one
+`SK_SKB` stream parser and verdict program. After normal routing selects the
+built-in DIRECT outbound and both endpoints are established plain TCP sockets,
+userspace flushes sniff buffers and currently queued bytes, publishes the two
+peer keys, and inserts both sockets. `bpf_sk_redirect_hash` then moves stream
+data directly between the sockets without the ordinary pair of Go copy
+goroutines.
+
+This path is deliberately narrower than the interception paths. It never
+handles UDP, proxy or encrypted outbounds, multiplexing, TLS transformation,
+or another inbound type. Preparation and pre-activation errors fall back to Go
+copy. An active upstream power-report recorder also forces userspace copy
+because kernel relay would bypass its attribution wrapper. An epoll watcher
+releases both map directions and sockets on RDHUP, HUP,
+or socket error; backend close also releases every active pair. No BPF state is
+pinned. Because bytes moved in SOCKHASH bypass userspace wrappers, ordinary
+per-connection traffic accounting is not updated in real time. The peer value
+accumulates directional bytes without another map lookup, and pair release
+reconciles them with the existing per-connection and global counters. Active
+splice connections therefore expose their final accounted total only at close.
+
+The splice runtime status separates kernel `redirect_successes`,
+`redirect_failures`, `peer_misses`, and key parsing errors from fixed userspace
+fallback reasons. Kernel counters use a per-CPU array so observation does not
+add a shared atomic operation to stream redirection. Fallback reason names are
+an ABI-like diagnostics surface; add a bounded enum instead of logging or
+exporting arbitrary error strings.
+
 ## Policy maps
 
 Exact host addresses use Hash maps. UID ranges, destination bypass CIDRs, and
@@ -118,15 +184,17 @@ Correctness maintenance remains enabled in release builds:
 | Task | Normal trigger | Purpose |
 |------|----------------|---------|
 | Shared pressure poll | 5 seconds | Detect reservation failures and sustained proxy-map pressure. |
-| Shared orphan sweep | 30 seconds, faster under pressure | Reclaim unreferenced proxy generations. |
-| Shared attachment reconciliation | Network change or 30 seconds | Attach new interfaces and repair TCX/clsact and `route_localnet`. |
-| Local TCP cleanup | 1 minute | Remove state from failed or abandoned accepts. |
+| Shared TCP grace cleanup | Earliest queued deadline | Reclaim closed TCP generations without periodic idle wakeups. |
+| Shared orphan sweep | Reservation pressure or 5-minute fallback | Reclaim unreferenced proxy generations. |
+| Shared attachment reconciliation | Network change or 2-minute watchdog | Attach new interfaces and repair TCX/clsact and `route_localnet`. |
+| Local TCP cleanup | Redirect failure or 5-minute fallback | Remove state from failed or abandoned accepts. |
 | Local IPv6 probe | Debounced network change | Implement `local.ipv6_mode: auto`. |
 
 Normal Debug logging reports lightweight status every ten minutes without
-walking large maps. `ebpf_debug` changes the interval to five minutes and adds
-full occupancy, Go runtime, task timing, and optional kernel program runtime
-statistics. It does not add instrumentation to the packet path.
+walking large maps. `ebpf_debug` collects full occupancy, Go runtime, task
+timing, and optional kernel program runtime statistics at startup, shutdown,
+and after coalesced failure events. It does not add instrumentation to the
+packet path.
 
 ## Generated objects
 
@@ -202,6 +270,12 @@ sudo -E SING_BOX_EBPF_SHARED_INTEGRATION=1 \
   go test -count=1 -tags with_ebpf,ebpf_integration \
   -run 'TestSharedNetwork(DataPath|TCPChurn)Integration' ./protocol/ebpf
 ```
+
+`TestSharedNetworkProgramRunIntegration` executes the loaded sched_cls ingress
+program through kernel `BPF_PROG_TEST_RUN`. It validates policy priority,
+address/port rewriting, IPv4 and TCP checksums, first/later fragment state, and
+fail-closed handling for missing fragment state and truncated selected packets.
+The verifier workflow runs this test with root privileges.
 
 `TestSharedNetworkTCPChurnIntegration` creates 5000 short TCP connections with
 128 workers and validates lookup, generation retention, reply, and cleanup for
@@ -283,9 +357,12 @@ only changes Go listener behavior must not be added to the BPF ABI.
 | `uid` / `package` include/exclude | `inbound_policy.go` | UID LPM maps and ranges | Match the creating process UID; see the limitation below. |
 | `bypass_private_address` | policy compilers | private/host exact maps | Skip proxying private destinations while preserving mandatory local safety exceptions. |
 | `bypass_rule_set` | policy compiler | destination LPM maps | Skip destinations in the resolved CIDR rule set. |
-| `dns_mode` | `inbound_policy.go` | DNS decision flag | `hijack`, `respect_bypass_hijack`, or `off`; DNS is evaluated before ordinary destination bypass. |
-| `local.ipv6_mode` / `shared.ipv6_mode` | `ipv6.go` | IPv6 section and host map | `auto` follows capability and address availability, `always` requires native IPv6, `off` loads IPv4-only sections. |
+| `local.dns_mode` / `shared.dns_mode` | `config.go` | per-path DNS mode enum | `hijack` precedes user policy, `respect_policy` follows the complete path policy, and `off` bypasses port 53. |
+| `local.ipv6_mode` / `shared.ipv6_mode` | `ipv6.go` | IPv6 section and route gate | Local `auto` follows usable native routes; `always` and shared mode do not use that gate; `off` bypasses native IPv6. |
 | `shared.interface` | `shared_network.go` | TC attachment set | Only named, currently present interfaces are attached; no dynamic “wlan0” guessing is performed. |
+| `tcp_splice` | `protocol/ebpf/splice.go` | SOCKHASH + `SK_SKB` | Explicitly offloads eligible DIRECT plain-TCP relay; all other connections keep Go copy. |
+| `shared.advanced.data_plane` | `shared_network.go` | assignment/rewrite section selection | `auto` prefers TCP assignment with UDP rewrite; explicit `socket_assign` also probes experimental UDP assignment; `rewrite` selects the compatibility path. |
+| `shared.advanced.routing_mark` / `routing_table` | `shared_network_route.go` | policy routing for assignment | Optional mark and table overrides; ignored by rewrite. |
 
 The include/exclude UID ranges are logged after normalization in diagnostic
 builds (and as a compact summary at startup in release builds). This is the
@@ -301,18 +378,22 @@ policy is not a guarantee for system DNS proxies, `DownloadManager`, VPN or
 connectivity services, isolated processes, or sockets handed across a Binder
 boundary. Do not infer package ownership from the UID of a later relay.
 
-DNS follows the configured `dns_mode` compatibility semantics. `hijack` always
-redirects DNS. `respect_bypass_hijack` applies UID/private/rule-set bypass before
-redirecting DNS. `off` leaves DNS untouched. Shared mode applies the same
-decision to packets received from the selected interface, so a downstream
-client bypass rule must include the client-facing source/destination context.
+Local and shared compile independent DNS modes. `hijack` forces enabled TCP/UDP
+port-53 traffic into the inbound before UID/package, shared source, host,
+private-address, and rule-set policy. `respect_policy` applies the complete
+policy of that data path first. `off` bypasses port 53 before user policy.
+Self/internal-loop prevention, protocol selection, DHCP safety, packet parsing,
+and the relevant IPv6-off gate always remain authoritative. The native ABI uses
+a three-state enum whose zero value is `hijack`, so zero-initialized control maps
+preserve the default without an invalid boolean combination.
 
 `local` and `shared` compile separate host-address and private-address maps.
 Host addresses are exact local `/32` or `/128` entries; an interface's entire
-prefix is never inserted. Shared mode additionally keeps multicast, unspecified,
+prefix is never inserted. Configured FakeIP ranges are forced into interception
+before private-address and destination rule-set bypass; overlap with mandatory
+safety ranges is rejected. Shared mode additionally keeps multicast, unspecified,
 and the complete loopback ranges as unconditional local safety exceptions when
-private bypass is disabled. FakeIP ranges must not be marked private unless the
-desired result is to bypass those synthetic destinations.
+private bypass is disabled.
 
 ## Map inventory and sizing
 
@@ -330,6 +411,13 @@ maps are:
 | Shared flow by original/token | Hash | configured shared capacity | Two authoritative directions and generation checks. |
 | Shared source/MAC | LPM/Hash | sized from configured inputs | Prepared only when shared interfaces are active. |
 | Fragment/rewrite scratch | LRU/array | small fixed bound | Eviction is acceptable; never authoritative flow state. |
+
+On kernels which accept `BPF_F_NO_COMMON_LRU`, the shared bypass-flow and
+fragment caches use per-CPU LRU eviction lists to reduce global LRU lock
+contention. A transient map-creation probe selects this mode; ordinary LRU is
+the complete fallback. Authoritative original/token maps and socket-assignment
+metadata never use this flag. Runtime status exposes the selected mode as
+`non_common_lru`.
 
 `NO_PREALLOC` makes hash elements grow on demand but does not make the bucket
 array dynamic. Therefore increasing `max_entries` is a real kernel memory
@@ -356,6 +444,7 @@ Kernel version strings are informational only. The loader chooses, in order:
 4. Socket-release cleanup, then LRU plus userspace janitor recovery.
 5. Native IPv6 sections, then IPv4-only sections when the probe or address set
    says IPv6 is unavailable.
+6. Per-CPU eviction lists for disposable shared LRU caches, then common LRU.
 
 Every fallback must remain functional on Linux 4.19 where the selected feature
 exists. Do not gate a path solely on `uname -r`, and do not make a probe attach

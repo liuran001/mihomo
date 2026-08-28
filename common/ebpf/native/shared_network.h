@@ -15,16 +15,26 @@
 #define SB_SHARED_FRAGMENT_TIMEOUT_NS 30000000000ULL
 #define SB_SHARED_ACTIVITY_UPDATE_INTERVAL_NS 1000000000ULL
 #define SB_SHARED_STAT_TOKEN_RESERVATION_FAILURE 0U
-#define SB_SHARED_STAT_COUNT 1U
+#define SB_SHARED_STAT_TOKEN_PUBLISH_RETRY 1U
+#define SB_SHARED_STAT_ORIGINAL_PUBLISH_FAILURE 2U
+#define SB_SHARED_STAT_EGRESS_FLOW_MISS 3U
+#define SB_SHARED_STAT_SOCKET_ASSIGNMENT 4U
+#define SB_SHARED_STAT_SOCKET_ASSIGN_FAILURE 5U
+#define SB_SHARED_STAT_UDP_SOCKET_ASSIGNMENT 6U
+#define SB_SHARED_STAT_UDP_SOCKET_ASSIGN_FAILURE 7U
+#define SB_SHARED_STAT_COUNT 8U
 
 #define SB_SHARED_FRAGMENT_DIRECTION_INGRESS 1U
 #define SB_SHARED_FRAGMENT_DIRECTION_EGRESS 2U
 
 #define SB_SHARED_FLAG_IPV4 (1U << 0)
+#define SB_SHARED_DNS_MODE_HIJACK 0U
+#define SB_SHARED_DNS_MODE_RESPECT_POLICY 1U
+#define SB_SHARED_DNS_MODE_OFF 2U
+
 #define SB_SHARED_FLAG_IPV6 (1U << 1)
 #define SB_SHARED_FLAG_TCP (1U << 2)
 #define SB_SHARED_FLAG_UDP (1U << 3)
-#define SB_SHARED_FLAG_DNS_HIJACK (1U << 4)
 #define SB_SHARED_FLAG_HOST_IPV4 (1U << 5)
 #define SB_SHARED_FLAG_HOST_IPV6 (1U << 6)
 #define SB_SHARED_FLAG_BYPASS_IPV4 (1U << 7)
@@ -35,15 +45,20 @@
 #define SB_SHARED_FLAG_EXCLUDE_SOURCE_MAC (1U << 12)
 #define SB_SHARED_FLAG_BYPASS_PRIVATE_ADDRESS (1U << 13)
 #define SB_SHARED_FLAG_BYPASS_FLOW_CACHE (1U << 14)
-#define SB_SHARED_FLAG_DNS_RESPECT_BYPASS (1U << 15)
 #define SB_SHARED_FLAG_FAKEIP_IPV4 (1U << 16)
 #define SB_SHARED_FLAG_FAKEIP_IPV6 (1U << 17)
+#define SB_SHARED_FLAG_SOCKET_ASSIGN_TCP (1U << 18)
+#define SB_SHARED_FLAG_SOCKET_ASSIGN_UDP (1U << 19)
+
+#define SB_SHARED_LISTENER_TCP4 0U
+#define SB_SHARED_LISTENER_TCP6 1U
+#define SB_SHARED_LISTENER_COUNT 2U
 
 struct sb_shared_control {
     __u32 enabled;
     __u32 flags;
     __u16 listener_port;
-    __u16 reserved;
+    __u16 dns_mode;
     __u8 token_ipv4_prefix[4];
     __u8 token_ipv4_prefix_bits;
     __u8 token_ipv6_prefix_bits;
@@ -54,6 +69,24 @@ struct sb_shared_control {
     __u8 fakeip_ipv4_mask[4];
     __u8 fakeip_ipv6_prefix[16];
     __u8 fakeip_ipv6_mask[16];
+    __u32 routing_mark;
+    __u32 reserved3;
+};
+
+struct sb_shared_assign_key {
+    __u8 family;
+    __u8 protocol;
+    __u16 client_port;
+    __u16 original_port;
+    __u16 reserved;
+    __u8 client_addr[16];
+    __u8 original_addr[16];
+};
+
+struct sb_shared_assign_value {
+    __u32 ifindex;
+    __u8 source_mac[6];
+    __u8 reserved[2];
 };
 
 struct sb_shared_original_key {
@@ -136,7 +169,9 @@ struct sb_shared_scratch {
     __u8 padding[4];
 };
 
-_Static_assert(sizeof(struct sb_shared_control) == 80U, "shared control ABI");
+_Static_assert(sizeof(struct sb_shared_control) == 88U, "shared control ABI");
+_Static_assert(sizeof(struct sb_shared_assign_key) == 40U, "shared assign key ABI");
+_Static_assert(sizeof(struct sb_shared_assign_value) == 12U, "shared assign value ABI");
 _Static_assert(sizeof(struct sb_shared_original_key) == 44U, "shared original key ABI");
 _Static_assert(sizeof(struct sb_shared_listener_key) == 40U, "shared listener key ABI");
 _Static_assert(sizeof(struct sb_shared_original_value) == 40U, "shared original value ABI");

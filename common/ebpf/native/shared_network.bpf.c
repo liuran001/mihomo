@@ -12,6 +12,7 @@
 #define SB_SHARED_POLICY_BYPASS 0U
 #define SB_SHARED_POLICY_PROXY 1U
 #define SB_SHARED_POLICY_CACHE_BYPASS 2U
+#define SB_SHARED_POLICY_CONTINUE 3U
 
 #define SB_SHARED_FRAGMENT_NONE 0U
 #define SB_SHARED_FRAGMENT_FIRST 1U
@@ -35,7 +36,12 @@
     }
 
 EXTERNAL_MAP(shared_control, __u32, struct sb_shared_control, 1U);
-EXTERNAL_MAP(shared_stats, __u32, __u64, SB_SHARED_STAT_COUNT);
+struct bpf_map_def SEC("maps") shared_stats = {
+    .type = BPF_MAP_TYPE_PERCPU_ARRAY,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(__u64),
+    .max_entries = SB_SHARED_STAT_COUNT,
+};
 EXTERNAL_MAP(shared_flow_by_original, struct sb_shared_original_key, struct sb_shared_token_value, SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES);
 struct bpf_map_def SEC("maps") shared_bypass_flow = {
     .type = BPF_MAP_TYPE_LRU_HASH,
@@ -44,6 +50,18 @@ struct bpf_map_def SEC("maps") shared_bypass_flow = {
     .max_entries = SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES,
 };
 EXTERNAL_MAP(shared_flow_by_token, struct sb_shared_listener_key, struct sb_shared_original_value, SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES);
+struct bpf_map_def SEC("maps") shared_listener_sockets = {
+    .type = BPF_MAP_TYPE_SOCKMAP,
+    .key_size = sizeof(__u32),
+    .value_size = sizeof(__u32),
+    .max_entries = SB_SHARED_LISTENER_COUNT,
+};
+struct bpf_map_def SEC("maps") shared_assign_metadata = {
+    .type = BPF_MAP_TYPE_LRU_HASH,
+    .key_size = sizeof(struct sb_shared_assign_key),
+    .value_size = sizeof(struct sb_shared_assign_value),
+    .max_entries = SB_SHARED_NETWORK_OBJECT_MAP_ENTRIES,
+};
 struct bpf_map_def SEC("maps") shared_fragment = {
     .type = BPF_MAP_TYPE_LRU_HASH,
     .key_size = sizeof(struct sb_shared_fragment_key),
@@ -81,10 +99,19 @@ static long (*l3_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, 
     (void *)BPF_FUNC_l3_csum_replace;
 static long (*l4_csum_replace)(struct __sk_buff *skb, __u32 offset, __u64 from, __u64 to, __u64 flags) =
     (void *)BPF_FUNC_l4_csum_replace;
-INLINE void record_token_reservation_failure(void) {
-    __u32 key = SB_SHARED_STAT_TOKEN_RESERVATION_FAILURE;
+static long (*sk_assign)(struct __sk_buff *skb, struct bpf_sock *sk, __u64 flags) =
+    (void *)BPF_FUNC_sk_assign;
+static void (*sk_release)(struct bpf_sock *sk) = (void *)BPF_FUNC_sk_release;
+static struct bpf_sock *(*skc_lookup_tcp)(void *ctx, struct bpf_sock_tuple *tuple, __u32 tuple_size, __u64 netns, __u64 flags) =
+    (void *)BPF_FUNC_skc_lookup_tcp;
+static struct bpf_sock *(*sk_lookup_udp)(void *ctx, struct bpf_sock_tuple *tuple, __u32 tuple_size, __u64 netns, __u64 flags) =
+    (void *)BPF_FUNC_sk_lookup_udp;
+INLINE void record_shared_stat(__u32 key) {
     __u64 *counter = map_lookup(&shared_stats, &key);
-    if (counter != 0) __sync_fetch_and_add(counter, 1U);
+    if (counter != 0) *counter += 1U;
+}
+INLINE void record_token_reservation_failure(void) {
+    record_shared_stat(SB_SHARED_STAT_TOKEN_RESERVATION_FAILURE);
 }
 INLINE void refresh_activity_timestamp(__u64 *last_seen_ns, __u64 now) {
     __u64 previous = *last_seen_ns;
@@ -279,8 +306,16 @@ NOINLINE int ingress_ipv4(
     __builtin_memcpy(scratch->source_mac.address + 4U, &source_mac_last, 2U);
     __builtin_memcpy(scratch->original.client_addr, &ip->source, 4U);
     __builtin_memcpy(scratch->original.original_addr, &ip->destination, 4U);
+    __u8 dns_policy = shared_dns_policy(
+        ip->protocol, source_port, destination_port, control);
+    if (dns_policy == SB_SHARED_POLICY_BYPASS) {
+        if (more_fragments && !store_ipv4_fragment_bypass(scratch, skb, ip)) {
+            return TC_ACT_SHOT;
+        }
+        return SB_SHARED_ACT_CONTINUE;
+    }
     bool cached = load_cached_token(scratch);
-    if (!cached) {
+    if (!cached && dns_policy != SB_SHARED_POLICY_PROXY) {
         __u32 tcp_sequence = 0U;
         bool initial_syn = initial_tcp_syn(ip->protocol, ports, data_end, &tcp_sequence);
         if (load_cached_bypass(scratch, control, ip->protocol, initial_syn, tcp_sequence)) {
@@ -446,7 +481,10 @@ NOINLINE int egress_ipv4(
     struct sb_shared_original_value *original = map_lookup(
         &shared_flow_by_token,
         &scratch->listener_key);
-    if (original == 0 || original->ifindex != skb->ifindex) return TC_ACT_SHOT;
+    if (original == 0 || original->ifindex != skb->ifindex) {
+        record_shared_stat(SB_SHARED_STAT_EGRESS_FLOW_MISS);
+        return TC_ACT_SHOT;
+    }
     __builtin_memcpy(&scratch->original_value, original, sizeof(scratch->original_value));
     __be32 original_address;
     __builtin_memcpy(&original_address, scratch->original_value.addr, 4U);
@@ -613,8 +651,17 @@ NOINLINE int ingress_ipv6(
     __builtin_memcpy(scratch->source_mac.address + 4U, &source_mac_last, 2U);
     copy_address(scratch->original.client_addr, ip->source, 16U);
     copy_address(scratch->original.original_addr, ip->destination, 16U);
+    __u8 dns_policy = shared_dns_policy(
+        protocol, source_port, destination_port, control);
+    if (dns_policy == SB_SHARED_POLICY_BYPASS) {
+        if (fragment_state == SB_SHARED_FRAGMENT_FIRST &&
+            !store_ipv6_fragment_bypass(scratch, skb, ip, protocol, fragment_id)) {
+            return TC_ACT_SHOT;
+        }
+        return SB_SHARED_ACT_CONTINUE;
+    }
     bool cached = load_cached_token(scratch);
-    if (!cached) {
+    if (!cached && dns_policy != SB_SHARED_POLICY_PROXY) {
         __u32 tcp_sequence = 0U;
         bool initial_syn = initial_tcp_syn(protocol, ports, data_end, &tcp_sequence);
         if (load_cached_bypass(scratch, control, protocol, initial_syn, tcp_sequence)) {
@@ -809,7 +856,10 @@ NOINLINE int egress_ipv6(
     struct sb_shared_original_value *original = map_lookup(
         &shared_flow_by_token,
         &scratch->listener_key);
-    if (original == 0 || original->ifindex != skb->ifindex) return TC_ACT_SHOT;
+    if (original == 0 || original->ifindex != skb->ifindex) {
+        record_shared_stat(SB_SHARED_STAT_EGRESS_FLOW_MISS);
+        return TC_ACT_SHOT;
+    }
     __builtin_memcpy(&scratch->original_value, original, sizeof(scratch->original_value));
     if (fragment_state == SB_SHARED_FRAGMENT_FIRST) {
         prepare_fragment_key(
@@ -896,9 +946,313 @@ NOINLINE int classify_egress(struct __sk_buff *skb) {
     return SB_SHARED_ACT_CONTINUE;
 }
 
+#define SB_SHARED_ASSIGN_FALLBACK 100
+
+INLINE void prepare_assign_key(
+    struct sb_shared_assign_key *key,
+    __u8 family,
+    __u8 protocol,
+    __u16 client_port,
+    __u16 original_port,
+    const __u8 client_addr[16],
+    const __u8 original_addr[16],
+    __u32 address_size) {
+    __builtin_memset(key, 0, sizeof(*key));
+    key->family = family;
+    key->protocol = protocol;
+    key->client_port = client_port;
+    key->original_port = original_port;
+    copy_address(key->client_addr, client_addr, address_size);
+    copy_address(key->original_addr, original_addr, address_size);
+}
+
+NOINLINE int assign_tcp_socket(
+    struct __sk_buff *skb,
+    struct sb_shared_assign_key *key,
+    const __u8 source_mac[6]) {
+    __u32 zero = 0U;
+    struct sb_shared_control *control = map_lookup(&shared_control, &zero);
+    if (control == 0) return SB_SHARED_ASSIGN_FALLBACK;
+    __be16 source_port_raw = swap16(key->client_port);
+    __be16 destination_port_raw = swap16(key->original_port);
+    struct bpf_sock_tuple tuple = {};
+    __u32 tuple_size;
+    if (key->family == AF_INET_VALUE) {
+        __builtin_memcpy(&tuple.ipv4.saddr, key->client_addr, 4U);
+        __builtin_memcpy(&tuple.ipv4.daddr, key->original_addr, 4U);
+        tuple.ipv4.sport = source_port_raw;
+        tuple.ipv4.dport = destination_port_raw;
+        tuple_size = sizeof(tuple.ipv4);
+    } else {
+        copy_address((__u8 *)&tuple.ipv6.saddr, key->client_addr, 16U);
+        copy_address((__u8 *)&tuple.ipv6.daddr, key->original_addr, 16U);
+        tuple.ipv6.sport = source_port_raw;
+        tuple.ipv6.dport = destination_port_raw;
+        tuple_size = sizeof(tuple.ipv6);
+    }
+    struct bpf_sock *socket = skc_lookup_tcp(skb, &tuple, tuple_size, BPF_F_CURRENT_NETNS, 0U);
+    if (socket != 0) {
+        if (socket->state != BPF_TCP_LISTEN) {
+            long result = sk_assign(skb, socket, 0U);
+            sk_release(socket);
+            if (result == 0) {
+                skb->mark = control->routing_mark;
+                record_shared_stat(SB_SHARED_STAT_SOCKET_ASSIGNMENT);
+                return TC_ACT_OK;
+            }
+            record_shared_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURE);
+            return SB_SHARED_ASSIGN_FALLBACK;
+        }
+        sk_release(socket);
+    }
+    __u32 listener_key = key->family == AF_INET_VALUE
+        ? SB_SHARED_LISTENER_TCP4
+        : SB_SHARED_LISTENER_TCP6;
+    socket = map_lookup(&shared_listener_sockets, &listener_key);
+    if (socket == 0) {
+        record_shared_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURE);
+        return SB_SHARED_ASSIGN_FALLBACK;
+    }
+    struct sb_shared_assign_value value = {.ifindex = skb->ifindex};
+    __builtin_memcpy(value.source_mac, source_mac, 6U);
+    if (map_update(&shared_assign_metadata, key, &value, BPF_ANY) != 0) {
+        sk_release(socket);
+        record_shared_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURE);
+        return SB_SHARED_ASSIGN_FALLBACK;
+    }
+    long result = sk_assign(skb, socket, 0U);
+    sk_release(socket);
+    if (result != 0) {
+        map_delete(&shared_assign_metadata, key);
+        record_shared_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURE);
+        return SB_SHARED_ASSIGN_FALLBACK;
+    }
+    skb->mark = control->routing_mark;
+    record_shared_stat(SB_SHARED_STAT_SOCKET_ASSIGNMENT);
+    return TC_ACT_OK;
+}
+
+NOINLINE int assign_udp_socket(
+    struct __sk_buff *skb,
+    struct sb_shared_assign_key *key,
+    const __u8 source_mac[6]) {
+    __u32 zero = 0U;
+    struct sb_shared_control *control = map_lookup(&shared_control, &zero);
+    if (control == 0) return SB_SHARED_ASSIGN_FALLBACK;
+    struct bpf_sock_tuple tuple = {};
+    __u32 tuple_size;
+    if (key->family == AF_INET_VALUE) {
+        __builtin_memcpy(&tuple.ipv4.saddr, key->client_addr, 4U);
+        __builtin_memcpy(&tuple.ipv4.daddr, key->original_addr, 4U);
+        tuple.ipv4.sport = swap16(key->client_port);
+        tuple.ipv4.dport = swap16(control->listener_port);
+        tuple_size = sizeof(tuple.ipv4);
+    } else {
+        copy_address((__u8 *)&tuple.ipv6.saddr, key->client_addr, 16U);
+        copy_address((__u8 *)&tuple.ipv6.daddr, key->original_addr, 16U);
+        tuple.ipv6.sport = swap16(key->client_port);
+        tuple.ipv6.dport = swap16(control->listener_port);
+        tuple_size = sizeof(tuple.ipv6);
+    }
+    struct bpf_sock *socket = sk_lookup_udp(skb, &tuple, tuple_size, BPF_F_CURRENT_NETNS, 0U);
+    if (socket == 0) {
+        record_shared_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURE);
+        record_shared_stat(SB_SHARED_STAT_UDP_SOCKET_ASSIGN_FAILURE);
+        return SB_SHARED_ASSIGN_FALLBACK;
+    }
+    struct sb_shared_assign_value value = {.ifindex = skb->ifindex};
+    __builtin_memcpy(value.source_mac, source_mac, 6U);
+    if (map_update(&shared_assign_metadata, key, &value, BPF_ANY) != 0) {
+        sk_release(socket);
+        record_shared_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURE);
+        record_shared_stat(SB_SHARED_STAT_UDP_SOCKET_ASSIGN_FAILURE);
+        return SB_SHARED_ASSIGN_FALLBACK;
+    }
+    long result = sk_assign(skb, socket, 0U);
+    sk_release(socket);
+    if (result != 0) {
+        record_shared_stat(SB_SHARED_STAT_SOCKET_ASSIGN_FAILURE);
+        record_shared_stat(SB_SHARED_STAT_UDP_SOCKET_ASSIGN_FAILURE);
+        return SB_SHARED_ASSIGN_FALLBACK;
+    }
+    skb->mark = control->routing_mark;
+    record_shared_stat(SB_SHARED_STAT_SOCKET_ASSIGNMENT);
+    record_shared_stat(SB_SHARED_STAT_UDP_SOCKET_ASSIGNMENT);
+    return TC_ACT_OK;
+}
+
+NOINLINE int assign_ingress_ipv4(
+    struct __sk_buff *skb,
+    __u32 l3_offset,
+    const struct sb_shared_control *control,
+    const __u8 source_mac[6]) {
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    struct ipv4_header *ip = data + l3_offset;
+    if ((void *)(ip + 1) > data_end || ip->version != 4U || ip->ihl < 5U ||
+        ip->protocol != IPPROTO_TCP_VALUE) return SB_SHARED_ASSIGN_FALLBACK;
+    if ((swap16(ip->fragment_offset) & (IPV4_FRAGMENT_OFFSET_MASK | IPV4_FRAGMENT_MORE)) != 0U) {
+        return SB_SHARED_ASSIGN_FALLBACK;
+    }
+    struct transport_ports *ports = (void *)ip + (__u32)ip->ihl * 4U;
+    if ((void *)(ports + 1) > data_end) return SB_SHARED_ASSIGN_FALLBACK;
+    __u16 source_port = swap16(ports->source);
+    __u16 destination_port = swap16(ports->destination);
+    if (!ipv4_policy_selected(
+            source_mac, (const __u8 *)&ip->source, (const __u8 *)&ip->destination,
+            IPPROTO_TCP_VALUE, source_port, destination_port, control)) {
+        return SB_SHARED_ACT_CONTINUE;
+    }
+    struct sb_shared_assign_key key;
+    prepare_assign_key(
+        &key, AF_INET_VALUE, IPPROTO_TCP_VALUE, source_port, destination_port,
+        (const __u8 *)&ip->source, (const __u8 *)&ip->destination, 4U);
+    return assign_tcp_socket(skb, &key, source_mac);
+}
+
+NOINLINE int assign_ingress_ipv6(
+    struct __sk_buff *skb,
+    __u32 l3_offset,
+    const struct sb_shared_control *control,
+    const __u8 source_mac[6]) {
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    struct ipv6_header *ip = data + l3_offset;
+    if ((void *)(ip + 1) > data_end || (swap32(ip->version_flow) >> 28U) != 6U) return SB_SHARED_ASSIGN_FALLBACK;
+    __u8 protocol = 0U;
+    __u64 transport_result = ipv6_transport_offset(data, data_end, l3_offset, &protocol);
+    __u32 transport_state = (__u32)transport_result;
+    if (protocol != IPPROTO_TCP_VALUE ||
+        ((transport_state >> IPV6_FRAGMENT_STATE_SHIFT) & 0x3U) != SB_SHARED_FRAGMENT_NONE ||
+        (transport_state & IPV6_TRANSPORT_MASK) < IPV6_TRANSPORT_MIN_OFFSET ||
+        (transport_state & IPV6_TRANSPORT_MASK) > IPV6_TRANSPORT_MAX_OFFSET) {
+        return SB_SHARED_ASSIGN_FALLBACK;
+    }
+    __u32 transport = transport_state & IPV6_TRANSPORT_MASK;
+    struct transport_ports *ports = data + transport;
+    if ((void *)(ports + 1) > data_end) return SB_SHARED_ASSIGN_FALLBACK;
+    __u16 source_port = swap16(ports->source);
+    __u16 destination_port = swap16(ports->destination);
+    if (!ipv6_policy_selected(
+            source_mac, ip->source, ip->destination,
+            IPPROTO_TCP_VALUE, source_port, destination_port, control)) {
+        return SB_SHARED_ACT_CONTINUE;
+    }
+    struct sb_shared_assign_key key;
+    prepare_assign_key(&key, AF_INET6_VALUE, IPPROTO_TCP_VALUE, source_port, destination_port, ip->source, ip->destination, 16U);
+    return assign_tcp_socket(skb, &key, source_mac);
+}
+
+NOINLINE int assign_udp_ingress_ipv4(
+    struct __sk_buff *skb,
+    __u32 l3_offset,
+    const struct sb_shared_control *control,
+    const __u8 source_mac[6]) {
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    struct ipv4_header *ip = data + l3_offset;
+    if ((void *)(ip + 1) > data_end || ip->version != 4U || ip->ihl < 5U ||
+        ip->protocol != IPPROTO_UDP_VALUE ||
+        (swap16(ip->fragment_offset) & (IPV4_FRAGMENT_OFFSET_MASK | IPV4_FRAGMENT_MORE)) != 0U) {
+        return SB_SHARED_ASSIGN_FALLBACK;
+    }
+    struct transport_ports *ports = (void *)ip + (__u32)ip->ihl * 4U;
+    if ((void *)(ports + 1) > data_end) return SB_SHARED_ASSIGN_FALLBACK;
+    __u16 source_port = swap16(ports->source);
+    __u16 destination_port = swap16(ports->destination);
+    if (!ipv4_policy_selected(
+            source_mac, (const __u8 *)&ip->source, (const __u8 *)&ip->destination,
+            IPPROTO_UDP_VALUE, source_port, destination_port, control)) {
+        return SB_SHARED_ACT_CONTINUE;
+    }
+    struct sb_shared_assign_key key;
+    prepare_assign_key(&key, AF_INET_VALUE, IPPROTO_UDP_VALUE, source_port, destination_port,
+        (const __u8 *)&ip->source, (const __u8 *)&ip->destination, 4U);
+    return assign_udp_socket(skb, &key, source_mac);
+}
+
+NOINLINE int assign_udp_ingress_ipv6(
+    struct __sk_buff *skb,
+    __u32 l3_offset,
+    const struct sb_shared_control *control,
+    const __u8 source_mac[6]) {
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    struct ipv6_header *ip = data + l3_offset;
+    if ((void *)(ip + 1) > data_end || (swap32(ip->version_flow) >> 28U) != 6U) return SB_SHARED_ASSIGN_FALLBACK;
+    __u8 protocol = 0U;
+    __u64 transport_result = ipv6_transport_offset(data, data_end, l3_offset, &protocol);
+    __u32 transport_state = (__u32)transport_result;
+    if (protocol != IPPROTO_UDP_VALUE ||
+        ((transport_state >> IPV6_FRAGMENT_STATE_SHIFT) & 0x3U) != SB_SHARED_FRAGMENT_NONE ||
+        (transport_state & IPV6_TRANSPORT_MASK) < IPV6_TRANSPORT_MIN_OFFSET ||
+        (transport_state & IPV6_TRANSPORT_MASK) > IPV6_TRANSPORT_MAX_OFFSET) {
+        return SB_SHARED_ASSIGN_FALLBACK;
+    }
+    struct transport_ports *ports = data + (transport_state & IPV6_TRANSPORT_MASK);
+    if ((void *)(ports + 1) > data_end) return SB_SHARED_ASSIGN_FALLBACK;
+    __u16 source_port = swap16(ports->source);
+    __u16 destination_port = swap16(ports->destination);
+    if (!ipv6_policy_selected(
+            source_mac, ip->source, ip->destination,
+            IPPROTO_UDP_VALUE, source_port, destination_port, control)) {
+        return SB_SHARED_ACT_CONTINUE;
+    }
+    struct sb_shared_assign_key key;
+    prepare_assign_key(&key, AF_INET6_VALUE, IPPROTO_UDP_VALUE, source_port, destination_port,
+        ip->source, ip->destination, 16U);
+    return assign_udp_socket(skb, &key, source_mac);
+}
+
+INLINE int classify_assign_ingress(struct __sk_buff *skb, bool enable_udp) {
+    __u32 zero = 0U;
+    struct sb_shared_control *control = map_lookup(&shared_control, &zero);
+    if (control == 0 || control->enabled == 0U ||
+        (control->flags & (SB_SHARED_FLAG_SOCKET_ASSIGN_TCP | SB_SHARED_FLAG_SOCKET_ASSIGN_UDP)) == 0U) return classify_ingress(skb);
+    void *data = (void *)(long)skb->data;
+    void *data_end = (void *)(long)skb->data_end;
+    struct ethernet_header *ethernet = data;
+    if ((void *)(ethernet + 1) > data_end) return classify_ingress(skb);
+    __u16 protocol = swap16(ethernet->protocol);
+    __u32 l3_offset = sizeof(*ethernet);
+#pragma clang loop unroll(full)
+    for (__u32 depth = 0U; depth < 2U; ++depth) {
+        if (protocol != ETH_P_8021Q_VALUE && protocol != ETH_P_8021AD_VALUE) break;
+        struct vlan_header *vlan = data + l3_offset;
+        if ((void *)(vlan + 1) > data_end) return classify_ingress(skb);
+        protocol = swap16(vlan->protocol);
+        l3_offset += sizeof(*vlan);
+    }
+    __u8 source_mac[6];
+    __builtin_memcpy(source_mac, ethernet->source, 6U);
+    int result = SB_SHARED_ASSIGN_FALLBACK;
+    if (protocol == ETH_P_IP_VALUE && (control->flags & SB_SHARED_FLAG_IPV4) != 0U) {
+        if (enable_udp && (control->flags & SB_SHARED_FLAG_SOCKET_ASSIGN_UDP) != 0U) {
+            result = assign_udp_ingress_ipv4(skb, l3_offset, control, source_mac);
+        }
+        if (result == SB_SHARED_ASSIGN_FALLBACK) result = assign_ingress_ipv4(skb, l3_offset, control, source_mac);
+    } else if (protocol == ETH_P_IPV6_VALUE && (control->flags & SB_SHARED_FLAG_IPV6) != 0U) {
+        if (enable_udp && (control->flags & SB_SHARED_FLAG_SOCKET_ASSIGN_UDP) != 0U) {
+            result = assign_udp_ingress_ipv6(skb, l3_offset, control, source_mac);
+        }
+        if (result == SB_SHARED_ASSIGN_FALLBACK) result = assign_ingress_ipv6(skb, l3_offset, control, source_mac);
+    }
+    return result == SB_SHARED_ASSIGN_FALLBACK ? classify_ingress(skb) : result;
+}
+
 SEC("classifier/ingress")
 int singbox_shared_ingress(struct __sk_buff *skb) {
     return classify_ingress(skb);
+}
+
+SEC("classifier/assign")
+int singbox_shared_assign_ingress(struct __sk_buff *skb) {
+    return classify_assign_ingress(skb, false);
+}
+
+SEC("classifier/assign_udp")
+int singbox_shared_assign_udp_ingress(struct __sk_buff *skb) {
+    return classify_assign_ingress(skb, true);
 }
 
 SEC("classifier/egress")

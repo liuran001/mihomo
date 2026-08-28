@@ -23,6 +23,8 @@ func TestBPFObjectsFitLinux419Verifier(t *testing.T) {
 		{"cgroup/bpfeb", "cgroup_bpfeb.o"},
 		{"shared-network/bpfel", "shared_network_bpfel.o"},
 		{"shared-network/bpfeb", "shared_network_bpfeb.o"},
+		{"splice/bpfel", "splice_bpfel.o"},
+		{"splice/bpfeb", "splice_bpfeb.o"},
 	}
 	for _, object := range objects {
 		var maxProgram string
@@ -37,12 +39,17 @@ func TestBPFObjectsFitLinux419Verifier(t *testing.T) {
 				maxProgram = programName
 				maxInstructions = rawInstructionCount
 			}
-			if rawInstructionCount > legacyInstructionLimit {
+			modernOnly := program.SectionName == "classifier/assign" || program.SectionName == "classifier/assign_udp"
+			if !modernOnly && rawInstructionCount > legacyInstructionLimit {
 				t.Errorf("%s/%s has %d raw instructions; Linux 4.19 permits at most %d",
 					object.name, programName, rawInstructionCount, legacyInstructionLimit)
-			} else if rawInstructionCount > legacyInstructionBudget {
+			} else if !modernOnly && rawInstructionCount > legacyInstructionBudget {
 				t.Errorf("%s/%s has %d raw instructions; keep at least %d instructions below the Linux 4.19 limit",
 					object.name, programName, rawInstructionCount, legacyInstructionHeadroom)
+			}
+			if modernOnly && rawInstructionCount > 8192 {
+				t.Errorf("%s/%s has %d raw instructions; modern assignment path exceeds its 8192 instruction budget",
+					object.name, programName, rawInstructionCount)
 			}
 			symbols, err := program.Instructions.SymbolOffsets()
 			if err != nil {

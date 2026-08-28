@@ -9,10 +9,10 @@ import (
 	"time"
 	"unsafe"
 
-	CiliumEBPF "github.com/cilium/ebpf"
 	"github.com/metacubex/sing/common/control"
 	E "github.com/metacubex/sing/common/exceptions"
 
+	CiliumEBPF "github.com/cilium/ebpf"
 	"golang.org/x/sys/unix"
 )
 

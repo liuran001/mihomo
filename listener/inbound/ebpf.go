@@ -18,6 +18,7 @@ type EBPFOption struct {
 	BypassPrivateAddress *bool         `inbound:"bypass-private-address,omitempty"`
 	BypassRuleSet        []string      `inbound:"bypass-rule-set,omitempty"`
 	BypassTUNDirect      *bool         `inbound:"bypass-tun-direct,omitempty"`
+	TCPSplice            bool          `inbound:"tcp-splice,omitempty"`
 	Local                LC.EBPFLocal  `inbound:"local,omitempty"`
 	Shared               LC.EBPFShared `inbound:"shared,omitempty"`
 }
@@ -49,6 +50,7 @@ func NewEBPF(options *EBPFOption) (*EBPF, error) {
 			BypassPrivateAddress: options.BypassPrivateAddress,
 			BypassRuleSet:        options.BypassRuleSet,
 			BypassTUNDirect:      options.BypassTUNDirect,
+			TCPSplice:            options.TCPSplice,
 			Local:                options.Local,
 			Shared:               options.Shared,
 		},

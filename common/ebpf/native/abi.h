@@ -13,11 +13,14 @@
 #define SB_EBPF_UDP_FLOW_ACTION_PROXY 1U
 #define SB_EBPF_UDP_FLOW_ACTION_BYPASS 2U
 
+#define SB_EBPF_DNS_MODE_HIJACK 0U
+#define SB_EBPF_DNS_MODE_RESPECT_POLICY 1U
+#define SB_EBPF_DNS_MODE_OFF 2U
+
 #define SB_EBPF_CGROUP_FLAG_TCP (1U << 0U)
 #define SB_EBPF_CGROUP_FLAG_UDP (1U << 1U)
 #define SB_EBPF_CGROUP_FLAG_IPV4 (1U << 2U)
 #define SB_EBPF_CGROUP_FLAG_IPV6 (1U << 3U)
-#define SB_EBPF_CGROUP_FLAG_HIJACK_DNS (1U << 4U)
 #define SB_EBPF_CGROUP_FLAG_UID_POLICY (1U << 5U)
 #define SB_EBPF_CGROUP_FLAG_UID_DEFAULT_BYPASS (1U << 6U)
 #define SB_EBPF_CGROUP_FLAG_BYPASS_IPV4 (1U << 7U)
@@ -25,7 +28,6 @@
 #define SB_EBPF_CGROUP_FLAG_AUTO_IPV6 (1U << 9U)
 #define SB_EBPF_CGROUP_FLAG_UDP_FLOW (1U << 10U)
 #define SB_EBPF_CGROUP_FLAG_BYPASS_PRIVATE_ADDRESS (1U << 11U)
-#define SB_EBPF_CGROUP_FLAG_DNS_RESPECT_BYPASS (1U << 12U)
 #define SB_EBPF_CGROUP_FLAG_HOST_IPV4 (1U << 13U)
 #define SB_EBPF_CGROUP_FLAG_HOST_IPV6 (1U << 14U)
 #define SB_EBPF_CGROUP_FLAG_FAKEIP_IPV4 (1U << 15U)
@@ -41,7 +43,7 @@ struct sb_ebpf_cgroup_control {
     __u32 redirect_ipv4_prefix;
     __u32 redirect_ipv4_host_mask;
     __u16 listener_port;
-    __u16 reserved;
+    __u16 dns_mode;
     __u8 redirect_ipv6_prefix[8];
     __u8 fakeip_ipv4_prefix[4];
     __u8 fakeip_ipv4_mask[4];

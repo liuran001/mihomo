@@ -97,7 +97,7 @@ func TestCgroupBackendTrafficStressIntegration(t *testing.T) {
 		RedirectIPv4: netip.MustParsePrefix("127.128.0.0/9"),
 		MapCapacity:  DefaultCgroupMapCapacity(),
 		UDPTimeout:   5 * time.Minute,
-		Policy:       CgroupPolicy{HijackDNS: true},
+		Policy:       CgroupPolicy{DNSMode: DNSModeHijack},
 	})
 	if err != nil {
 		t.Fatal(err)

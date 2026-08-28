@@ -160,8 +160,6 @@ INLINE bool base_bypass(void *ctx, const struct sb_ebpf_cgroup_control *config, 
     if (tgid_mode ? is_tgid_self(config) : is_cookie_bypassed(ctx)) return true;
     if (!protocol_selected(config, protocol)) return true;
     if (service_port(protocol, port)) return true;
-    if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) == 0U && port == 53U) return true;
-    if (uid_bypassed(config)) return true;
     return false;
 }
 
@@ -565,25 +563,26 @@ INLINE int handle_v4(
         return 1;
     }
     bool connected_udp = connect_hook && protocol == UDP_VALUE;
+    if (!connect_hook) {
+        (void)restore_udp_peer_v4(cookie, &destination, &port);
+    }
+    bool force_dns = port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_HIJACK;
+    if (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF) return 1;
+    if (!force_dns && uid_bypassed(config)) return 1;
     if (connected_udp) {
         reset_connected_udp(cookie);
         store_udp_peer_v4(cookie, destination, port);
-    } else if (!connect_hook) {
-        (void)restore_udp_peer_v4(cookie, &destination, &port);
     }
     __u8 flow_address[16] = {0};
     __builtin_memcpy(flow_address, &destination, sizeof(destination));
     if (!connect_hook) {
         int cached = flow_action(
             ctx, config, AF_INET_VALUE, protocol, port, flow_address, cookie, false);
-        if (cached != FLOW_CACHE_MISS) return 1;
+        if (cached == FLOW_CACHE_PROXY || (!force_dns && cached == FLOW_CACHE_BYPASS)) return 1;
     }
     __u8 destination_bytes[4];
     __builtin_memcpy(destination_bytes, &destination, sizeof(destination_bytes));
-    if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) != 0U &&
-        (config->flags & SB_EBPF_CGROUP_FLAG_DNS_RESPECT_BYPASS) == 0U && port == 53U) {
-        // DNS hijack intentionally bypasses destination and CIDR policy checks.
-    } else {
+    if (!force_dns) {
         if (sb_ebpf_ipv4_safety_bypass(destination_bytes)) return 1;
         if ((config->flags & SB_EBPF_CGROUP_FLAG_HOST_IPV4) != 0U && host_ipv4(destination)) return 1;
         bool force_fakeip = fakeip_ipv4(config, destination_bytes);
@@ -649,23 +648,26 @@ INLINE int handle_v6(
         if ((config->flags & SB_EBPF_CGROUP_FLAG_IPV4) == 0U) return 1;
         __u32 destination;
         __builtin_memcpy(&destination, ((__u8 *)address) + 12U, sizeof(destination));
+        if (!connect_hook) {
+            (void)restore_udp_peer_v4(cookie, &destination, &port);
+        }
+        bool force_dns = port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_HIJACK;
+        if (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF) return 1;
+        if (!force_dns && uid_bypassed(config)) return 1;
         if (connected_udp) {
             reset_connected_udp(cookie);
             store_udp_peer_v4(cookie, destination, port);
-        } else if (!connect_hook) {
-            (void)restore_udp_peer_v4(cookie, &destination, &port);
         }
         __u8 flow_address[16] = {0};
         __builtin_memcpy(flow_address, &destination, sizeof(destination));
         if (!connect_hook) {
             int cached = flow_action(
                 ctx, config, AF_INET_VALUE, protocol, port, flow_address, cookie, true);
-            if (cached != FLOW_CACHE_MISS) return 1;
+            if (cached == FLOW_CACHE_PROXY || (!force_dns && cached == FLOW_CACHE_BYPASS)) return 1;
         }
         __u8 destination_bytes[4];
         __builtin_memcpy(destination_bytes, &destination, sizeof(destination_bytes));
-        if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) == 0U ||
-            (config->flags & SB_EBPF_CGROUP_FLAG_DNS_RESPECT_BYPASS) != 0U || port != 53U) {
+        if (!force_dns) {
             if (sb_ebpf_ipv4_safety_bypass(destination_bytes)) return 1;
             if ((config->flags & SB_EBPF_CGROUP_FLAG_HOST_IPV4) != 0U && host_ipv4(destination)) return 1;
             bool force_fakeip = fakeip_ipv4(config, destination_bytes);
@@ -698,21 +700,24 @@ INLINE int handle_v6(
     }
     if (!enable_native_ipv6) return 1;
     if ((config->flags & SB_EBPF_CGROUP_FLAG_IPV6) == 0U) return 1;
+    if (!connect_hook) {
+        (void)restore_udp_peer_v6(cookie, address, &port);
+    }
+    bool force_dns = port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_HIJACK;
+    if (port == 53U && config->dns_mode == SB_EBPF_DNS_MODE_OFF) return 1;
+    if (!force_dns && uid_bypassed(config)) return 1;
     if (connected_udp) {
         reset_connected_udp(cookie);
         store_udp_peer_v6(cookie, address, port);
-    } else if (!connect_hook) {
-        (void)restore_udp_peer_v6(cookie, address, &port);
     }
     __u8 flow_address[16];
     __builtin_memcpy(flow_address, address, sizeof(flow_address));
     if (!connect_hook) {
         int cached = flow_action(
             ctx, config, AF_INET6_VALUE, protocol, port, flow_address, cookie, false);
-        if (cached != FLOW_CACHE_MISS) return 1;
+        if (cached == FLOW_CACHE_PROXY || (!force_dns && cached == FLOW_CACHE_BYPASS)) return 1;
     }
-    if ((config->flags & SB_EBPF_CGROUP_FLAG_HIJACK_DNS) == 0U ||
-        (config->flags & SB_EBPF_CGROUP_FLAG_DNS_RESPECT_BYPASS) != 0U || port != 53U) {
+    if (!force_dns) {
         if (sb_ebpf_ipv6_safety_bypass((const __u8 *)address)) return 1;
         if ((config->flags & SB_EBPF_CGROUP_FLAG_HOST_IPV6) != 0U && host_ipv6(address)) return 1;
         bool force_fakeip = fakeip_ipv6(config, (const __u8 *)address);

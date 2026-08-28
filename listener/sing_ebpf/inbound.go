@@ -6,6 +6,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"net"
 	"net/netip"
 	"runtime"
 	"strings"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/metacubex/mihomo/adapter/inbound"
 	ECommon "github.com/metacubex/mihomo/common/ebpf"
+	N "github.com/metacubex/mihomo/common/net"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/component/iface"
 	"github.com/metacubex/mihomo/component/resolver"
@@ -88,6 +90,14 @@ type Inbound struct {
 	backend       *ECommon.CgroupBackend
 
 	protectRegistered bool
+
+	tcpSplice        bool
+	tcpSpliceBackend *ECommon.SpliceBackend
+
+	tcpJanitorStop    context.CancelFunc
+	tcpJanitorDone    chan struct{}
+	maintenanceAccess sync.RWMutex
+	tcpJanitorWake    chan struct{}
 
 	localRoutes []*localRoute
 
@@ -202,6 +212,7 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		additions:                additions,
 		options:                  options,
 		cgroupEnabled:            cgroupEnabled,
+		tcpSplice:                options.TCPSplice && enableTCP,
 		sharedNetworkEnabled:     sharedNetworkEnabled,
 		cgroupPath:               cgroupPath,
 		enableTCP:                enableTCP,
@@ -222,8 +233,7 @@ func New(ctx context.Context, options LC.EBPF, tunnel C.Tunnel, additions ...inb
 		tcpRedirectPressure:      newMapPressureWatcher(),
 		udpRedirectPressure:      newMapPressureWatcher(),
 		cgroupPolicy: ECommon.CgroupPolicy{
-			HijackDNS:            dnsMode != dnsModeOff,
-			DNSRespectBypass:     dnsMode == dnsModeRespectBypass,
+			DNSMode:              commonDNSMode(dnsMode),
 			BypassPrivateAddress: bypassPrivateAddress,
 			IncludeUIDConfigured: len(options.Local.IncludeUID) > 0 ||
 				len(options.Local.IncludeUIDRange) > 0 || len(options.Local.IncludePackage) > 0,
@@ -281,6 +291,14 @@ func parseNetworkOptions(networks []string) (tcp bool, udp bool) {
 }
 
 func (i *Inbound) start() error {
+	if err := i.prepareTCPSplice(); err != nil {
+		return err
+	}
+	if i.tcpSpliceBackend != nil {
+		N.RegisterTCPSplicer(func(local, remote net.Conn) bool {
+			return i.tryHandleSplice(local, remote, C.Direct)
+		})
+	}
 	if i.cgroupEnabled {
 		if i.androidUIDOptions != nil {
 			if err := i.resolveAndroidUIDPolicy(); err != nil {
@@ -351,6 +369,7 @@ func (i *Inbound) start() error {
 		}
 
 		i.startUDPPeriodic()
+		i.startTCPRedirectJanitor()
 
 		bypassIPv4Count, bypassIPv6Count := backend.BypassCIDRCount()
 		if i.cgroupIPv6Mode == cgroupIPv6ModeAuto && i.cgroupIPv6Enabled() {
@@ -428,6 +447,9 @@ func (i *Inbound) firstSharedInterface() string {
 func (i *Inbound) Close() error {
 	var closeErr error
 	i.closeOnce.Do(func() {
+		N.RegisterTCPSplicer(nil)
+		i.stopTCPRedirectJanitor()
+		i.closeTCPSplice()
 		i.stopUDPPeriodic()
 		i.stopFakeIPTracking()
 		i.stopLocalNetworkMonitor()
@@ -631,6 +653,19 @@ func (i *Inbound) logBypassCIDRUpdate() {
 	}
 	ipv4Count, ipv6Count := backend.BypassCIDRCount()
 	log.Debugln("[EBPF] refreshed bypass CIDR policy: ipv4=%d, ipv6=%d", ipv4Count, ipv6Count)
+}
+
+// isRedirectListenerDestination reports whether the destination is one of this
+// inbound's internal token listener addresses (same port + redirect prefix).
+func (i *Inbound) isRedirectListenerDestination(destination netip.AddrPort, listenerPort uint16) bool {
+	if !destination.IsValid() || destination.Port() != listenerPort {
+		return false
+	}
+	address := destination.Addr().Unmap()
+	if address.Is4() {
+		return i.redirectIPv4Prefix.IsValid() && i.redirectIPv4Prefix.Contains(address)
+	}
+	return i.redirectIPv6Prefix.IsValid() && i.redirectIPv6Prefix.Contains(address)
 }
 
 func localInterfacePrefixes() []netip.Prefix {

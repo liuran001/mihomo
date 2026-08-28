@@ -30,12 +30,12 @@ func detectCgroup2Mount(reader io.Reader) (string, error) {
 	scanner := bufio.NewScanner(reader)
 	for scanner.Scan() {
 		line := scanner.Text()
-		separator := strings.Index(line, " - ")
-		if separator < 0 {
+		before, after, ok := strings.Cut(line, " - ")
+		if !ok {
 			continue
 		}
-		leftFields := strings.Fields(line[:separator])
-		rightFields := strings.Fields(line[separator+3:])
+		leftFields := strings.Fields(before)
+		rightFields := strings.Fields(after)
 		if len(leftFields) < 5 || len(rightFields) == 0 || rightFields[0] != "cgroup2" {
 			continue
 		}

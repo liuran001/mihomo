@@ -44,7 +44,7 @@ const (
 	cgroupFlagUDP
 	cgroupFlagIPv4
 	cgroupFlagIPv6
-	cgroupFlagHijackDNS
+	_
 	cgroupFlagUIDPolicy
 	cgroupFlagUIDDefaultBypass
 	cgroupFlagBypassIPv4
@@ -52,7 +52,7 @@ const (
 	cgroupFlagAutoIPv6
 	cgroupFlagUDPFlow
 	cgroupFlagBypassPrivateAddress
-	cgroupFlagDNSRespectBypass
+	_
 	cgroupFlagHostIPv4
 	cgroupFlagHostIPv6
 	cgroupFlagFakeIPIPv4
@@ -66,7 +66,7 @@ type cgroupControl struct {
 	RedirectIPv4Prefix   uint32
 	RedirectIPv4HostMask uint32
 	ListenerPort         uint16
-	Reserved             uint16
+	DNSMode              DNSMode
 	RedirectIPv6Prefix   [8]byte
 	FakeIPIPv4Prefix     [4]byte
 	FakeIPIPv4Mask       [4]byte

@@ -171,6 +171,12 @@ func probeCommonCapabilities(report *KernelProbeReport, memlockErr error) {
 		"Stores bounded socket, UDP, fragment, and bypass caches.")
 	probeMapType(report, "common", KernelProbeRequired, CiliumEBPF.LPMTrie,
 		"Stores UID and CIDR policies. Linux 6.6.0-6.6.46 policy updates remain blocked separately unless the upstream fix is detected.")
+	probeMapType(report, "experimental TCP splice", KernelProbePerformance, CiliumEBPF.SockHash,
+		"Relays explicitly enabled DIRECT TCP connections in the kernel. Userspace copy remains the fallback.")
+	probeProgramType(report, "experimental TCP splice", KernelProbePerformance, CiliumEBPF.SkSKB,
+		"Runs the optional TCP stream parser and verdict programs.")
+	probeProgramHelper(report, "experimental TCP splice", KernelProbePerformance, CiliumEBPF.SkSKB,
+		asm.FnSkRedirectHash, "bpf_sk_redirect_hash", "Redirects stream data to the paired DIRECT TCP socket.")
 
 	probeMemlockLimit(report, memlockErr)
 	probeBPFJIT(report)
@@ -271,6 +277,8 @@ func probeSharedNetworkCapabilities(report *KernelProbeReport, interfaceName str
 		"Implements TC ingress and egress interception, policy, token rewriting, and reply restoration.")
 	probeMapType(report, scope, KernelProbeRequired, CiliumEBPF.PerCPUArray,
 		"Provides lock-free per-CPU packet parsing scratch space.")
+	probeMapType(report, scope, KernelProbePerformance, CiliumEBPF.SockMap,
+		"Enables shared TCP socket assignment. The destination-rewrite data path is the compatibility fallback.")
 	probeAttachType(report, scope, KernelProbePerformance, CiliumEBPF.SchedCLS,
 		CiliumEBPF.AttachTCXIngress, "TCX ingress attach type",
 		"Used on modern kernels for qdisc-independent ingress attachment; clsact is the fallback.")
@@ -294,6 +302,17 @@ func probeSharedNetworkCapabilities(report *KernelProbeReport, interfaceName str
 		{asm.FnL4CsumReplace, "bpf_l4_csum_replace", "Updates TCP and UDP checksums."},
 	} {
 		probeProgramHelper(report, scope, KernelProbeRequired, CiliumEBPF.SchedCLS, helper.fn, helper.name, helper.detail)
+	}
+	for _, helper := range []struct {
+		fn     asm.BuiltinFunc
+		name   string
+		detail string
+	}{
+		{asm.FnSkcLookupTcp, "bpf_skc_lookup_tcp", "Finds an established transparent TCP socket before listener assignment."},
+		{asm.FnSkAssign, "bpf_sk_assign", "Assigns shared TCP packets directly to the transparent listener or established socket."},
+	} {
+		probeProgramHelper(report, scope, KernelProbePerformance, CiliumEBPF.SchedCLS, helper.fn, helper.name,
+			helper.detail+" Destination rewriting remains available when this helper is unavailable.")
 	}
 	probeSharedInterface(report, interfaceName)
 }

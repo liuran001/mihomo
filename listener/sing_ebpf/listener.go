@@ -12,6 +12,7 @@ import (
 	"sync"
 	"syscall"
 
+	"github.com/metacubex/mihomo/common/ebpf"
 	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/component/dialer"
 	"github.com/metacubex/mihomo/log"
@@ -151,6 +152,48 @@ func (s *internalListenerSet) selectedPort() uint16 {
 	s.access.Lock()
 	defer s.access.Unlock()
 	return s.port
+}
+
+// registerTCPAssignmentSockets publishes the internal TCP listening sockets to
+// the shared-network backend so the kernel socket-assignment data plane can
+// steer assigned client flows into them (key 0 = IPv4, key 1 = IPv6).
+func (s *internalListenerSet) registerTCPAssignmentSockets(backend *ebpf.SharedNetworkBackend) error {
+	s.access.Lock()
+	defer s.access.Unlock()
+	type registration struct {
+		key      uint32
+		listener net.Listener
+	}
+	registrations := []registration{{0, nil}, {1, nil}}
+	if s.tcp4 != nil {
+		registrations[0].listener = s.tcp4.listener
+	}
+	if s.tcp6 != nil {
+		registrations[1].listener = s.tcp6.listener
+	}
+	for _, registration := range registrations {
+		if registration.listener == nil {
+			continue
+		}
+		conn, loaded := registration.listener.(syscall.Conn)
+		if !loaded {
+			return E.New("shared-network TCP listener does not expose syscall.Conn")
+		}
+		raw, err := conn.SyscallConn()
+		if err != nil {
+			return err
+		}
+		var registerErr error
+		if err = raw.Control(func(fd uintptr) {
+			registerErr = backend.RegisterTCPAssignmentSocket(registration.key, int(fd))
+		}); err != nil {
+			return err
+		}
+		if registerErr != nil {
+			return registerErr
+		}
+	}
+	return nil
 }
 
 func (s *internalListenerSet) udpConn(ipv6 bool) *net.UDPConn {
@@ -323,13 +366,26 @@ func (i *Inbound) socketControl(ipv6 bool) func(network, address string, rawConn
 				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_V6ONLY, 1)
 				if strings.HasPrefix(network, "udp") {
 					_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVPKTINFO, 1)
+					// Socket-assignment data plane: receive the original
+					// destination address with each datagram.
+					_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IPV6, unix.IPV6_RECVORIGDSTADDR, 1)
 				}
+			}); err != nil {
+				return err
+			}
+		} else if strings.HasPrefix(network, "tcp") {
+			if err := rawConn.Control(func(fd uintptr) {
+				_ = unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT, 1)
 			}); err != nil {
 				return err
 			}
 		} else if strings.HasPrefix(network, "udp") {
 			if err := rawConn.Control(func(fd uintptr) {
+				_ = unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_TRANSPARENT, 1)
 				_ = unix.SetsockoptInt(int(fd), unix.IPPROTO_IP, unix.IP_PKTINFO, 1)
+				// Socket-assignment data plane: receive the original
+				// destination address with each datagram.
+				_ = unix.SetsockoptInt(int(fd), unix.SOL_IP, unix.IP_RECVORIGDSTADDR, 1)
 			}); err != nil {
 				return err
 			}

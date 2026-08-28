@@ -115,7 +115,10 @@ NOINLINE int reserve_token_attempt(
     }
     scratch->token.generation = now ^ ((__u64)hash << 32U);
     scratch->token.last_seen_ns = now;
-    if (!publish_token(scratch, control, BPF_NOEXIST)) return SB_SHARED_TOKEN_RETRY;
+    if (!publish_token(scratch, control, BPF_NOEXIST)) {
+        record_shared_stat(SB_SHARED_STAT_TOKEN_PUBLISH_RETRY);
+        return SB_SHARED_TOKEN_RETRY;
+    }
     if (map_update(
             &shared_flow_by_original,
             &scratch->original,
@@ -131,6 +134,7 @@ NOINLINE int reserve_token_attempt(
         __builtin_memcpy(&scratch->token, existing, sizeof(scratch->token));
         return SB_SHARED_TOKEN_RESERVED;
     }
+    record_shared_stat(SB_SHARED_STAT_ORIGINAL_PUBLISH_FAILURE);
     return SB_SHARED_TOKEN_RETRY;
 }
 
@@ -154,7 +158,9 @@ INLINE bool load_cached_token(struct sb_shared_scratch *scratch) {
         &scratch->original);
     if (existing == 0) return false;
     __builtin_memcpy(&scratch->token, existing, sizeof(scratch->token));
-    refresh_activity_timestamp(&existing->last_seen_ns, ktime_get_ns());
+    if (scratch->original.protocol != IPPROTO_TCP_VALUE) {
+        refresh_activity_timestamp(&existing->last_seen_ns, ktime_get_ns());
+    }
     return true;
 }
 
@@ -172,7 +178,7 @@ INLINE bool initial_tcp_syn(
     return true;
 }
 
-INLINE bool load_cached_bypass(
+NOINLINE bool load_cached_bypass(
     struct sb_shared_scratch *scratch,
     const struct sb_shared_control *control,
     __u8 protocol,
@@ -198,7 +204,7 @@ INLINE bool load_cached_bypass(
     return true;
 }
 
-INLINE void cache_bypass(
+NOINLINE void cache_bypass(
     struct sb_shared_scratch *scratch,
     __u8 protocol,
     __u32 tcp_sequence) {

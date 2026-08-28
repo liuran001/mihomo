@@ -16,14 +16,14 @@ func TestApplyFakeIPControlReplacesRanges(t *testing.T) {
 		fakeIPIPv4: netip.MustParsePrefix("100.64.0.0/10"),
 	}
 	control := cgroupControl{
-		Flags:            cgroupFlagTCP | cgroupFlagHijackDNS | cgroupFlagFakeIPIPv6,
+		Flags:            cgroupFlagTCP | cgroupFlagUDP | cgroupFlagFakeIPIPv6,
 		ListenerPort:     4242,
 		FakeIPIPv6Prefix: [16]byte{0: 0xfd},
 		FakeIPIPv6Mask:   [16]byte{0: 0xff},
 	}
 	backend.applyFakeIPControlLocked(&control)
 
-	if control.Flags&(cgroupFlagTCP|cgroupFlagHijackDNS) != cgroupFlagTCP|cgroupFlagHijackDNS {
+	if control.Flags&(cgroupFlagTCP|cgroupFlagUDP) != cgroupFlagTCP|cgroupFlagUDP {
 		t.Fatalf("unrelated flags were dropped: %#x", control.Flags)
 	}
 	if control.Flags&cgroupFlagFakeIPIPv4 == 0 {

@@ -20,6 +20,7 @@ const bpfFlagNoPrealloc = 1
 var (
 	loadCgroup        = BPFGen.LoadCgroup
 	loadSharedNetwork = BPFGen.LoadSharedNetwork
+	loadSplice        = BPFGen.LoadSplice
 )
 
 type programSelection struct {
