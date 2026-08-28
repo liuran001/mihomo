@@ -140,14 +140,33 @@ func TestLogMetadataNamesTheDecidedMode(t *testing.T) {
 
 	// rule is nil and the mode branches never touch the connection, so the
 	// remote conn a real caller would pass is not needed here.
-	logMetadata(tunMetadata("10.0.0.1"), nil, Direct, nil)
+	metadata := tunMetadata("10.0.0.1")
+	logMetadata(metadata, nil, Direct, nil)
 
-	select {
-	case event := <-subscription:
-		if !strings.Contains(event.Payload, "using DIRECT") {
-			t.Fatalf("expected the line to name the mode the connection was decided under, got %q", event.Payload)
+	// The log bus is process-wide, and the observable hands an event it has
+	// already taken off the channel to whoever is subscribed by the time it
+	// reaches its lock -- so a line another test emitted just before this one
+	// subscribed can arrive first. Claim our own line by the destination it was
+	// logged for instead of trusting whatever turns up first.
+	destination := metadata.RemoteAddress()
+	timeout := time.After(5 * time.Second)
+	var unrelated []string
+	for {
+		select {
+		case event, ok := <-subscription:
+			if !ok {
+				t.Fatalf("log subscription closed before a line for %s arrived", destination)
+			}
+			if !strings.Contains(event.Payload, destination) {
+				unrelated = append(unrelated, event.Payload)
+				continue
+			}
+			if !strings.Contains(event.Payload, "using DIRECT") {
+				t.Fatalf("expected the line to name the mode the connection was decided under, got %q", event.Payload)
+			}
+			return
+		case <-timeout:
+			t.Fatalf("timed out waiting for the log line for %s; unrelated lines seen: %q", destination, unrelated)
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("timed out waiting for the log line")
 	}
 }
