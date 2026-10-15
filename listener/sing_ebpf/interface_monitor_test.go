@@ -123,7 +123,7 @@ func TestActiveSharedInterfaces(t *testing.T) {
 	if active := activeSharedInterfaces(configured, "rmnet_data2", false); !slices.Equal(active, configured) {
 		t.Fatalf("downstream interfaces changed unexpectedly: %v", active)
 	}
-	// 单臂旁路由: 唯一网卡既是下联又是默认上游, allow-default-upstream 必须保留它
+	// Single-interface bypass router: the only NIC is both downstream and the default upstream, so allow-default-upstream must keep it.
 	if active := activeSharedInterfaces(configured, "wlan0", true); !slices.Equal(active, configured) {
 		t.Fatalf("default upstream was excluded despite allow-default-upstream: %v", active)
 	}
