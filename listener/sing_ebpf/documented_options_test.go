@@ -66,6 +66,14 @@ func TestReadmeDocumentedValues(t *testing.T) {
 	if got := resolveUDPTimeout(300); got.Seconds() != 300 {
 		t.Errorf("udp-timeout 300 解析成了 %v", got)
 	}
+	// README: allow-default-upstream(单臂旁路由) 仅 shared/hybrid 模式可配
+	allow := true
+	if err := validateSharedOptions(true, LC.EBPFShared{AllowDefaultUpstream: &allow}); err != nil {
+		t.Errorf("shared 模式下 allow-default-upstream 本应被接受: %v", err)
+	}
+	if err := validateSharedOptions(false, LC.EBPFShared{AllowDefaultUpstream: &allow}); err == nil {
+		t.Error("shared 未启用时 allow-default-upstream 本应被拒绝")
+	}
 }
 
 // TestFakeIPICMPDocumentedRequirements pins the README's rule for when

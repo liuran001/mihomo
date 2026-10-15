@@ -67,6 +67,12 @@ type EBPFShared struct {
 	DataPlane            string         `json:"data-plane" yaml:"data-plane" inbound:"data-plane,omitempty"`
 	DNSMode              string         `json:"dns-mode" yaml:"dns-mode" inbound:"dns-mode,omitempty"`
 	Interface            []string       `json:"interface" yaml:"interface" inbound:"interface,omitempty"`
+	// AllowDefaultUpstream keeps entries of Interface attached even while the
+	// interface is the default upstream. By default such an interface is
+	// skipped, which guards a router whose WAN is also listed by mistake but
+	// breaks a single-armed gateway whose one and only NIC is both the
+	// downstream and the upstream.
+	AllowDefaultUpstream  *bool          `json:"allow-default-upstream" yaml:"allow-default-upstream" inbound:"allow-default-upstream,omitempty"`
 	IPv6                 *bool          `json:"ipv6" yaml:"ipv6" inbound:"ipv6,omitempty"`
 	BypassPrivateAddress *bool          `json:"bypass-private-address" yaml:"bypass-private-address" inbound:"bypass-private-address,omitempty"`
 	IncludeSourceCIDR    []netip.Prefix `json:"include-source-cidr" yaml:"include-source-cidr" inbound:"include-source-cidr,omitempty"`

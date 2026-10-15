@@ -130,6 +130,7 @@ listeners:
     shared:
       enable: true                    # 启用下联接管（与 mode 二选一）
       interface: [br0]                # 下联网卡名（必填，可填多张网卡）
+      allow-default-upstream: false    # 单臂旁路由（下联=默认上游同一张网卡）设为 true 强制接管
       bypass-rule-set: []             # 仅对下联生效的额外直连规则集
       data-plane: packet_rewrite      # 数据面：packet_rewrite（默认）或 socket_assign
       dns-mode: hijack
@@ -147,6 +148,7 @@ listeners:
 2. **DNS 劫持不受 bypass 影响**：`dns-mode: hijack` 在内核最前置步骤接管 53 端口，DNS 广告拦截与分流策略（如 `nameserver-policy`）依然正常生效。
 3. **Fake-IP 永不被直连放行**：即使 fake-ip 段落在私网网段内，也会准确进入核心处理。开启 `fakeip-icmp: reply` 可在内核直接回复 ICMP Echo，解决 ping 连通性测试超时。
 4. **下联网卡必须准确**：`shared.interface` 必须指定真实的下联物理/桥接网卡（如 `br0`、`wlan0`），上联出口网卡会自动跳过。
+   单臂旁路由（唯一网卡既是下联又是默认上游）请设 `shared.allow-default-upstream: true`，否则该网卡会被上述防呆逻辑剔除、接管静默失效。
 5. **内核版本要求**：推荐 Linux 5.4 及以上内核（主流 5.10+、6.x 原生支持良好）。详细特性矩阵与平台测试见 [docs/ebpf-validation.md](docs/ebpf-validation.md)。
 
 ---

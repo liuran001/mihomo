@@ -117,11 +117,18 @@ func TestTCAttachmentTopologyChanged(t *testing.T) {
 
 func TestActiveSharedInterfaces(t *testing.T) {
 	configured := []string{"wlan0", "rndis0"}
-	if active := activeSharedInterfaces(configured, "wlan0"); !slices.Equal(active, []string{"rndis0"}) {
+	if active := activeSharedInterfaces(configured, "wlan0", false); !slices.Equal(active, []string{"rndis0"}) {
 		t.Fatalf("default upstream was not excluded: %v", active)
 	}
-	if active := activeSharedInterfaces(configured, "rmnet_data2"); !slices.Equal(active, configured) {
+	if active := activeSharedInterfaces(configured, "rmnet_data2", false); !slices.Equal(active, configured) {
 		t.Fatalf("downstream interfaces changed unexpectedly: %v", active)
+	}
+	// 单臂旁路由: 唯一网卡既是下联又是默认上游, allow-default-upstream 必须保留它
+	if active := activeSharedInterfaces(configured, "wlan0", true); !slices.Equal(active, configured) {
+		t.Fatalf("default upstream was excluded despite allow-default-upstream: %v", active)
+	}
+	if active := activeSharedInterfaces(configured, "", true); !slices.Equal(active, configured) {
+		t.Fatalf("interfaces changed unexpectedly with allow-default-upstream: %v", active)
 	}
 	if !slices.Equal(configured, []string{"wlan0", "rndis0"}) {
 		t.Fatalf("configured interfaces were modified: %v", configured)

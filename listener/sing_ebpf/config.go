@@ -362,6 +362,9 @@ func validateSharedOptions(enabled bool, options LC.EBPFShared) error {
 	if len(options.Interface) > 0 {
 		return E.New("shared.interface requires shared or hybrid mode")
 	}
+	if options.AllowDefaultUpstream != nil {
+		return E.New("shared.allow_default_upstream requires shared or hybrid mode")
+	}
 	if len(options.IncludeSourceCIDR) > 0 || len(options.ExcludeSourceCIDR) > 0 ||
 		len(options.IncludeMACAddress) > 0 || len(options.ExcludeMACAddress) > 0 {
 		return E.New("shared source policy requires shared or hybrid mode")

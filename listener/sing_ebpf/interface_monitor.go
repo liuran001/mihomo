@@ -612,7 +612,7 @@ func (i *Inbound) updateTCInterfaces(ctx context.Context) (outcome tcUpdateOutco
 	if localTCEnabled && localInterface == "" {
 		i.interfaceWarnings.defaultInterface.warn(i.logWarn, "default interface unavailable; retaining previous local TC attachment")
 	}
-	sharedInterfaces := activeSharedInterfaces(i.sharedOptions.Interface, defaultInterface)
+	sharedInterfaces := activeSharedInterfaces(i.sharedOptions.Interface, defaultInterface, i.sharedAllowsDefaultUpstream())
 	tcSharedInterfaces := sharedInterfaces
 	if i.sharedRewriteEnabled() {
 		tcSharedInterfaces = nil
@@ -719,7 +719,17 @@ func availableLocalTCInterface(enabled bool, interfaceName string) (string, erro
 	return interfaceName, nil
 }
 
-func activeSharedInterfaces(configured []string, defaultInterface string) []string {
+// sharedAllowsDefaultUpstream reports whether the operator asked to keep
+// shared interfaces attached even when one of them is the default upstream
+// (single-armed gateway: the same NIC is downstream and upstream).
+func (i *Inbound) sharedAllowsDefaultUpstream() bool {
+	return i.sharedOptions.AllowDefaultUpstream != nil && *i.sharedOptions.AllowDefaultUpstream
+}
+
+func activeSharedInterfaces(configured []string, defaultInterface string, allowDefaultUpstream bool) []string {
+	if allowDefaultUpstream {
+		return slices.Clone(configured)
+	}
 	return slices.DeleteFunc(slices.Clone(configured), func(interfaceName string) bool {
 		return interfaceName == defaultInterface
 	})

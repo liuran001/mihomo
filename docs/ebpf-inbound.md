@@ -114,6 +114,7 @@ listeners:
       data-plane: packet_rewrite  # packet_rewrite (default) | socket_assign
       dns-mode: hijack
       interface: [br0]        # downstream interfaces, required when shared runs
+      allow-default-upstream: false # keep a single-armed interface (default upstream AND downstream) attached
       ipv6: true
       bypass-private-address: true
       bypass-rule-set: []     # bypassed by the shared role only, on top of the list above
@@ -212,6 +213,12 @@ Field behavior:
   plus policy routing, and also works on raw-IP links.
 - `shared.interface`: downstream interfaces. An interface that is currently
   the default upstream is skipped until it returns to a downstream role.
+- `shared.allow-default-upstream`: keep `shared.interface` entries attached
+  even while one of them is the default upstream. Meant for the single-armed
+  gateway whose only NIC is downstream and upstream at once; with it a listed
+  interface is never skipped, so a later WAN appearing on the same name keeps
+  being intercepted until the operator says otherwise. Changes to this key
+  rebuild the inbound.
 - `include-source-cidr`, `exclude-source-cidr`, `include-mac-address`,
   `exclude-mac-address`: shared source policy. MAC policy needs Ethernet
   framing.
