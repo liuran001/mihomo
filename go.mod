@@ -8,7 +8,7 @@ require (
 	github.com/coreos/go-iptables v0.8.0
 	github.com/dlclark/regexp2 v1.12.0
 	github.com/easytier/easytier/easytier-go v0.0.0-20260910071355-3d0c9c3ca5e2
-	github.com/enfein/mieru/v3 v3.38.1
+	github.com/enfein/mieru/v3 v3.39.0
 	github.com/gobwas/ws v1.4.0
 	github.com/gofrs/uuid/v5 v5.4.0
 	github.com/golang/snappy v1.0.0
@@ -29,25 +29,25 @@ require (
 	github.com/metacubex/jls-tls v0.0.0-20260723084315-67adc0e2f796
 	github.com/metacubex/kcp-go v0.0.0-20260105040817-550693377604
 	github.com/metacubex/mhurl v0.1.0
-	github.com/metacubex/mipstack v0.0.0-20260930071539-961d4b1c1983
+	github.com/metacubex/mipstack v0.0.0-20261019124225-9a80a07eaeb9
 	github.com/metacubex/mlkem v0.1.0
 	github.com/metacubex/quic-go v0.61.1-0.20260727080200-2548683b76f4
 	github.com/metacubex/randv2 v0.2.0
 	github.com/metacubex/restls-client-go v0.1.9
 	github.com/metacubex/sevenzip v1.6.4
-	github.com/metacubex/sing v0.5.8
+	github.com/metacubex/sing v0.5.9
 	github.com/metacubex/sing-mux v0.3.12
 	github.com/metacubex/sing-quic v0.0.0-20260904234848-1c242664697a
 	github.com/metacubex/sing-shadowsocks v0.2.13
 	github.com/metacubex/sing-shadowsocks2 v0.2.8
-	github.com/metacubex/sing-tun v0.4.27
+	github.com/metacubex/sing-tun v0.4.28
 	github.com/metacubex/sing-vmess v0.2.5
 	github.com/metacubex/sing-wireguard v0.0.0-20261002050126-e5fa1a607406
 	github.com/metacubex/smux v0.0.0-20260105030934-d0c8756d3141
 	github.com/metacubex/ssh v0.1.0
 	github.com/metacubex/tailscale v0.0.0-20260821153257-ff0ecd818181
-	github.com/metacubex/tfo-go v0.0.0-20260623020846-376a77860b8c
-	github.com/metacubex/tls v0.1.8
+	github.com/metacubex/tfo-go v0.0.0-20261026151606-08d83ec08c84
+	github.com/metacubex/tls v0.1.9
 	github.com/metacubex/utls v1.8.8
 	github.com/metacubex/wireguard-go v0.0.0-20250820062549-a6cecdd7f57f
 	github.com/metacubex/zerotier-go v0.0.0-20260813124750-13fa6f45da5f
