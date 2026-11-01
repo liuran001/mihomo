@@ -1,7 +1,8 @@
-package memconservative
+package geodata
 
 import (
 	"bufio"
+	"bytes"
 	"errors"
 	"fmt"
 	"io"
@@ -12,23 +13,43 @@ import (
 )
 
 var (
-	errFailedToReadBytes            = errors.New("failed to read bytes")
-	errFailedToReadExpectedLenBytes = errors.New("failed to read expected length of bytes")
-	errInvalidGeodataFile           = errors.New("invalid geodata file")
-	errInvalidGeodataVarintLength   = errors.New("invalid geodata varint length")
-	errCodeNotFound                 = errors.New("code not found")
+	ErrFailedToReadBytes            = errors.New("failed to read bytes")
+	ErrFailedToReadExpectedLenBytes = errors.New("failed to read expected length of bytes")
+	ErrInvalidGeodataFile           = errors.New("invalid geodata file")
+	ErrInvalidGeodataVarintLength   = errors.New("invalid geodata varint length")
+	ErrCodeNotFound                 = errors.New("code not found")
 )
 
-func emitBytes(f io.ReadSeeker, code string) ([]byte, error) {
+func Decode(filename, code string) ([]byte, error) {
+	f, err := os.Open(filename)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open file: %s, base error: %s", filename, err.Error())
+	}
+	defer func(f *os.File) {
+		_ = f.Close()
+	}(f)
+
+	return DecodeReader(f, code)
+}
+
+func DecodeReader(f io.ReadSeeker, code string) ([]byte, error) {
+	return decode(f, code)
+}
+
+func DecodeBytes(data []byte, code string) ([]byte, error) {
+	return decode(bytes.NewReader(data), code)
+}
+
+func decode(f io.ReadSeeker, code string) ([]byte, error) {
 	reader := bufio.NewReaderSize(f, 16*1024)
 	readError := func(err error) error {
 		switch err {
 		case io.EOF:
-			return errCodeNotFound
+			return ErrCodeNotFound
 		case io.ErrUnexpectedEOF:
-			return errFailedToReadExpectedLenBytes
+			return ErrFailedToReadExpectedLenBytes
 		default:
-			return errFailedToReadBytes
+			return ErrFailedToReadBytes
 		}
 	}
 	var lengthBytes []byte
@@ -43,7 +64,7 @@ func emitBytes(f io.ReadSeeker, code string) ([]byte, error) {
 			if b < 128 {
 				n, size := protowire.ConsumeVarint(lengthBytes)
 				if size < 0 {
-					return 0, errInvalidGeodataVarintLength
+					return 0, ErrInvalidGeodataVarintLength
 				}
 				return n, nil
 			}
@@ -55,7 +76,7 @@ func emitBytes(f io.ReadSeeker, code string) ([]byte, error) {
 			return nil, readError(err)
 		}
 		if b != 10 {
-			return nil, errInvalidGeodataFile
+			return nil, ErrInvalidGeodataFile
 		}
 		length, err := readLength()
 		if err != nil {
@@ -66,7 +87,7 @@ func emitBytes(f io.ReadSeeker, code string) ([]byte, error) {
 			return nil, readError(err)
 		}
 		if b != 10 {
-			return nil, errInvalidGeodataFile
+			return nil, ErrInvalidGeodataFile
 		}
 		codeLength, err := readLength()
 		if err != nil {
@@ -84,7 +105,7 @@ func emitBytes(f io.ReadSeeker, code string) ([]byte, error) {
 			n += copy(result[n:], name)
 			if _, err := io.ReadFull(reader, result[n:]); err != nil {
 				if err == io.EOF {
-					return nil, errFailedToReadExpectedLenBytes
+					return nil, ErrFailedToReadExpectedLenBytes
 				}
 				return nil, readError(err)
 			}
@@ -98,23 +119,7 @@ func emitBytes(f io.ReadSeeker, code string) ([]byte, error) {
 			reader.Reset(f)
 		}
 		if err != nil {
-			return nil, errFailedToReadBytes
+			return nil, ErrFailedToReadBytes
 		}
 	}
-}
-
-func Decode(filename, code string) ([]byte, error) {
-	f, err := os.Open(filename)
-	if err != nil {
-		return nil, fmt.Errorf("failed to open file: %s, base error: %s", filename, err.Error())
-	}
-	defer func(f *os.File) {
-		_ = f.Close()
-	}(f)
-
-	geoBytes, err := emitBytes(f, code)
-	if err != nil {
-		return nil, err
-	}
-	return geoBytes, nil
 }

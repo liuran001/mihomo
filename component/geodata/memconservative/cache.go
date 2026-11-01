@@ -5,6 +5,7 @@ import (
 	"os"
 	"strings"
 
+	"github.com/metacubex/mihomo/component/geodata"
 	"github.com/metacubex/mihomo/component/geodata/router"
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
@@ -38,7 +39,7 @@ func (g GeoIPCache) Unmarshal(filename, code string) (*router.GeoIP, error) {
 		return g.Get(idx), nil
 	}
 
-	geoipBytes, err := Decode(asset, code)
+	geoipBytes, err := geodata.Decode(asset, code)
 	switch err {
 	case nil:
 		var geoip router.GeoIP
@@ -48,11 +49,11 @@ func (g GeoIPCache) Unmarshal(filename, code string) (*router.GeoIP, error) {
 		g.Set(idx, &geoip)
 		return &geoip, nil
 
-	case errCodeNotFound:
+	case geodata.ErrCodeNotFound:
 		return nil, fmt.Errorf("country code %s%s%s", code, " not found in ", filename)
 
-	case errFailedToReadBytes, errFailedToReadExpectedLenBytes,
-		errInvalidGeodataFile, errInvalidGeodataVarintLength:
+	case geodata.ErrFailedToReadBytes, geodata.ErrFailedToReadExpectedLenBytes,
+		geodata.ErrInvalidGeodataFile, geodata.ErrInvalidGeodataVarintLength:
 		log.Warnln("failed to decode geoip file: %s%s", filename, ", fallback to the original ReadFile method")
 		geoipBytes, err = os.ReadFile(asset)
 		if err != nil {
@@ -103,7 +104,7 @@ func (g GeoSiteCache) Unmarshal(filename, code string) (*router.GeoSite, error) 
 		return g.Get(idx), nil
 	}
 
-	geositeBytes, err := Decode(asset, code)
+	geositeBytes, err := geodata.Decode(asset, code)
 	switch err {
 	case nil:
 		var geosite router.GeoSite
@@ -113,11 +114,11 @@ func (g GeoSiteCache) Unmarshal(filename, code string) (*router.GeoSite, error) 
 		g.Set(idx, &geosite)
 		return &geosite, nil
 
-	case errCodeNotFound:
+	case geodata.ErrCodeNotFound:
 		return nil, fmt.Errorf("list %s%s%s", code, " not found in ", filename)
 
-	case errFailedToReadBytes, errFailedToReadExpectedLenBytes,
-		errInvalidGeodataFile, errInvalidGeodataVarintLength:
+	case geodata.ErrFailedToReadBytes, geodata.ErrFailedToReadExpectedLenBytes,
+		geodata.ErrInvalidGeodataFile, geodata.ErrInvalidGeodataVarintLength:
 		log.Warnln("failed to decode geosite file: %s%s", filename, ", fallback to the original ReadFile method")
 		geositeBytes, err = os.ReadFile(asset)
 		if err != nil {

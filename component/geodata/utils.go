@@ -8,6 +8,7 @@ import (
 	"io"
 	"math"
 	"os"
+	"runtime"
 	"strings"
 
 	"github.com/metacubex/mihomo/common/singleflight"
@@ -15,6 +16,9 @@ import (
 	C "github.com/metacubex/mihomo/constant"
 	"github.com/metacubex/mihomo/log"
 )
+
+// Limits concurrent cold geodata parses so provider preloading cannot multiply the peak.
+const geodataLoadConcurrency = 2
 
 var (
 	geoMode        bool
@@ -115,8 +119,11 @@ func Verify(name string) error {
 	}
 }
 
-var loadGeoSiteMatcherListSF = singleflight.Group[[]*router.Domain]{StoreResult: true}
-var loadGeoSiteMatcherSF = singleflight.Group[router.DomainMatcher]{StoreResult: true}
+var (
+	loadGeoSiteMatcherListSF = singleflight.Group[[]*router.Domain]{}
+	loadGeoSiteMatcherSF     = singleflight.Group[router.DomainMatcher]{StoreResult: true}
+	geoLoadSem               = make(chan struct{}, geodataLoadConcurrency)
+)
 
 func LoadGeoSiteMatcher(countryCode string) (router.DomainMatcher, error) {
 	if countryCode == "" {
@@ -148,17 +155,22 @@ func LoadGeoSiteMatcher(countryCode string) (router.DomainMatcher, error) {
 	}
 	matcher, err, shared := loadGeoSiteMatcherSF.Do(matcherName, func() (router.DomainMatcher, error) {
 		log.Infoln("Load GeoSite rule: %s", matcherName)
-		domains, err, shared := loadGeoSiteMatcherListSF.Do(listName, func() ([]*router.Domain, error) {
+		geoLoadSem <- struct{}{}
+		defer func() { <-geoLoadSem }()
+		domains, err, _ := loadGeoSiteMatcherListSF.Do(listName, func() ([]*router.Domain, error) {
 			geoLoader, err := GetGeoDataLoader(geoLoaderName)
 			if err != nil {
 				return nil, err
 			}
-			return geoLoader.LoadGeoSite(listName)
+			domains, err := geoLoader.LoadGeoSite(listName)
+			if err != nil {
+				return nil, err
+			}
+			geoLoader = nil
+			runtime.GC() // drop loader temporaries; domains stay live
+			return domains, nil
 		})
 		if err != nil {
-			if !shared {
-				loadGeoSiteMatcherListSF.Forget(listName) // don't store the error result
-			}
 			return nil, err
 		}
 
@@ -186,11 +198,17 @@ func LoadGeoSiteMatcher(countryCode string) (router.DomainMatcher, error) {
 		matcher, err := router.NewDomainMatcher(domains)
 		mph：minimal perfect hash algorithm
 		*/
+		var matcher router.DomainMatcher
 		if geoSiteMatcher == "mph" {
-			return router.NewMphMatcherGroup(domains)
+			matcher, err = router.NewMphMatcherGroup(domains)
 		} else {
-			return router.NewSuccinctMatcherGroup(domains)
+			matcher, err = router.NewSuccinctMatcherGroup(domains)
 		}
+		domains = nil
+		if err == nil {
+			runtime.GC() // drop raw domains; only the matcher stays cached
+		}
+		return matcher, err
 	})
 	if err != nil {
 		if !shared {
@@ -221,6 +239,8 @@ func LoadGeoIPMatcher(country string) (router.IPMatcher, error) {
 
 	matcher, err, shared := loadGeoIPMatcherSF.Do(country, func() (router.IPMatcher, error) {
 		log.Infoln("Load GeoIP rule: %s", country)
+		geoLoadSem <- struct{}{}
+		defer func() { <-geoLoadSem }()
 		geoLoader, err := GetGeoDataLoader(geoLoaderName)
 		if err != nil {
 			return nil, err
@@ -229,7 +249,14 @@ func LoadGeoIPMatcher(country string) (router.IPMatcher, error) {
 		if err != nil {
 			return nil, err
 		}
-		return router.NewGeoIPMatcher(cidrList)
+		geoLoader = nil
+		runtime.GC() // drop loader temporaries; cidrList stays live
+		matcher, err := router.NewGeoIPMatcher(cidrList)
+		cidrList = nil
+		if err == nil {
+			runtime.GC() // drop raw CIDRs; only the matcher stays cached
+		}
+		return matcher, err
 	})
 	if err != nil {
 		if !shared {
