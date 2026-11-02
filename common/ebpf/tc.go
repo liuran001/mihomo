@@ -175,6 +175,15 @@ func PrepareTC(config TCConfig) (*TCBackend, error) {
 	return prepareTC(config, false)
 }
 
+// PrepareTCDirectTCP prepares a TC backend whose TCP programs look up the
+// internal listener directly instead of through the listener SOCKMAP. Use it
+// when a backend from PrepareTC loaded the SOCKMAP programs but the kernel
+// refused to insert the real listening socket (RegisterTCPListener reporting
+// EOPNOTSUPP).
+func PrepareTCDirectTCP(config TCConfig) (*TCBackend, error) {
+	return prepareTC(config, true)
+}
+
 func prepareTC(config TCConfig, forceLegacyTCP bool) (*TCBackend, error) {
 	if config.ListenerPort == 0 {
 		return nil, E.New("invalid TC eBPF listener port")
@@ -565,6 +574,11 @@ func (b *TCBackend) SetDeliveryInterface(interfaceIndex uint32, hardwareAddress 
 	return nil
 }
 
+// RegisterTCPListener publishes the internal TCP listening socket to the
+// SOCKMAP-based TCP programs; it is a no-op for direct TCP lookup. It must run
+// before any program is attached: a kernel can load the SOCKMAP programs yet
+// still reject the real listener with EOPNOTSUPP, and the caller then has to
+// rebuild the backend with PrepareTCDirectTCP.
 func (b *TCBackend) RegisterTCPListener(ipv6 bool, fd int) error {
 	if !b.tcpListenerMap {
 		return nil

@@ -6,6 +6,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"net/netip"
 	"strings"
@@ -15,6 +16,7 @@ import (
 	"github.com/metacubex/mihomo/common/ebpf"
 	"github.com/metacubex/mihomo/common/pool"
 	"github.com/metacubex/mihomo/component/dialer"
+	"github.com/metacubex/mihomo/log"
 
 	E "github.com/metacubex/sing/common/exceptions"
 
@@ -198,6 +200,39 @@ func (s *internalListenerSet) registerTCTCPListeners(backend *ebpf.TCBackend) er
 		}
 	}
 	return nil
+}
+
+// registerTCTCPListenersOrDirect registers the internal TCP listeners with a
+// freshly prepared, not yet attached TC backend. Some kernels load the
+// SOCKMAP-based TCP programs but refuse to insert a real listening socket into
+// the SOCKMAP (EOPNOTSUPP); the backend is then rebuilt with direct TCP
+// listener lookup, which needs no registration. Ownership of backend passes to
+// this function: on error every backend it created or received is closed.
+func registerTCTCPListenersOrDirect[B io.Closer](
+	backend B,
+	register func(B) error,
+	prepareDirect func() (B, error),
+) (B, error) {
+	var zero B
+	err := register(backend)
+	if err == nil {
+		return backend, nil
+	}
+	if !errors.Is(err, unix.EOPNOTSUPP) {
+		return zero, E.Errors(err, backend.Close())
+	}
+	if closeErr := backend.Close(); closeErr != nil {
+		return zero, E.Errors(err, closeErr)
+	}
+	direct, directErr := prepareDirect()
+	if directErr != nil {
+		return zero, E.Errors(err, E.Cause(directErr, "prepare TC eBPF backend with direct TCP lookup"))
+	}
+	if directErr = register(direct); directErr != nil {
+		return zero, E.Errors(directErr, direct.Close())
+	}
+	log.Debugln("[EBPF] TC listener SOCKMAP rejected the TCP listener; using direct TCP listener lookup: %s", err.Error())
+	return direct, nil
 }
 
 func (s *internalListenerSet) udpConn(ipv6 bool) *net.UDPConn {
