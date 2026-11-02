@@ -314,7 +314,10 @@ func (r *smartGlobalTaskRun) cleanupOrphanedGroups() {
 // stalledReplyAfter and the group carrying it currently avoids the member it is
 // on. Idle connections and ones still getting answers are left alone, as is
 // everything on a member the group still dials.
-func (r *smartGlobalTaskRun) closeStalledConnections() {
+//
+// It reports whether any connection is still waiting on a reply. Without one
+// the next pass cannot find anything until some connection uploads again.
+func (r *smartGlobalTaskRun) closeStalledConnections() (pending bool) {
 	now := time.Now()
 	type groupView struct {
 		proxyByName  map[string]C.Proxy
@@ -334,6 +337,10 @@ func (r *smartGlobalTaskRun) closeStalledConnections() {
 		// Two atomic loads, and they reject nearly every connection, so they go
 		// before anything that walks the chain or reads the store.
 		info := tracker.Info()
+		if !info.ReplyPending() {
+			return true
+		}
+		pending = true
 		if !info.AwaitingReply(now, stalledReplyAfter) {
 			return true
 		}
@@ -357,6 +364,52 @@ func (r *smartGlobalTaskRun) closeStalledConnections() {
 		}
 		return true
 	})
+	return pending
+}
+
+// runStalledSweep paces closeStalledConnections apart from the shared schedule
+// so that it can sleep. On a 15s ticker it woke an idle phone 240 times an
+// hour to scan nothing; now a pass that finds no connection waiting on a reply
+// blocks until the next upload, which is the only way one can appear.
+//
+// sweep reports whether a connection is still waiting on a reply; upload arms
+// the wake for the next upload; background is power.BackgroundState.
+func runStalledSweep(ctx context.Context, interval, jitter time.Duration, background func() (bool, <-chan struct{}), upload func() <-chan struct{}, sweep func() bool) {
+	timer := time.NewTimer(interval + jitter)
+	defer timer.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-timer.C:
+		}
+		// Armed before the scan: an upload either shows up in it or fires this.
+		// Suspended or paused, it waits too: a resume or the first upload
+		// after it brings the sweep back.
+		uploaded := upload()
+		pending := false
+		if paused, _ := background(); !paused {
+			pending = sweep()
+		}
+		for !pending {
+			paused, changed := background()
+			if paused {
+				uploaded = nil
+			}
+			select {
+			case <-ctx.Done():
+				return
+			case <-uploaded:
+				pending = true
+			case <-changed:
+				if paused {
+					// Resumed: re-arm and look once more after the interval.
+					pending = true
+				}
+			}
+		}
+		timer.Reset(interval)
+	}
 }
 
 // admitGroupsByName indexes the registered groups that are not closing by
@@ -375,15 +428,22 @@ func (r *smartGlobalTaskRun) admitGroupsByName() map[string][]*Smart {
 
 func (r *smartGlobalTaskRun) start() {
 	tasks := []smartScheduledTask{
-		{stalledSweepInterval, stalledSweepInterval, "Global stalled connections sweep", r.closeStalledConnections, false},
 		{5 * time.Minute, cleanupInterval, "Global orphaned groups clean up", r.cleanupOrphanedGroups, false},
 		{5 * time.Second, cacheParamAdjustInterval, "Global cache parameters adjustment", r.store.AdjustCacheParameters, false},
 		{5 * time.Minute, flushQueueInterval, "Global queues flush", func() { r.store.FlushQueue(true) }, false},
 	}
-	r.wg.Add(1)
+	r.wg.Add(2)
 	go func() {
 		defer r.wg.Done()
 		runSmartTaskSchedule(r.ctx, tasks, func() bool { return tunnel.Status() == tunnel.Running }, smartTaskReadyPollInterval, smartTaskJitter)
+	}()
+	go func() {
+		defer r.wg.Done()
+		runStalledSweep(r.ctx, stalledSweepInterval, smartTaskJitter(), power.BackgroundState, statistic.DefaultManager.UploadSignal, func() bool {
+			// A suspended tunnel waits like an idle one: its first upload
+			// after resuming brings the sweep back.
+			return tunnel.Status() == tunnel.Running && r.closeStalledConnections()
+		})
 	}()
 }
 
@@ -435,13 +495,17 @@ func (s *Smart) startGroupTasks() {
 	tasks := []smartScheduledTask{
 		{10 * time.Minute, cleanupInterval, "Group orphaned nodes clean up", s.cleanupOrphanedNodeCache, true},
 		{5 * time.Minute, prefetchInterval, "Group targets prefetch", s.runPrefetch, false},
-		{time.Minute, claimInterval, "Group network claims refresh", s.claimASNEvidence, false},
 		{5 * time.Minute, checkInterval, "Group nodes stable check", s.checkNodesStable, false},
 		{5 * time.Minute, rankingInterval, "Group nodes ranking", s.updateNodeRanking, false},
 		{5 * time.Minute, recoveryCheckInterval, "Group nodes recovery check", s.checkBlockedNodes, false},
 		{15 * time.Minute, hostStatusCheckInterval, "Group host status check", s.checkHostStatus, false},
 		{time.Minute, prefetchInterval, "Group hostFailLimit refresh", s.applyHostFailLimit, false},
 		{10 * time.Minute, cleanupInterval, "Group old records clean up", func() { s.store.CleanupOldRecords(s.Name(), s.configName) }, false},
+	}
+	// prefer-asn is fixed for the group's life; without it the refresh returns
+	// at once, so scheduling it would only wake the device every two minutes.
+	if s.preferASN {
+		tasks = append(tasks, smartScheduledTask{time.Minute, claimInterval, "Group network claims refresh", s.claimASNEvidence, false})
 	}
 
 	s.wg.Add(1)

@@ -5,6 +5,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/metacubex/mihomo/component/power"
@@ -437,4 +438,77 @@ func TestSmartTaskScheduleRunsWhatCameDueWhilePaused(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("scheduler did not stop")
 	}
+}
+
+// The stalled sweep used to scan every 15s for as long as the process ran. A
+// pass that finds nothing waiting on a reply now sleeps until an upload.
+func TestStalledSweepSleepsUntilUpload(t *testing.T) {
+	synctest.Test(t, func(t *testing.T) {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		var mu sync.Mutex
+		var upload chan struct{}
+		arm := func() <-chan struct{} {
+			mu.Lock()
+			defer mu.Unlock()
+			if upload == nil {
+				upload = make(chan struct{})
+			}
+			return upload
+		}
+		fire := func() {
+			mu.Lock()
+			defer mu.Unlock()
+			if upload != nil {
+				close(upload)
+				upload = nil
+			}
+		}
+		var sweeps atomic.Int32
+		var pending atomic.Bool
+		// power's own channel lives outside the bubble, which would keep
+		// synctest from ever seeing the loop as blocked.
+		resumed := make(chan struct{})
+		background := func() (bool, <-chan struct{}) { return false, resumed }
+		go runStalledSweep(ctx, 15*time.Second, 0, background, arm, func() bool {
+			sweeps.Add(1)
+			return pending.Load()
+		})
+
+		time.Sleep(15 * time.Second)
+		synctest.Wait()
+		if got := sweeps.Load(); got != 1 {
+			t.Fatalf("sweeps after first interval = %d, want 1", got)
+		}
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		if got := sweeps.Load(); got != 1 {
+			t.Fatalf("idle sweep kept waking: %d passes in an hour", got)
+		}
+
+		// An upload brings it back; while something is pending it keeps pacing.
+		pending.Store(true)
+		fire()
+		synctest.Wait()
+		time.Sleep(15 * time.Second)
+		synctest.Wait()
+		if got := sweeps.Load(); got != 2 {
+			t.Fatalf("sweeps after upload = %d, want 2", got)
+		}
+		time.Sleep(30 * time.Second)
+		synctest.Wait()
+		if got := sweeps.Load(); got != 4 {
+			t.Fatalf("sweeps while pending = %d, want 4", got)
+		}
+
+		// Once nothing is pending again it goes back to sleep.
+		pending.Store(false)
+		time.Sleep(15 * time.Second)
+		synctest.Wait()
+		time.Sleep(time.Hour)
+		synctest.Wait()
+		if got := sweeps.Load(); got != 5 {
+			t.Fatalf("sweeps after going idle = %d, want 5", got)
+		}
+	})
 }
