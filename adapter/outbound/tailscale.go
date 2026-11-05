@@ -312,9 +312,21 @@ func NewTailscale(option TailscaleOption) (*Tailscale, error) {
 		// tsnet startup may need to wait for state files, control-plane reachability,
 		// or Android's network to come out of Doze. A transient failure must not
 		// prevent the rest of the configuration (and VPN) from starting.
-		go outbound.startWithRetry()
+		if tailscaleEagerStart(advertisedRoutes) {
+			go outbound.startWithRetry()
+		} else {
+			log.Debugln("[Tailscale](%s) configuration check: skip eager backend start", option.Name)
+		}
 	}
 	return outbound, nil
+}
+
+// tailscaleEagerStart reports whether the backend should come up while the
+// outbound is constructed. `mihomo -t` only parses the configuration; starting
+// tsnet there would bring up a second node with the same state directory and
+// identity as the running instance.
+func tailscaleEagerStart(advertisedRoutes []netip.Prefix) bool {
+	return len(advertisedRoutes) > 0 && !C.ConfigCheck()
 }
 
 func (t *Tailscale) start() error {

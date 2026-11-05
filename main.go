@@ -173,6 +173,8 @@ func main() {
 	}
 
 	if testConfig {
+		// Parsing only: outbounds must not start background nodes that could race the running instance.
+		C.SetConfigCheck(true)
 		if len(configBytes) != 0 {
 			if _, err := executor.ParseWithBytes(configBytes); err != nil {
 				log.Errorln("%s", err.Error())
