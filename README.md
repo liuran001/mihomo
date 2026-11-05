@@ -218,6 +218,14 @@ proxies:
           target: unix:run/webui.sock      # 相对 home 目录；也可写 http://127.0.0.1:9099（须为 IP）
   ```
   unix socket 只有能读 home 目录的进程可以连接，身份头可信；回环 TCP 端口任何本地进程都能连，不要据此免密。配置了 `serve` 或 `advertise-routes` 时节点随配置启动，`mihomo -t` 校验时不会启动。
+- **控制器接口**：前端可直接查询与登录，无需解析日志或状态文件：
+
+  | 接口 | 说明 |
+  |---|---|
+  | `GET /tailscale` | 所有 Tailscale 出站的状态：`state`（`NotStarted`/`NeedsLogin`/`Starting`/`Running` 等）、`authURL`、`login`、`tailnet`、`self.ips`、`serve`、`error` |
+  | `GET /tailscale/{name}` | 单个出站的状态（不会启动节点） |
+  | `POST /tailscale/{name}/login?wait=20` | 启动节点并等待：有 auth key 时自动登录，否则返回网页登录链接 `authURL`；最多等 60 秒 |
+  | `POST /tailscale/{name}/logout` | 退出登录，节点保持运行，可重新登录 |
 
 ---
 
