@@ -208,6 +208,16 @@ proxies:
     - GEOIP,CN,DIRECT
     - MATCH,智能优选
   ```
+- **发布本机 HTTP 服务（serve）**：类似 `tailscale serve`，把本节点 Tailscale IP 上的端口反向代理到本机服务，并附带访问者身份头 `Tailscale-User-Login` / `Tailscale-User-Name`（客户端自带的同名头会被丢弃，tag 设备不带身份）：
+  ```yaml
+  proxies:
+    - name: TS
+      type: tailscale
+      serve:
+        - port: 80
+          target: unix:run/webui.sock      # 相对 home 目录；也可写 http://127.0.0.1:9099（须为 IP）
+  ```
+  unix socket 只有能读 home 目录的进程可以连接，身份头可信；回环 TCP 端口任何本地进程都能连，不要据此免密。配置了 `serve` 或 `advertise-routes` 时节点随配置启动，`mihomo -t` 校验时不会启动。
 
 ---
 
