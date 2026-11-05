@@ -611,7 +611,7 @@ func DefaultRawConfig() *RawConfig {
 			ParsePureIp:     true,
 			OverrideDest:    true,
 		},
-		ExternalUIURL: "https://github.com/MetaCubeX/metacubexd/archive/refs/heads/gh-pages.zip",
+		ExternalUIURL: "https://github.com/Zephyruso/zashboard/releases/latest/download/dist.zip",
 		ExternalControllerCors: RawCors{
 			AllowOrigins:        []string{"*"},
 			AllowPrivateNetwork: true,
