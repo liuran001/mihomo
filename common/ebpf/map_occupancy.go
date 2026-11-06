@@ -36,6 +36,12 @@ const (
 	// MapCategoryConfiguredPolicy identifies maps whose capacity is derived
 	// from the currently compiled policy.
 	MapCategoryConfiguredPolicy MapCategory = "configured_policy"
+	// MapCategoryCache identifies LRU maps whose entries are only a
+	// recomputable fast-path cache. Stale entries are left for LRU eviction,
+	// so running near capacity is their steady state; an evicted entry merely
+	// falls back to the full policy evaluation. Maps whose eviction would drop
+	// live connection state must stay MapCategoryRuntime.
+	MapCategoryCache MapCategory = "cache"
 )
 
 // mapMetadata is the library-owned semantic metadata for a kernel map. The
@@ -95,11 +101,22 @@ var configuredPolicyMapMetadata = map[string]mapMetadata{
 	"sb_sh_port":        {category: MapCategoryConfiguredPolicy},
 }
 
+// cacheMapMetadata lists LRU maps that only memoize a decision the datapath
+// can recompute. Entries are never removed on connection close, so these maps
+// sit near max_entries during normal operation and must not be reported as
+// pressure.
+var cacheMapMetadata = map[string]mapMetadata{
+	// Shared-network bypass decision cache; a miss re-runs the bypass policy.
+	"sb_sh_bypass": {category: MapCategoryCache},
+}
+
 func metadataForMapName(name string) mapMetadata {
-	for fullName, metadata := range configuredPolicyMapMetadata {
-		// BPF_OBJ_NAME_LEN includes the trailing NUL.
-		if name == fullName[:min(len(fullName), 15)] {
-			return metadata
+	for _, table := range []map[string]mapMetadata{configuredPolicyMapMetadata, cacheMapMetadata} {
+		for fullName, metadata := range table {
+			// BPF_OBJ_NAME_LEN includes the trailing NUL.
+			if name == fullName[:min(len(fullName), 15)] {
+				return metadata
+			}
 		}
 	}
 	return mapMetadata{category: MapCategoryRuntime}
@@ -148,6 +165,9 @@ func mapPressure(category MapCategory, entries, maxEntries uint32, failed bool) 
 	}
 	if category == MapCategoryConfiguredPolicy {
 		return "configured"
+	}
+	if category == MapCategoryCache {
+		return "cache"
 	}
 	if maxEntries == 0 {
 		return "unknown"

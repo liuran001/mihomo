@@ -57,6 +57,35 @@ func TestMapOccupancyExactCapacity(t *testing.T) {
 	}
 }
 
+func TestMapOccupancyCacheClassification(t *testing.T) {
+	if category := metadataForMapName("sb_sh_bypass").category; category != MapCategoryCache {
+		t.Fatalf("sb_sh_bypass category = %s", category)
+	}
+	if pressure := mapPressure(MapCategoryCache, 16384, 16384, false); pressure != "cache" {
+		t.Fatalf("full cache pressure = %s", pressure)
+	}
+	// Policy tables sharing the prefix keep their own classification.
+	for _, name := range []string{"sb_sh_bypass4", "sb_sh_bypass6"} {
+		if category := metadataForMapName(name).category; category != MapCategoryConfiguredPolicy {
+			t.Errorf("%s category = %s", name, category)
+		}
+	}
+	// LRU maps holding live connection state still report pressure.
+	for _, name := range []string{"sb_cg_tcp", "sb_cg_flow", "sb_tc_assign"} {
+		category := metadataForMapName(name).category
+		if category != MapCategoryRuntime {
+			t.Errorf("%s category = %s", name, category)
+		}
+		if pressure := mapPressure(category, 100, 100, false); pressure != "degraded" {
+			t.Errorf("full %s pressure = %s", name, pressure)
+		}
+	}
+	maps := []MapOccupancy{{Pressure: "healthy"}, {Pressure: "cache"}, {Pressure: "configured"}}
+	if got := mapOccupancyStatus(maps); got != "pass" {
+		t.Fatalf("full cache status = %s, want pass", got)
+	}
+}
+
 func TestMapOccupancyPolicyClassification(t *testing.T) {
 	for _, name := range []string{"sb_cg_lforce4", "sb_sh_sforce6", "sb_sh_inc4", "sb_sh_exc6", "sb_cg_bypass_po", "sb_tc_lport"} {
 		category := metadataForMapName(name).category
@@ -69,6 +98,9 @@ func TestMapOccupancyPolicyClassification(t *testing.T) {
 	}
 	if pressure := mapPressure(MapCategoryRuntime, 95, 100, false); pressure != "degraded" {
 		t.Fatalf("runtime pressure = %s", pressure)
+	}
+	if pressure := mapPressure(MapCategoryCache, 0, 100, true); pressure != "unavailable" {
+		t.Fatalf("failed cache inspection pressure = %s", pressure)
 	}
 	if pressure := mapPressure(MapCategoryRuntime, 0, 100, true); pressure != "unavailable" {
 		t.Fatalf("failed inspection pressure = %s", pressure)
