@@ -17,10 +17,15 @@ import (
 func connectionRouter() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/", getConnections)
+	r.Get("/summary", getConnectionSummary)
 	r.Delete("/", closeAllConnections)
 	r.Delete("/{id}", closeConnection)
 	r.Delete("/smart/{id}", setSmartBlock)
 	return r
+}
+
+func getConnectionSummary(writer http.ResponseWriter, request *http.Request) {
+	render.JSON(writer, request, statistic.DefaultManager.Summary())
 }
 
 func getConnections(w http.ResponseWriter, r *http.Request) {

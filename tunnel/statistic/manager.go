@@ -155,6 +155,22 @@ func (m *Manager) Snapshot() *Snapshot {
 	}
 }
 
+type TrafficSummary struct {
+	DownloadTotal   int64  `json:"downloadTotal"`
+	UploadTotal     int64  `json:"uploadTotal"`
+	ConnectionCount int    `json:"connectionCount"`
+	Memory          uint64 `json:"memory"`
+}
+
+func (m *Manager) Summary() TrafficSummary {
+	return TrafficSummary{
+		DownloadTotal:   m.downloadTotal.Load(),
+		UploadTotal:     m.uploadTotal.Load(),
+		ConnectionCount: m.connections.Size(),
+		Memory:          m.Memory(),
+	}
+}
+
 func (m *Manager) updateMemory() {
 	m.memoryMu.Lock()
 	defer m.memoryMu.Unlock()

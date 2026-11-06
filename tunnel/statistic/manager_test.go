@@ -2,12 +2,55 @@ package statistic
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"sync"
 	"testing"
 	"testing/synctest"
 	"time"
 )
+
+type summaryOnlyTracker struct {
+	Tracker
+}
+
+func (summaryOnlyTracker) Info() *TrackerInfo {
+	panic("summary must not inspect individual connections")
+}
+
+func TestManagerSummaryDoesNotInspectConnections(t *testing.T) {
+	manager := &Manager{pid: -1, memoryUpdated: time.Now()}
+	manager.uploadTotal.Store(123)
+	manager.downloadTotal.Store(456)
+	manager.memory.Store(789)
+	for index := range 1000 {
+		manager.connections.Store(fmt.Sprint(index), summaryOnlyTracker{})
+	}
+	summary := manager.Summary()
+	if summary.ConnectionCount != 1000 || summary.UploadTotal != 123 || summary.DownloadTotal != 456 || summary.Memory != 789 {
+		t.Fatalf("unexpected summary: %+v", summary)
+	}
+	manager.connections.Delete("0")
+	if manager.Summary().ConnectionCount != 999 {
+		t.Fatal("summary did not reflect connection removal")
+	}
+}
+
+func BenchmarkManagerSummary(b *testing.B) {
+	for _, count := range []int{0, 1000, 10000} {
+		b.Run(fmt.Sprint(count), func(b *testing.B) {
+			manager := &Manager{pid: -1, memoryUpdated: time.Now()}
+			for index := range count {
+				manager.connections.Store(fmt.Sprint(index), summaryOnlyTracker{})
+			}
+			b.ReportAllocs()
+			b.ResetTimer()
+			for b.Loop() {
+				manager.Summary()
+			}
+		})
+	}
+}
 
 func TestTrafficSamplingSleepsWhenIdleAndRestarts(t *testing.T) {
 	synctest.Test(t, func(t *testing.T) {

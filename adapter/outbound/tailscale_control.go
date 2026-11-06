@@ -4,21 +4,122 @@ package outbound
 
 import (
 	"context"
+	"errors"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/metacubex/tailscale/ipn"
+	"github.com/metacubex/tailscale/tailcfg"
+	"github.com/metacubex/tailscale/tsnet"
 )
+
+type tailscaleControlSnapshot struct {
+	state          ipn.State
+	stateError     error
+	authURL        string
+	health         []string
+	self           *tailscaleControlSelf
+	profile        tailcfg.UserProfile
+	tailnet        string
+	magicDNSSuffix string
+}
+
+type tailscaleControlSelf struct {
+	userID   tailcfg.UserID
+	hostName string
+	dnsName  string
+	ips      []string
+	online   *bool
+}
+
+func (t *Tailscale) resetControlStatus() {
+	t.controlAccess.Lock()
+	t.controlStatus = tailscaleControlSnapshot{}
+	t.controlAccess.Unlock()
+}
+
+func (t *Tailscale) observeControlNotify(notification ipn.Notify) {
+	t.controlAccess.Lock()
+	defer t.controlAccess.Unlock()
+	status := &t.controlStatus
+	if notification.State != nil {
+		if status.state != *notification.State {
+			status.stateError = nil
+		}
+		status.state = *notification.State
+		if status.state == ipn.NeedsLogin {
+			status.self = nil
+			status.profile = tailcfg.UserProfile{}
+			status.tailnet = ""
+			status.magicDNSSuffix = ""
+		}
+		if status.state == ipn.Running {
+			status.authURL = ""
+		}
+	}
+	if notification.ErrMessage != nil {
+		status.stateError = errors.New(*notification.ErrMessage)
+	}
+	if notification.BrowseToURL != nil && status.state != ipn.Running {
+		status.authURL = *notification.BrowseToURL
+	}
+	if notification.Prefs != nil && notification.Prefs.Valid() && notification.Prefs.Persist().Valid() {
+		if profile := notification.Prefs.Persist().UserProfile(); profile.Valid() {
+			status.profile = *profile.AsStruct()
+		}
+	}
+	self := notification.SelfChange
+	if network := notification.NetMap; network != nil {
+		status.tailnet = network.Domain
+		status.magicDNSSuffix = network.MagicDNSSuffix()
+		if network.SelfNode.Valid() {
+			self = network.SelfNode.AsStruct()
+			status.profile = tailcfg.UserProfile{}
+			if profile, ok := network.UserProfiles[self.User]; ok && profile.Valid() {
+				status.profile = *profile.AsStruct()
+			}
+		}
+	}
+	if self != nil {
+		identity := &tailscaleControlSelf{userID: self.User, dnsName: self.Name}
+		if self.Hostinfo.Valid() {
+			identity.hostName = self.Hostinfo.Hostname()
+		}
+		for _, address := range self.Addresses {
+			if address.IsSingleIP() {
+				identity.ips = append(identity.ips, address.Addr().String())
+			}
+		}
+		if self.Online != nil {
+			online := *self.Online
+			identity.online = &online
+		}
+		_, suffix, _ := strings.Cut(strings.TrimSuffix(self.Name, "."), ".")
+		if status.magicDNSSuffix != suffix {
+			status.tailnet = ""
+		}
+		status.magicDNSSuffix = suffix
+		status.self = identity
+		if status.profile.ID != self.User {
+			status.profile = tailcfg.UserProfile{}
+		}
+	}
+	if notification.Health != nil {
+		status.health = make([]string, 0, len(notification.Health.Warnings))
+		for _, warning := range notification.Health.Warnings {
+			status.health = append(status.health, warning.Text)
+		}
+		slices.Sort(status.health)
+	}
+}
 
 // TailscaleStatus reports the login and connection state of this outbound for
 // the external controller. It never starts the backend.
 func (t *Tailscale) TailscaleStatus(ctx context.Context) map[string]any {
-	t.startAccess.Lock()
-	startErr := t.startErr
-	t.startAccess.Unlock()
-	t.backendStateAccess.Lock()
-	state := t.backendState
-	stateErr := t.backendStateErr
-	t.backendStateAccess.Unlock()
+	t.controlAccess.Lock()
+	status := t.controlStatus
+	t.controlAccess.Unlock()
 
 	started := t.serverStarted.Load()
 	out := map[string]any{
@@ -31,14 +132,14 @@ func (t *Tailscale) TailscaleStatus(ctx context.Context) map[string]any {
 		"serve":     t.serveSummary(),
 	}
 	if started {
-		out["state"] = state.String()
+		out["state"] = status.state.String()
 	} else {
 		out["state"] = "NotStarted"
 	}
-	if err := startErr; err != nil {
+	if err := t.startErr.Load(); err != nil {
 		out["error"] = err.Error()
-	} else if stateErr != nil {
-		out["error"] = stateErr.Error()
+	} else if status.stateError != nil {
+		out["error"] = status.stateError.Error()
 	}
 	if routes := t.advertisedRoutes; len(routes) > 0 {
 		list := make([]string, 0, len(routes))
@@ -47,46 +148,31 @@ func (t *Tailscale) TailscaleStatus(ctx context.Context) map[string]any {
 		}
 		out["advertiseRoutes"] = list
 	}
-	server, err := t.snapshotServer()
-	if err != nil {
-		return out
+	if status.authURL != "" {
+		out["authURL"] = status.authURL
 	}
-	lc, err := server.LocalClient()
-	if err != nil {
-		return out
+	if len(status.health) > 0 {
+		out["health"] = slices.Clone(status.health)
 	}
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	st, err := lc.StatusWithoutPeers(ctx)
-	if err != nil {
-		out["error"] = err.Error()
-		return out
+	if status.tailnet != "" {
+		out["tailnet"] = status.tailnet
 	}
-	out["state"] = st.BackendState
-	if st.AuthURL != "" {
-		out["authURL"] = st.AuthURL
+	if status.magicDNSSuffix != "" {
+		out["magicDNSSuffix"] = status.magicDNSSuffix
 	}
-	if len(st.Health) > 0 {
-		out["health"] = st.Health
-	}
-	if st.CurrentTailnet != nil {
-		out["tailnet"] = st.CurrentTailnet.Name
-		out["magicDNSSuffix"] = st.CurrentTailnet.MagicDNSSuffix
-	}
-	if self := st.Self; self != nil {
-		ips := make([]string, 0, len(self.TailscaleIPs))
-		for _, ip := range self.TailscaleIPs {
-			ips = append(ips, ip.String())
+	if self := status.self; self != nil && started {
+		identity := map[string]any{
+			"hostName": self.hostName,
+			"dnsName":  self.dnsName,
+			"ips":      slices.Clone(self.ips),
 		}
-		out["self"] = map[string]any{
-			"hostName": self.HostName,
-			"dnsName":  self.DNSName,
-			"ips":      ips,
-			"online":   self.Online,
+		if self.online != nil {
+			identity["online"] = *self.online
 		}
-		if user, ok := st.User[self.UserID]; ok {
-			out["login"] = user.LoginName
-			out["displayName"] = user.DisplayName
+		out["self"] = identity
+		if status.profile.ID == self.userID && status.profile.LoginName != "" {
+			out["login"] = status.profile.LoginName
+			out["displayName"] = status.profile.DisplayName
 		}
 	}
 	return out
@@ -97,11 +183,11 @@ func (t *Tailscale) TailscaleStatus(ctx context.Context) map[string]any {
 // logs in by itself; interactive login is only requested when the backend
 // still needs login after a short grace period (or immediately without a key).
 func (t *Tailscale) TailscaleLogin(ctx context.Context, wait time.Duration) (map[string]any, error) {
-	if err := t.start(); err != nil {
-		return nil, err
-	}
 	ctx, cancel := context.WithTimeout(ctx, wait)
 	defer cancel()
+	if err := t.startContext(ctx); err != nil {
+		return nil, err
+	}
 	begin := time.Now()
 	grace := 4 * time.Second
 	if t.option.AuthKey == "" {
@@ -118,7 +204,7 @@ func (t *Tailscale) TailscaleLogin(ctx context.Context, wait time.Duration) (map
 			return status, nil
 		}
 		if !interactive && state == ipn.NeedsLogin.String() && time.Since(begin) >= grace {
-			if server, err := t.snapshotServer(); err == nil {
+			if server, err := t.controlServer(); err == nil {
 				if lc, err := server.LocalClient(); err == nil {
 					if err := lc.StartLoginInteractive(ctx); err == nil {
 						interactive = true
@@ -137,7 +223,12 @@ func (t *Tailscale) TailscaleLogin(ctx context.Context, wait time.Duration) (map
 // TailscaleLogout logs the node out of its tailnet. The backend keeps running
 // in NeedsLogin state so a later login can reuse the same server.
 func (t *Tailscale) TailscaleLogout(ctx context.Context) error {
-	server, err := t.snapshotServer()
+	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
+	defer cancel()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	server, err := t.controlServer()
 	if err != nil {
 		return err
 	}
@@ -145,9 +236,18 @@ func (t *Tailscale) TailscaleLogout(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	ctx, cancel := context.WithTimeout(ctx, 15*time.Second)
-	defer cancel()
 	return lc.Logout(ctx)
+}
+
+func (t *Tailscale) controlServer() (*tsnet.Server, error) {
+	if !t.startAccess.TryLock() {
+		return nil, errors.New("tailscale startup or shutdown is in progress")
+	}
+	defer t.startAccess.Unlock()
+	if t.closed || !t.serverStarted.Load() || t.server == nil {
+		return nil, errTailscaleBackendNotRunning
+	}
+	return t.server, nil
 }
 
 func (t *Tailscale) serveSummary() []map[string]any {

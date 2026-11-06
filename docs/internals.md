@@ -85,6 +85,16 @@ eBPF 后端以 [CHIZI-0618/sing-box](https://github.com/CHIZI-0618/sing-box) 的
 
 还修了一个 TUN 模式下的直连问题：上游把 magicsock 的 UDP socket 交给 outbound dialer，于是被 `auto-detect-interface` 用 `SO_BINDTODEVICE` 绑到了默认出口网卡上。绑了网卡的 socket 收不到从其他本地网卡（比如自家 LAN）到达的 disco 包，同一个局域网里的两台设备也只能走 DERP 中继，实测从 4 ms 恶化到 250 ms。现在默认不绑，只有显式配了 `interface-name` / `routing-mark` 或存在 socket hook（CMFA）时才保留原行为。
 
+## WebUI 控制面与转发隔离
+
+- `/tailscale` 状态只读取独立的小快照，不等待 tsnet 启动锁，也不调用会扫描 WireGuard 状态的 LocalAPI Status。快照复用 IPN watcher：首次收取 NetMap，此后请求 self 变更而非反复序列化全部 peers。打开状态页不会启动或唤醒未使用的 Tailscale 出站；登录/退出才进行控制操作，启动等待有超时并共享同一个在途任务。
+- 账号按本机 `Self.User` 匹配 `UserProfile.ID`，不会取 Tailnet 用户表中的第一项。它代表设备注册属主，不是查看网页的浏览器账号；身份缺失时留空，不猜测团队成员。进入 NeedsLogin 时清除旧账号。
+- 首页改用 `/connections/summary`、`/overview`、`/ebpf/summary`。连接摘要读原子计数和连接数，RSS 最多每秒按需采样；出口链最多 32 层，概览不为展示而选择 Smart/LoadBalance 节点，不展开所有代理、连接与规则。
+- `/ebpf` 仍保留手动详细诊断：只允许一个在途扫描，跨表共享 100 ms 检查预算，每表最多检查 16,384 个 key，定期响应取消，不持数据面锁遍历全部 map。它不是硬实时保证，单次系统调用和调度仍可能延迟。
+- 实时日志消费者满载时丢弃该消费者的新事件，不反压代理流量；普通 Observable 的可靠传递语义不变。info 订阅不再隐式启用所有 debug 格式化。本地日志输出仍遵循所设日志等级。
+
+相关竞态测试、慢日志回归、启动锁竞争测试及 Android arm64 交叉编译已验证。桌面微基准与模拟 WebUI 只能说明调用开销和隔离行为，不能替代实体设备的温度、电流、吞吐或续航测量；升级时须同时更新模块与内核，旧内核缺摘要接口时首页提示升级，不退回高频全量扫描。
+
 ## 其他
 
 **内核自更新指向本分支。** `POST /upgrade` 的 alpha 通道原本从上游拉，下载到的版本不含这些改动，用了新配置项的 config 会直接启动失败。现在指向本仓库的 `Prerelease-Alpha`。

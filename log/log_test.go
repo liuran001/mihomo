@@ -1,9 +1,70 @@
 package log
 
 import (
+	"sync"
 	"testing"
 	"time"
 )
+
+func TestSlowLogSubscriberDoesNotBlockCore(t *testing.T) {
+	previous := Level()
+	SetLevel(SILENT)
+	t.Cleanup(func() { SetLevel(previous) })
+	subscriber := Subscribe()
+	var drained sync.WaitGroup
+	drained.Add(1)
+	t.Cleanup(func() {
+		go func() {
+			defer drained.Done()
+			for range subscriber {
+			}
+		}()
+		UnSubscribe(subscriber)
+		drained.Wait()
+	})
+	done := make(chan struct{})
+	go func() {
+		for index := range 5000 {
+			Infoln("slow dashboard event %d", index)
+		}
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(time.Second):
+		t.Fatal("a stalled log subscriber blocked log producers")
+	}
+}
+
+func TestInfoSubscriptionDoesNotEnableDebugFormatting(t *testing.T) {
+	previous := Level()
+	SetLevel(SILENT)
+	t.Cleanup(func() { SetLevel(previous) })
+	subscriber := SubscribeLevel(INFO)
+	defer UnSubscribe(subscriber)
+	probe := &formatProbe{}
+	Debugln("%s", probe)
+	if probe.calls != 0 || DebugEnabled() {
+		t.Fatal("info-only dashboard enabled debug logging")
+	}
+	Infoln("%s", probe)
+	select {
+	case event := <-subscriber:
+		if event.LogLevel != INFO || event.Payload != "formatted" {
+			t.Fatalf("unexpected event: %+v", event)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("info event was not delivered")
+	}
+	debug := SubscribeLevel(DEBUG)
+	if !DebugEnabled() {
+		t.Fatal("explicit debug subscription must enable debug logging")
+	}
+	UnSubscribe(debug)
+	if DebugEnabled() {
+		t.Fatal("removing debug subscriber did not restore the minimum level")
+	}
+}
 
 func BenchmarkDisabledInfo(b *testing.B) {
 	previous := Level()

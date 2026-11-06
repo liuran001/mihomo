@@ -13,13 +13,18 @@ type Observable[T any] struct {
 	done           bool
 	stopCh         chan struct{}
 	hasSubscribers atomic.Bool
+	dropOnFull     bool
 }
 
 func (o *Observable[T]) process() {
 	for item := range o.iterable {
 		o.mux.Lock()
 		for _, sub := range o.listener {
-			sub.Emit(item)
+			if o.dropOnFull {
+				sub.TryEmit(item)
+			} else {
+				sub.Emit(item)
+			}
 		}
 		o.mux.Unlock()
 	}
@@ -70,10 +75,19 @@ func (o *Observable[T]) HasSubscribers() bool {
 }
 
 func NewObservable[T any](iter Iterable[T]) *Observable[T] {
+	return newObservable(iter, false)
+}
+
+func NewLossyObservable[T any](iter Iterable[T]) *Observable[T] {
+	return newObservable(iter, true)
+}
+
+func newObservable[T any](iter Iterable[T], dropOnFull bool) *Observable[T] {
 	observable := &Observable[T]{
-		iterable: iter,
-		listener: map[Subscription[T]]*Subscriber[T]{},
-		stopCh:   make(chan struct{}),
+		iterable:   iter,
+		listener:   map[Subscription[T]]*Subscriber[T]{},
+		stopCh:     make(chan struct{}),
+		dropOnFull: dropOnFull,
 	}
 	go observable.process()
 	return observable

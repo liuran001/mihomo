@@ -3,6 +3,7 @@
 package ebpf
 
 import (
+	"context"
 	"errors"
 
 	CiliumEBPF "github.com/cilium/ebpf"
@@ -110,7 +111,7 @@ type MapOccupancyReport struct {
 	Error  string         `json:"error,omitempty"`
 }
 
-func inspectMapOccupancy(m *CiliumEBPF.Map, id CiliumEBPF.MapID, info *CiliumEBPF.MapInfo) MapOccupancy {
+func inspectMapOccupancy(ctx context.Context, m *CiliumEBPF.Map, id CiliumEBPF.MapID, info *CiliumEBPF.MapInfo) MapOccupancy {
 	item := MapOccupancy{ID: id, Name: info.Name, Category: metadataForMapName(info.Name).category, Type: info.Type.String(),
 		MaxEntries: info.MaxEntries, KeySize: info.KeySize, ValueSize: info.ValueSize, Flags: info.Flags}
 	if !occupancySupported(info.Type) {
@@ -119,7 +120,7 @@ func inspectMapOccupancy(m *CiliumEBPF.Map, id CiliumEBPF.MapID, info *CiliumEBP
 	}
 	item.Supported = true
 	var err error
-	item.Entries, err = countMapKeys(m, info.KeySize, info.MaxEntries)
+	item.Entries, err = countMapKeys(ctx, m, info.KeySize, info.MaxEntries)
 	if err != nil {
 		item.Error = err.Error()
 	}
@@ -164,18 +165,32 @@ func mapPressure(category MapCategory, entries, maxEntries uint32, failed bool) 
 
 var errMapKeyIterationAborted = errors.New("map key iteration aborted")
 
-func countMapKeys(m *CiliumEBPF.Map, keySize uint32, maxEntries uint32) (uint32, error) {
+const mapOccupancyKeyBudget = 16384
+
+type mapKeyIterator interface {
+	NextKey(key, nextKey any) error
+}
+
+func countMapKeys(ctx context.Context, iterator mapKeyIterator, keySize uint32, maxEntries uint32) (uint32, error) {
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
 	key := make([]byte, keySize)
 	next := make([]byte, keySize)
-	err := m.NextKey(nil, &next)
+	err := iterator.NextKey(nil, &next)
 	var entries uint32
 	for err == nil {
-		if entries >= maxEntries {
+		if entries%64 == 0 {
+			if err := ctx.Err(); err != nil {
+				return entries, err
+			}
+		}
+		if entries >= min(maxEntries, mapOccupancyKeyBudget) {
 			return entries, errMapKeyIterationAborted
 		}
 		entries++
 		copy(key, next)
-		err = m.NextKey(key, &next)
+		err = iterator.NextKey(key, &next)
 	}
 	if errors.Is(err, CiliumEBPF.ErrKeyNotExist) {
 		return entries, nil

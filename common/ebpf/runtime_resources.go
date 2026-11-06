@@ -3,9 +3,11 @@
 package ebpf
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"slices"
+	"time"
 
 	CiliumEBPF "github.com/cilium/ebpf"
 )
@@ -134,6 +136,12 @@ func (b *ProcessTracker) RuntimeResources() (r RuntimeResources) {
 }
 
 func InspectRuntimeResources(owners ...RuntimeResources) RuntimeState {
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+	return InspectRuntimeResourcesContext(ctx, owners...)
+}
+
+func InspectRuntimeResourcesContext(ctx context.Context, owners ...RuntimeResources) RuntimeState {
 	var resources RuntimeResources
 	for _, owner := range owners {
 		resources.merge(owner)
@@ -147,6 +155,10 @@ func InspectRuntimeResources(owners ...RuntimeResources) RuntimeState {
 		state.MapOccupancy.Error = resources.Error.Error()
 	}
 	for _, id := range resources.Programs {
+		if err := ctx.Err(); err != nil {
+			state.ProgramsError = errors.Join(state.ProgramsError, err)
+			break
+		}
 		program, err := CiliumEBPF.NewProgramFromID(id)
 		if err != nil {
 			state.ProgramsError = errors.Join(state.ProgramsError, err)
@@ -162,6 +174,10 @@ func InspectRuntimeResources(owners ...RuntimeResources) RuntimeState {
 		state.Programs = append(state.Programs, RuntimeProgram{ID: id, Name: info.Name, Type: info.Type, MapIDs: mapIDs, MapCount: len(mapIDs)})
 	}
 	for _, id := range resources.Maps {
+		if err := ctx.Err(); err != nil {
+			state.MapOccupancy.Error = err.Error()
+			break
+		}
 		m, err := CiliumEBPF.NewMapFromID(id)
 		if err != nil {
 			state.MapOccupancy.Maps = append(state.MapOccupancy.Maps, MapOccupancy{ID: id, Error: fmt.Sprint(err), Pressure: "unavailable"})
@@ -173,7 +189,7 @@ func InspectRuntimeResources(owners ...RuntimeResources) RuntimeState {
 			state.MapOccupancy.Maps = append(state.MapOccupancy.Maps, MapOccupancy{ID: id, Error: fmt.Sprint(err), Pressure: "unavailable"})
 			continue
 		}
-		state.MapOccupancy.Maps = append(state.MapOccupancy.Maps, inspectMapOccupancy(m, id, info))
+		state.MapOccupancy.Maps = append(state.MapOccupancy.Maps, inspectMapOccupancy(ctx, m, id, info))
 		_ = m.Close()
 	}
 	state.MapOccupancy.Status = mapOccupancyStatus(state.MapOccupancy.Maps)

@@ -125,6 +125,7 @@ func router(isDebug bool, secret string, dohServer string, cors Cors) *chi.Mux {
 		r.Get("/traffic", traffic)
 		r.Get("/memory", memory)
 		r.Get("/version", version)
+		r.Get("/overview", getOverview)
 		addEBPFRoutes(r)
 		r.Mount("/configs", configRouter())
 		r.Mount("/proxies", proxyRouter())
@@ -538,7 +539,7 @@ func getLogs(w http.ResponseWriter, r *http.Request) {
 	}
 
 	ch := make(chan log.Event, 1024)
-	sub := log.Subscribe()
+	sub := log.SubscribeLevel(level)
 	defer log.UnSubscribe(sub)
 	buf := &bytes.Buffer{}
 
