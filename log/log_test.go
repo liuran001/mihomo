@@ -48,12 +48,7 @@ func TestInfoSubscriptionDoesNotEnableDebugFormatting(t *testing.T) {
 		t.Fatal("info-only dashboard enabled debug logging")
 	}
 	Infoln("%s", probe)
-	select {
-	case event := <-subscriber:
-		if event.LogLevel != INFO || event.Payload != "formatted" {
-			t.Fatalf("unexpected event: %+v", event)
-		}
-	case <-time.After(time.Second):
+	if !awaitEvent(t, subscriber, INFO, "formatted") {
 		t.Fatal("info event was not delivered")
 	}
 	debug := SubscribeLevel(DEBUG)
@@ -88,6 +83,33 @@ func BenchmarkDisabledDebugParallel(b *testing.B) {
 	})
 }
 
+// awaitEvent waits for the event a test published itself. The log stream is
+// package-global and its fan-out goroutine may still hold an event received
+// before this subscriber existed (the last of TestSlowLogSubscriberDoesNotBlockCore's
+// burst, typically), so earlier tests' events are skipped rather than treated as
+// this test's. A debug event is never skipped: an INFO subscriber seeing one is
+// the bug these tests guard against.
+func awaitEvent(t *testing.T, sub <-chan Event, level LogLevel, payload string) bool {
+	t.Helper()
+	timeout := time.After(time.Second)
+	for {
+		select {
+		case event, ok := <-sub:
+			if !ok {
+				return false
+			}
+			if event.LogLevel == level && event.Payload == payload {
+				return true
+			}
+			if event.LogLevel == DEBUG && level != DEBUG {
+				t.Fatalf("unexpected debug event: %+v", event)
+			}
+		case <-timeout:
+			return false
+		}
+	}
+}
+
 type formatProbe struct{ calls int }
 
 func (p *formatProbe) String() string {
@@ -107,13 +129,11 @@ func TestDisabledInfoSkipsFormattingButKeepsSubscribers(t *testing.T) {
 	sub := Subscribe()
 	defer UnSubscribe(sub)
 	Infoln("%s", probe)
-	select {
-	case event := <-sub:
-		if event.LogLevel != INFO || event.Payload != "formatted" || probe.calls != 1 {
-			t.Fatalf("unexpected subscriber event: %+v; format calls: %d", event, probe.calls)
-		}
-	case <-time.After(time.Second):
+	if !awaitEvent(t, sub, INFO, "formatted") {
 		t.Fatal("silent output suppressed a live subscriber's info log")
+	}
+	if probe.calls != 1 {
+		t.Fatalf("info payload formatted %d times, want 1", probe.calls)
 	}
 }
 
