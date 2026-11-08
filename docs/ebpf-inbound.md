@@ -215,8 +215,13 @@ Field behavior:
   being intercepted until the operator says otherwise. Changes to this key
   rebuild the inbound.
 - `include-source-cidr`, `exclude-source-cidr`, `include-mac-address`,
-  `exclude-mac-address`: shared source policy. MAC policy needs Ethernet
-  framing.
+  `exclude-mac-address`: shared source policy. A client whose source MAC or
+  source address is in either exclude list is never intercepted. When any
+  include list is set, a client is intercepted if its MAC is in
+  `include-mac-address` *or* its address is in `include-source-cidr`; with no
+  include list every client that is not excluded is intercepted. MAC policy
+  needs Ethernet framing. With `dns-mode: respect_policy` the same policy
+  decides whether a client's DNS is hijacked.
 
 Keys from the previous configuration surface are still accepted and mapped to
 the fields above: a top-level `dns-mode` or `bypass-private-address` applies

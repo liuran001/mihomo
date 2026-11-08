@@ -439,22 +439,23 @@ INLINE bool bypass_destination(const struct sb_tc_control *control,
     return map_lookup(&tc_bypass_ipv6, &key) != 0;
 }
 
-INLINE bool source_address_selected(const struct sb_tc_control *control,
-    const struct sb_tc_assign_key *flow) {
+// Source policy for shared clients, see shared_network_policy.h: exclusion
+// wins, and with any include list configured a client is selected when its MAC
+// OR its source address is included. Reports membership in one list; false
+// when that list is not configured.
+INLINE bool source_address_matches(const struct sb_tc_control *control,
+    const struct sb_tc_assign_key *flow, bool include) {
+    if ((control->flags & (include ? SB_TC_FLAG_INCLUDE_SOURCE : SB_TC_FLAG_EXCLUDE_SOURCE)) == 0U) return false;
     if (flow->family == AF_INET_VALUE) {
         struct sb_tc_ipv4_lpm_key key = {.prefixlen = 32U};
         __builtin_memcpy(key.address, flow->source_addr, 4U);
-        if ((control->flags & SB_TC_FLAG_EXCLUDE_SOURCE) != 0U &&
-            map_lookup(&tc_exclude_source_ipv4, &key) != 0) return false;
-        return (control->flags & SB_TC_FLAG_INCLUDE_SOURCE) == 0U ||
-            map_lookup(&tc_include_source_ipv4, &key) != 0;
+        if (include) return map_lookup(&tc_include_source_ipv4, &key) != 0;
+        return map_lookup(&tc_exclude_source_ipv4, &key) != 0;
     }
     struct sb_tc_ipv6_lpm_key key = {.prefixlen = 128U};
     __builtin_memcpy(key.address, flow->source_addr, 16U);
-    if ((control->flags & SB_TC_FLAG_EXCLUDE_SOURCE) != 0U &&
-        map_lookup(&tc_exclude_source_ipv6, &key) != 0) return false;
-    return (control->flags & SB_TC_FLAG_INCLUDE_SOURCE) == 0U ||
-        map_lookup(&tc_include_source_ipv6, &key) != 0;
+    if (include) return map_lookup(&tc_include_source_ipv6, &key) != 0;
+    return map_lookup(&tc_exclude_source_ipv6, &key) != 0;
 }
 
 INLINE bool host_destination(const struct sb_tc_control *control,
@@ -471,13 +472,19 @@ INLINE bool host_destination(const struct sb_tc_control *control,
     return map_lookup(&tc_host_ipv6, &key) != 0;
 }
 
-INLINE bool source_mac_selected(const struct sb_tc_control *control, const __u8 source_mac[6]) {
+INLINE bool source_mac_matches(const struct sb_tc_control *control, const __u8 source_mac[6], bool include) {
+    if ((control->flags & (include ? SB_TC_FLAG_INCLUDE_SOURCE_MAC : SB_TC_FLAG_EXCLUDE_SOURCE_MAC)) == 0U) return false;
     struct sb_tc_mac_key key = {};
     __builtin_memcpy(key.address, source_mac, 6U);
-    if ((control->flags & SB_TC_FLAG_EXCLUDE_SOURCE_MAC) != 0U &&
-        map_lookup(&tc_exclude_source_mac, &key) != 0) return false;
-    return (control->flags & SB_TC_FLAG_INCLUDE_SOURCE_MAC) == 0U ||
-        map_lookup(&tc_include_source_mac, &key) != 0;
+    if (include) return map_lookup(&tc_include_source_mac, &key) != 0;
+    return map_lookup(&tc_exclude_source_mac, &key) != 0;
+}
+
+INLINE bool shared_source_selected(const struct sb_tc_control *control,
+    const struct sb_tc_assign_key *flow, const __u8 source_mac[6]) {
+    if (source_address_matches(control, flow, false) || source_mac_matches(control, source_mac, false)) return false;
+    if ((control->flags & (SB_TC_FLAG_INCLUDE_SOURCE | SB_TC_FLAG_INCLUDE_SOURCE_MAC)) == 0U) return true;
+    return source_address_matches(control, flow, true) || source_mac_matches(control, source_mac, true);
 }
 
 INLINE bool local_selected(struct __sk_buff *skb, const struct sb_tc_control *control,
@@ -501,7 +508,7 @@ INLINE bool shared_selected(const struct sb_tc_control *control,
     if (must_intercept_fakeip(control, key)) return true;
     if (dns_bypassed(key->protocol, key->destination_port, control->shared_dns_mode)) return false;
     if (dns_selected(key->protocol, key->destination_port, control->shared_dns_mode)) return true;
-    if (!source_address_selected(control, key) || !source_mac_selected(control, source_mac)) return false;
+    if (!shared_source_selected(control, key, source_mac)) return false;
     if (key->destination_port == 53U && control->shared_dns_mode == SB_TC_DNS_RESPECT_POLICY) return true;
     if (port_bypassed(control, key, true)) return false;
     if (host_destination(control, key)) return false;
