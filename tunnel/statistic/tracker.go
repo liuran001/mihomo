@@ -205,6 +205,7 @@ func (tt *tcpTracker) Close() error {
 	tt.closeOnce.Do(func() {
 		tt.closeErr = tt.Conn.Close()
 		tt.manager.Leave(tt)
+		tt.source.release()
 		tt.reportStall()
 	})
 	return tt.closeErr
@@ -366,6 +367,7 @@ func (ut *udpTracker) Close() error {
 	ut.closeOnce.Do(func() {
 		ut.closeErr = ut.PacketConn.Close()
 		ut.manager.Leave(ut)
+		ut.source.release()
 	})
 	return ut.closeErr
 }

@@ -55,6 +55,7 @@ type Manager struct {
 	// Per-source traffic counters, see source.go.
 	sources     xsync.Map[netip.Addr, *sourceCounter]
 	sourceCount stdatomic.Int32
+	sourceSweep stdatomic.Int64
 }
 
 func (m *Manager) Join(c Tracker) {
